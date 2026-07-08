@@ -1,10 +1,9 @@
 from pathlib import Path
 
-from metadata import read_metadata
+from metadata import get_metadata
 
 
 class FileScanner:
-
     def __init__(self, root):
         self.root = Path(root)
 
@@ -20,23 +19,23 @@ class FileScanner:
 
             if path.is_file():
 
-                file = read_metadata(path)
+                info = get_metadata(path)
 
-                print("=" * 60)
-                print(f"Name      : {file.filename}")
-                print(f"Extension : {file.extension}")
-                print(f"Size      : {file.size:,} bytes")
-                print(f"Modified  : {file.modified}")
-                print(f"Path      : {file.path}")
+                print("-" * 60)
+                print(f"Name      : {info['name']}")
+                print(f"Extension : {info['extension']}")
+                print(f"Size      : {info['size']} bytes")
+                print(f"Modified  : {info['modified']}")
+                print(f"Path      : {info['path']}")
 
                 count += 1
 
-        print("\nFinished")
-        print(f"Files : {count}")
+        print(f"\nFinished. Files found: {count}")
 
 
 if __name__ == "__main__":
+    folder = input("Folder to scan: ").strip()
 
-    folder = input("Folder to scan: ")
+    scanner = FileScanner(folder)
 
-    FileScanner(folder).scan()
+    scanner.scan()
