@@ -1,30 +1,42 @@
 from pathlib import Path
 
+from metadata import read_metadata
+
 
 class FileScanner:
+
     def __init__(self, root):
         self.root = Path(root)
 
     def scan(self):
+
         if not self.root.exists():
-            print(f"Folder not found: {self.root}")
+            print("Folder not found.")
             return
 
         count = 0
 
         for path in self.root.rglob("*"):
+
             if path.is_file():
-                print(path)
+
+                file = read_metadata(path)
+
+                print("=" * 60)
+                print(f"Name      : {file.filename}")
+                print(f"Extension : {file.extension}")
+                print(f"Size      : {file.size:,} bytes")
+                print(f"Modified  : {file.modified}")
+                print(f"Path      : {file.path}")
+
                 count += 1
 
-        print()
-        print(f"Finished.")
-        print(f"Files found: {count}")
+        print("\nFinished")
+        print(f"Files : {count}")
 
 
 if __name__ == "__main__":
-    root = input("Folder to scan: ").strip()
 
-    scanner = FileScanner(root)
+    folder = input("Folder to scan: ")
 
-    scanner.scan()
+    FileScanner(folder).scan()
