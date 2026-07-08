@@ -1,20 +1,9 @@
 import sqlite3
 from pathlib import Path
 
+# Location of the SQLite database
+DB_PATH = Path(__file__).resolve().parent.parent / "database" / "knowledge.db"
 
-DB_PATH = Path("database/knowledge.db")
 
-
-def connect():
+def get_connection():
     return sqlite3.connect(DB_PATH)
-
-
-def initialize():
-
-    conn = connect()
-
-    with open("database/schema.sql") as f:
-        conn.executescript(f.read())
-
-    conn.commit()
-    conn.close()
