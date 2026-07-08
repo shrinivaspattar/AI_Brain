@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from metadata import get_metadata
+from database import Database
 
 
 class FileScanner:
@@ -13,6 +14,8 @@ class FileScanner:
             print("Folder not found.")
             return
 
+        db = Database()
+
         count = 0
 
         for path in self.root.rglob("*"):
@@ -20,6 +23,8 @@ class FileScanner:
             if path.is_file():
 
                 info = get_metadata(path)
+
+                db.insert(info)
 
                 print("-" * 60)
                 print(f"Name      : {info['name']}")
@@ -29,6 +34,8 @@ class FileScanner:
                 print(f"Path      : {info['path']}")
 
                 count += 1
+
+        db.close()
 
         print(f"\nFinished. Files found: {count}")
 
