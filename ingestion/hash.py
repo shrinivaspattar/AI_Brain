@@ -9,7 +9,7 @@ def sha256_file(path: Path) -> str:
 
     with open(path, "rb") as f:
         while True:
-            chunk = f.read(1024 * 1024)  # 1 MB chunks
+            chunk = f.read(1024 * 1024)  # 1 MB
             if not chunk:
                 break
             sha.update(chunk)

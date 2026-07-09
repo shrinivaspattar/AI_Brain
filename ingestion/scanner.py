@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from metadata import get_metadata
-from database import Database
-from hash import sha256_file
+from .metadata import get_metadata
+from .database import Database
+from .hash import sha256_file
 
 
 class FileScanner:
