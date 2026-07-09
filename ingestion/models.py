@@ -1,12 +1,13 @@
 from dataclasses import dataclass
-from pathlib import Path
-from datetime import datetime
 
 
 @dataclass
 class FileRecord:
-    path: Path
-    filename: str
+    path: str
+    name: str
     extension: str
     size: int
-    modified: datetime
+    modified: str
+
+    sha256: str = ""
+    mime: str = ""
