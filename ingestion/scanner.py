@@ -1,5 +1,5 @@
 from pathlib import Path
-
+from .mime import detect_mime
 from .metadata import get_metadata
 from .database import Database
 from .hash import sha256_file
@@ -24,9 +24,11 @@ class FileScanner:
             if path.is_file():
 
                 info = get_metadata(path)
+                
 
                 # Calculate SHA-256
                 info["sha256"] = sha256_file(path)
+                info["mime"] = detect_mime(path)
 
                 # Save to SQLite
                 db.insert(info)
@@ -38,6 +40,7 @@ class FileScanner:
                 print(f"Modified  : {info['modified']}")
                 print(f"SHA256    : {info['sha256']}")
                 print(f"Path      : {info['path']}")
+                print(f"MIME      : {info['mime']}")
 
                 count += 1
 

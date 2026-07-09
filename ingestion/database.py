@@ -10,27 +10,21 @@ class Database:
 
     def insert(self, info):
         self.conn.execute(
-            """
-            INSERT OR IGNORE INTO files
-            (
-                path,
-                filename,
-                extension,
-                size,
-                modified,
-                sha256
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                info["path"],
-                info["name"],
-                info["extension"],
-                info["size"],
-                str(info["modified"]),
-                info["sha256"],
-            ),
-        )
+    """
+    INSERT OR IGNORE INTO files
+    (path, filename, extension, size, modified, sha256, mime)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """,
+    (
+        info["path"],
+        info["name"],
+        info["extension"],
+        info["size"],
+        str(info["modified"]),
+        info["sha256"],
+        info["mime"],
+    ),
+)
 
         self.conn.commit()
 
