@@ -11,19 +11,28 @@ class Database:
     def insert(self, info):
         self.conn.execute(
     """
-    INSERT OR IGNORE INTO files
-    (path, filename, extension, size, modified, sha256, mime)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT OR REPLACE INTO files (
+    path,
+    filename,
+    extension,
+    size,
+    modified,
+    sha256,
+    mime,
+    content
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """,
     (
-        info["path"],
-        info["name"],
-        info["extension"],
-        info["size"],
-        str(info["modified"]),
-        info["sha256"],
-        info["mime"],
-    ),
+    info["path"],
+    info["name"],
+    info["extension"],
+    info["size"],
+    info["modified"],
+    info["sha256"],
+    info["mime"],
+    info["content"],
+),
 )
 
         self.conn.commit()

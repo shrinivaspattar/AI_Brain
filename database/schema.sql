@@ -6,5 +6,6 @@ CREATE TABLE files (
     size INTEGER,
     modified TEXT,
     sha256 TEXT,
-    mime TEXT
+    mime TEXT,
+    content TEXT
 );

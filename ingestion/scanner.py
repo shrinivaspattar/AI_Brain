@@ -5,6 +5,7 @@ from .metadata import get_metadata
 from .database import Database
 from .hash import sha256_file
 from .archive import is_archive
+from .text import extract_text
 from config.ignore import IGNORE_DIRS, IGNORE_FILES
 from .archive_reader import (
     list_zip_contents,
@@ -29,9 +30,8 @@ class FileScanner:
         scanned_dirs = set()
 
         for root, dirs, files in os.walk(self.root):
-            scanned_dirs.add(root)
 
-            # Don't descend into ignored directories
+            scanned_dirs.add(root)
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
 
             for filename in files:
@@ -43,12 +43,13 @@ class FileScanner:
 
                 info = get_metadata(path)
 
-                # Calculate SHA-256
                 info["sha256"] = sha256_file(path)
                 info["mime"] = detect_mime(path)
                 info["archive"] = is_archive(path)
 
-                # Save to SQLite
+                text = extract_text(path)
+                info["content"] = text
+
                 db.insert(info)
 
                 print("-" * 60)
@@ -61,36 +62,23 @@ class FileScanner:
                 print(f"MIME      : {info['mime']}")
                 print(f"Archive   : {info['archive']}")
 
-                if info["archive"] and path.suffix.lower() == ".zip":
+                if text:
+                    print("Preview:")
+                    print(text[:100])
 
+                if info["archive"] and path.suffix.lower() == ".zip":
                     print("Contents:")
 
                     with open_zip(path) as archive:
-
                         items = list_zip_contents_from_archive(archive)
 
                         for item in items:
-
                             print(f"  - {item['name']}")
                             print(f"      Size            : {item['size']} bytes")
                             print(f"      Compressed Size : {item['compressed']} bytes")
                             print(f"      Archive         : {item['is_archive']}")
 
-                            # Inspect nested ZIPs
-                            if item["is_archive"] and item["name"].endswith(".zip"):
-
-                                data = archive.read(item["name"])
-
-                                with open_zip_bytes(data) as nested:
-
-                                    print("      Contents:")
-
-                                    nested_items = list_zip_contents_from_archive(nested)
-
-                                    for nested_item in nested_items:
-                                        print(f"        - {nested_item['name']}")
-
-                count += 1
+                    count += 1
         db.close()
 
         print(f"\nFinished. Files found: {count}")
