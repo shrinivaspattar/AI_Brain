@@ -3,7 +3,7 @@ from .mime import detect_mime
 from .metadata import get_metadata
 from .database import Database
 from .hash import sha256_file
-
+from .archive import is_archive
 
 class FileScanner:
     def __init__(self, root):
@@ -29,6 +29,7 @@ class FileScanner:
                 # Calculate SHA-256
                 info["sha256"] = sha256_file(path)
                 info["mime"] = detect_mime(path)
+                info["archive"] = is_archive(path)
 
                 # Save to SQLite
                 db.insert(info)
@@ -41,6 +42,7 @@ class FileScanner:
                 print(f"SHA256    : {info['sha256']}")
                 print(f"Path      : {info['path']}")
                 print(f"MIME      : {info['mime']}")
+                print(f"Archive  : {info['archive']}")
 
                 count += 1
 
