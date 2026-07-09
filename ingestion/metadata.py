@@ -9,6 +9,6 @@ def get_metadata(path: Path):
         "name": path.name,
         "extension": path.suffix.lower(),
         "size": stat.st_size,
-        "modified": datetime.fromtimestamp(stat.st_mtime),
+        "modified": str(datetime.fromtimestamp(stat.st_mtime)),
         "path": str(path),
     }

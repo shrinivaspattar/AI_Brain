@@ -42,6 +42,14 @@ class FileScanner:
                     continue
 
                 info = get_metadata(path)
+                existing = db.get_file(info["path"])
+                
+
+                if existing and existing[0] == str(info["modified"]):
+                    print(f"Skipping: {path.name}")
+                    continue
+                    print(f"Skipping: {path.name}")
+                    continue
 
                 info["sha256"] = sha256_file(path)
                 info["mime"] = detect_mime(path)

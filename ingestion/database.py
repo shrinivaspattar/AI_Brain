@@ -7,33 +7,41 @@ DB_PATH = Path(__file__).resolve().parent.parent / "database" / "knowledge.db"
 class Database:
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH)
+        self.cursor = self.conn.cursor()
+
+    def get_file(self, path):
+        self.cursor.execute(
+            "SELECT modified FROM files WHERE path = ?",
+            (path,),
+        )
+        return self.cursor.fetchone()
 
     def insert(self, info):
         self.conn.execute(
-    """
-    INSERT OR REPLACE INTO files (
-    path,
-    filename,
-    extension,
-    size,
-    modified,
-    sha256,
-    mime,
-    content
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    (
-    info["path"],
-    info["name"],
-    info["extension"],
-    info["size"],
-    info["modified"],
-    info["sha256"],
-    info["mime"],
-    info["content"],
-),
-)
+            """
+            INSERT OR REPLACE INTO files (
+                path,
+                filename,
+                extension,
+                size,
+                modified,
+                sha256,
+                mime,
+                content
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                info["path"],
+                info["name"],
+                info["extension"],
+                info["size"],
+                info["modified"],
+                info["sha256"],
+                info["mime"],
+                info["content"],
+            ),
+        )
 
         self.conn.commit()
 
