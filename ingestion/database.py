@@ -16,6 +16,17 @@ class Database:
         )
         return self.cursor.fetchone()
 
+    def get_all_paths(self):
+        self.cursor.execute("SELECT path FROM files")
+        return [row[0] for row in self.cursor.fetchall()]
+
+    def delete_file(self, path):
+        self.conn.execute(
+            "DELETE FROM files WHERE path = ?",
+            (path,),
+        )
+        self.conn.commit()
+
     def insert(self, info):
         self.conn.execute(
             """
@@ -42,7 +53,6 @@ class Database:
                 info["content"],
             ),
         )
-
         self.conn.commit()
 
     def close(self):

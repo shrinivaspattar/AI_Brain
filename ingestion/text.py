@@ -1,30 +1,27 @@
-from pathlib import Path
-from pypdf import PdfReader
+from parsers import (
+    text_parser,
+    markdown_parser,
+    pdf_parser,
+    json_parser,
+)
+from parsers import docx_parser
 
 
-def extract_text(path: Path) -> str:
+def extract_text(path):
     suffix = path.suffix.lower()
 
-    if suffix in {".txt", ".md"}:
-        return path.read_text(
-            encoding="utf-8",
-            errors="ignore",
-        )
+    if suffix == ".txt":
+        return text_parser.extract(path)
 
-    elif path.suffix.lower() == ".pdf":
-        try:
-            reader = PdfReader(path)
+    if suffix == ".md":
+        return markdown_parser.extract(path)
 
-            text = ""
+    if suffix == ".pdf":
+        return pdf_parser.extract(path)
 
-            for page in reader.pages:
-                page_text = page.extract_text()
+    if suffix == ".json":
+        return json_parser.extract(path)
+    if suffix == ".docx":
+        return docx_parser.extract(path)
 
-                if page_text:
-                    text += page_text + "\n"
-
-            return text
-
-        except Exception as e:
-            print(f"Warning: Could not read PDF '{path.name}': {e}")
-            return ""
+    return ""
