@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from .mime import detect_mime
 from .metadata import get_metadata
@@ -5,6 +6,8 @@ from .database import Database
 from .hash import sha256_file
 from .archive import is_archive
 from .archive_reader import list_zip_contents
+from config.ignore import IGNORE_DIRS, IGNORE_FILES
+
 
 class FileScanner:
     def __init__(self, root):
@@ -20,12 +23,19 @@ class FileScanner:
 
         count = 0
 
-        for path in self.root.rglob("*"):
+        for root, dirs, files in os.walk(self.root):
 
-            if path.is_file():
+            # Don't descend into ignored directories
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+
+            for filename in files:
+
+                path = Path(root) / filename
+
+                if path.name in IGNORE_FILES:
+                    continue
 
                 info = get_metadata(path)
-                
 
                 # Calculate SHA-256
                 info["sha256"] = sha256_file(path)
@@ -56,7 +66,6 @@ class FileScanner:
         db.close()
 
         print(f"\nFinished. Files found: {count}")
-
 if __name__ == "__main__":
     folder = input("Folder to scan: ").strip()
 
