@@ -1,9 +1,11 @@
-v0.0.1
+# Changelog
 
-✓ Project initialized
+## v0.1
 
-✓ Git configured
-
-✓ Scanner created
-
-✓ Metadata reader
+- Project initialized
+- Git configured
+- Python virtual environment
+- Recursive file scanner
+- Metadata extraction
+- SQLite database
+- File catalog

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from metadata import get_metadata
 from database import Database
+from hash import sha256_file
 
 
 class FileScanner:
@@ -24,6 +25,10 @@ class FileScanner:
 
                 info = get_metadata(path)
 
+                # Calculate SHA-256
+                info["sha256"] = sha256_file(path)
+
+                # Save to SQLite
                 db.insert(info)
 
                 print("-" * 60)
@@ -31,6 +36,7 @@ class FileScanner:
                 print(f"Extension : {info['extension']}")
                 print(f"Size      : {info['size']} bytes")
                 print(f"Modified  : {info['modified']}")
+                print(f"SHA256    : {info['sha256']}")
                 print(f"Path      : {info['path']}")
 
                 count += 1

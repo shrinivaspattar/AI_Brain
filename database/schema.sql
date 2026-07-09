@@ -4,5 +4,6 @@ CREATE TABLE IF NOT EXISTS files (
     filename TEXT,
     extension TEXT,
     size INTEGER,
-    modified TEXT
+    modified TEXT,
+    sha256 TEXT
 );

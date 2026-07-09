@@ -12,8 +12,15 @@ class Database:
         self.conn.execute(
             """
             INSERT OR IGNORE INTO files
-            (path, filename, extension, size, modified)
-            VALUES (?, ?, ?, ?, ?)
+            (
+                path,
+                filename,
+                extension,
+                size,
+                modified,
+                sha256
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 info["path"],
@@ -21,8 +28,10 @@ class Database:
                 info["extension"],
                 info["size"],
                 str(info["modified"]),
+                info["sha256"],
             ),
         )
+
         self.conn.commit()
 
     def close(self):
