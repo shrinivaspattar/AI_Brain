@@ -5,9 +5,13 @@ from .metadata import get_metadata
 from .database import Database
 from .hash import sha256_file
 from .archive import is_archive
-from .archive_reader import list_zip_contents
 from config.ignore import IGNORE_DIRS, IGNORE_FILES
-
+from .archive_reader import (
+    list_zip_contents,
+    open_zip,
+    open_zip_bytes,
+    list_zip_contents_from_archive,
+)
 
 class FileScanner:
     def __init__(self, root):
@@ -58,15 +62,35 @@ class FileScanner:
                 print(f"Archive   : {info['archive']}")
 
                 if info["archive"] and path.suffix.lower() == ".zip":
+
                     print("Contents:")
 
-                    for item in list_zip_contents(path):
-                        print(f"  - {item['name']}")
-                        print(f"      Size            : {item['size']} bytes")
-                        print(f"      Compressed Size : {item['compressed']} bytes")
+                    with open_zip(path) as archive:
+
+                        items = list_zip_contents_from_archive(archive)
+
+                        for item in items:
+
+                            print(f"  - {item['name']}")
+                            print(f"      Size            : {item['size']} bytes")
+                            print(f"      Compressed Size : {item['compressed']} bytes")
+                            print(f"      Archive         : {item['is_archive']}")
+
+                            # Inspect nested ZIPs
+                            if item["is_archive"] and item["name"].endswith(".zip"):
+
+                                data = archive.read(item["name"])
+
+                                with open_zip_bytes(data) as nested:
+
+                                    print("      Contents:")
+
+                                    nested_items = list_zip_contents_from_archive(nested)
+
+                                    for nested_item in nested_items:
+                                        print(f"        - {nested_item['name']}")
 
                 count += 1
-
         db.close()
 
         print(f"\nFinished. Files found: {count}")
