@@ -8,9 +8,7 @@ from .archive import is_archive
 from .text import extract_text
 from config.ignore import IGNORE_DIRS, IGNORE_FILES
 from .archive_reader import (
-    list_zip_contents,
     open_zip,
-    open_zip_bytes,
     list_zip_contents_from_archive,
 )
 
@@ -27,16 +25,25 @@ class FileScanner:
         db = Database()
 
         count = 0
-        scanned_dirs = set()
+        scanned_paths = set()
+        scanned = 0
+        indexed = 0
+        skipped = 0
+        removed = 0
+
+        scanned_paths = set()
+        
 
         for root, dirs, files in os.walk(self.root):
 
-            scanned_dirs.add(root)
+            
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
 
             for filename in files:
 
                 path = Path(root) / filename
+                scanned += 1
+                scanned_paths.add(str(path))
 
                 if path.name in IGNORE_FILES:
                     continue
@@ -46,11 +53,9 @@ class FileScanner:
                 
 
                 if existing and existing[0] == str(info["modified"]):
+                    skipped += 1
                     print(f"Skipping: {path.name}")
                     continue
-                    print(f"Skipping: {path.name}")
-                    continue
-
                 info["sha256"] = sha256_file(path)
                 info["mime"] = detect_mime(path)
                 info["archive"] = is_archive(path)
@@ -59,6 +64,7 @@ class FileScanner:
                 info["content"] = text
 
                 db.insert(info)
+                indexed += 1
 
                 print("-" * 60)
                 print(f"Name      : {info['name']}")
@@ -72,7 +78,7 @@ class FileScanner:
 
                 if text:
                     print("Preview:")
-                    print(text[:100])
+                    print(text[:100].strip())
 
                 if info["archive"] and path.suffix.lower() == ".zip":
                     print("Contents:")
@@ -86,13 +92,26 @@ class FileScanner:
                             print(f"      Compressed Size : {item['compressed']} bytes")
                             print(f"      Archive         : {item['is_archive']}")
 
-                    count += 1
-        db.close()
+        
+        db_paths = set(db.get_all_paths())
 
-        print(f"\nFinished. Files found: {count}")
+        deleted = db_paths - scanned_paths
+
+        for path in deleted:
+            print(f"Removing deleted file: {path}")
+            db.delete_file(path)
+            removed += 1
+        db.close()
+        print("\nScan Summary")
+        print("-" * 40)
+        print(f"Scanned : {scanned}")
+        print(f"Indexed : {indexed}")
+        print(f"Skipped : {skipped}")
+        print(f"Removed : {removed}")
 if __name__ == "__main__":
     folder = input("Folder to scan: ").strip()
 
     scanner = FileScanner(folder)
 
     scanner.scan()
+    
