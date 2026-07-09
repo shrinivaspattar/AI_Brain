@@ -3,7 +3,23 @@ from pathlib import Path
 
 
 def list_zip_contents(path: Path):
-    """Return a list of files inside a ZIP archive."""
+    """
+    Return metadata for every file inside a ZIP archive.
+    """
+
+    contents = []
 
     with zipfile.ZipFile(path, "r") as archive:
-        return archive.namelist()
+
+        for item in archive.infolist():
+
+            contents.append(
+                {
+                    "name": item.filename,
+                    "size": item.file_size,
+                    "compressed": item.compress_size,
+                    "is_dir": item.is_dir(),
+                }
+            )
+
+    return contents

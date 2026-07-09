@@ -22,8 +22,10 @@ class FileScanner:
         db = Database()
 
         count = 0
+        scanned_dirs = set()
 
         for root, dirs, files in os.walk(self.root):
+            scanned_dirs.add(root)
 
             # Don't descend into ignored directories
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
@@ -59,7 +61,9 @@ class FileScanner:
                     print("Contents:")
 
                     for item in list_zip_contents(path):
-                        print(f"  - {item}")
+                        print(f"  - {item['name']}")
+                        print(f"      Size            : {item['size']} bytes")
+                        print(f"      Compressed Size : {item['compressed']} bytes")
 
                 count += 1
 
