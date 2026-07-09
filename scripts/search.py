@@ -1,5 +1,4 @@
 import sqlite3
-from pathlib import Path
 
 conn = sqlite3.connect("database/knowledge.db")
 cursor = conn.cursor()

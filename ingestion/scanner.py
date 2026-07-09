@@ -24,7 +24,6 @@ class FileScanner:
 
         db = Database()
 
-        count = 0
         scanned_paths = set()
         scanned = 0
         indexed = 0
