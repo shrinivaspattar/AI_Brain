@@ -4,6 +4,7 @@ from .metadata import get_metadata
 from .database import Database
 from .hash import sha256_file
 from .archive import is_archive
+from .archive_reader import list_zip_contents
 
 class FileScanner:
     def __init__(self, root):
@@ -42,14 +43,19 @@ class FileScanner:
                 print(f"SHA256    : {info['sha256']}")
                 print(f"Path      : {info['path']}")
                 print(f"MIME      : {info['mime']}")
-                print(f"Archive  : {info['archive']}")
+                print(f"Archive   : {info['archive']}")
+
+                if info["archive"] and path.suffix.lower() == ".zip":
+                    print("Contents:")
+
+                    for item in list_zip_contents(path):
+                        print(f"  - {item}")
 
                 count += 1
 
         db.close()
 
         print(f"\nFinished. Files found: {count}")
-
 
 if __name__ == "__main__":
     folder = input("Folder to scan: ").strip()
