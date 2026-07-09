@@ -1,18 +1,24 @@
-venv/
-
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
+# Virtual environment
+venv/
+
+# SQLite
+database/*.db
+
+# Logs
 logs/
+
+# Temporary files
 temp/
 
-*.db
-*.sqlite
-*.sqlite3
-
+# VS Code
 .vscode/
-.idea/
 
+# OS files
 .DS_Store
 Thumbs.db
