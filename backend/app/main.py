@@ -2,18 +2,19 @@ from fastapi import FastAPI
 
 from app.api.health import router as health_router
 from app.api.version import router as version_router
+from app.core.config import settings
 
 app = FastAPI(
-    title="AI_Brain",
+    title=settings.PROJECT_NAME,
     description="Personal AI Knowledge System",
-    version="0.1.0",
+    version=settings.VERSION,
 )
 
 
 @app.get("/")
 async def root():
     return {
-        "message": "Welcome to AI_Brain"
+        "message": f"Welcome to {settings.PROJECT_NAME}"
     }
 
 
