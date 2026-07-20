@@ -1,7 +1,8 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.schemas.import_job import ImportJobCreate
+
 from app.models.import_job import ImportJob
+from app.schemas.import_job import ImportJobCreate
 
 
 class ImportJobService:
@@ -16,7 +17,7 @@ class ImportJobService:
             name=job_data.name,
             source_path=job_data.source_path,
             source_type=job_data.source_type,
-)
+        )
 
         try:
             self.db.add(job)
@@ -28,11 +29,27 @@ class ImportJobService:
             self.db.rollback()
             raise
 
-    def get_job(self, job_id: int) -> ImportJob | None:
+    def get_job(
+        self,
+        job_id: int,
+    ) -> ImportJob | None:
         return self.db.get(ImportJob, job_id)
 
-    def list_jobs(self) -> list[ImportJob]:
+    def list_jobs(
+        self,
+    ) -> list[ImportJob]:
         statement = select(ImportJob).order_by(
             ImportJob.created_at.desc()
         )
         return list(self.db.scalars(statement))
+
+    def _get_job_or_raise(
+        self,
+        job_id: int,
+    ) -> ImportJob:
+        job = self.db.get(ImportJob, job_id)
+
+        if job is None:
+            raise ValueError(f"Import job {job_id} not found")
+
+        return job
