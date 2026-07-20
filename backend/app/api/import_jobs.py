@@ -57,7 +57,6 @@ def create_import_job(
     "",
     response_model=List[ImportJobResponse],
 )
-
 def list_import_jobs(
     db: Session = Depends(get_db),
 ) -> list[ImportJobResponse]:
@@ -82,6 +81,31 @@ def start_import_job(
 
     try:
         return service.mark_running(job_id)
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    
+    
+@router.post(
+    "/{job_id}/complete",
+    response_model=ImportJobResponse,
+    responses={
+        404: {
+            "description": "Import job not found"
+        }
+    },
+)
+def complete_import_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+) -> ImportJobResponse:
+    service = ImportJobService(db)
+
+    try:
+        return service.mark_completed(job_id)
 
     except ValueError as e:
         raise HTTPException(

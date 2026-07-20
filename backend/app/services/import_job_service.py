@@ -31,11 +31,13 @@ class ImportJobService:
             self.db.rollback()
             raise
 
+
     def get_job(
         self,
         job_id: int,
     ) -> ImportJob | None:
         return self.db.get(ImportJob, job_id)
+
 
     def list_jobs(
         self,
@@ -44,6 +46,7 @@ class ImportJobService:
             ImportJob.created_at.desc()
         )
         return list(self.db.scalars(statement))
+
 
     def _get_job_or_raise(
         self,
@@ -55,6 +58,7 @@ class ImportJobService:
             raise ValueError(f"Import job {job_id} not found")
         return job
     
+
     def mark_running(
         self,
         job_id: int,
@@ -64,6 +68,27 @@ class ImportJobService:
         try:
             job.status = ImportStatus.RUNNING
             job.started_at = datetime.now(UTC)
+
+            self.db.commit()
+            self.db.refresh(job)
+
+            return job
+
+        except Exception:
+            self.db.rollback()
+            raise
+
+
+    def mark_completed(
+        self,
+        job_id: int,
+    ) -> ImportJob:
+        job = self._get_job_or_raise(job_id)
+
+        try:
+            job.status = ImportStatus.COMPLETED
+            job.progress = 100
+            job.finished_at = datetime.now(UTC)
 
             self.db.commit()
             self.db.refresh(job)
