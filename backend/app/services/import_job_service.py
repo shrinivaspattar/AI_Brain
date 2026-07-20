@@ -1,7 +1,9 @@
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.import_job import ImportJob
+from app.models.import_job import ImportJob, ImportStatus
 from app.schemas.import_job import ImportJobCreate
 
 
@@ -51,5 +53,23 @@ class ImportJobService:
 
         if job is None:
             raise ValueError(f"Import job {job_id} not found")
-
         return job
+    
+    def mark_running(
+        self,
+        job_id: int,
+    ) -> ImportJob:
+        job = self._get_job_or_raise(job_id)
+
+        try:
+            job.status = ImportStatus.RUNNING
+            job.started_at = datetime.now(UTC)
+
+            self.db.commit()
+            self.db.refresh(job)
+
+            return job
+
+        except Exception:
+            self.db.rollback()
+            raise
