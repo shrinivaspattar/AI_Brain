@@ -31,22 +31,17 @@ class ImportJobService:
             self.db.rollback()
             raise
 
-
     def get_job(
         self,
         job_id: int,
     ) -> ImportJob | None:
         return self.db.get(ImportJob, job_id)
 
-
     def list_jobs(
         self,
     ) -> list[ImportJob]:
-        statement = select(ImportJob).order_by(
-            ImportJob.created_at.desc()
-        )
+        statement = select(ImportJob).order_by(ImportJob.created_at.desc())
         return list(self.db.scalars(statement))
-
 
     def _get_job_or_raise(
         self,
@@ -57,7 +52,6 @@ class ImportJobService:
         if job is None:
             raise ValueError(f"Import job {job_id} not found")
         return job
-    
 
     def mark_running(
         self,
@@ -77,7 +71,6 @@ class ImportJobService:
         except Exception:
             self.db.rollback()
             raise
-
 
     def mark_completed(
         self,

@@ -2,8 +2,10 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.db.database import engine
 
+
 class Base(DeclarativeBase):
     pass
+
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -11,6 +13,7 @@ SessionLocal = sessionmaker(
     autocommit=False,
     expire_on_commit=False,
 )
+
 
 def get_db():
     db = SessionLocal()

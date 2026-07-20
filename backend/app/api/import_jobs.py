@@ -7,7 +7,6 @@ from app.db.session import get_db
 from app.schemas.import_job import ImportJobCreate, ImportJobResponse
 from app.services.import_job_service import ImportJobService
 
-
 router = APIRouter(
     prefix="/import-jobs",
     tags=["Import Jobs"],
@@ -17,11 +16,7 @@ router = APIRouter(
 @router.get(
     "/{job_id}",
     response_model=ImportJobResponse,
-    responses={
-        404: {
-            "description": "Import job not found"
-        }
-    },
+    responses={404: {"description": "Import job not found"}},
 )
 def get_import_job(
     job_id: int,
@@ -67,11 +62,7 @@ def list_import_jobs(
 @router.post(
     "/{job_id}/start",
     response_model=ImportJobResponse,
-    responses={
-        404: {
-            "description": "Import job not found"
-        }
-    },
+    responses={404: {"description": "Import job not found"}},
 )
 def start_import_job(
     job_id: int,
@@ -87,16 +78,12 @@ def start_import_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         )
-    
-    
+
+
 @router.post(
     "/{job_id}/complete",
     response_model=ImportJobResponse,
-    responses={
-        404: {
-            "description": "Import job not found"
-        }
-    },
+    responses={404: {"description": "Import job not found"}},
 )
 def complete_import_job(
     job_id: int,
