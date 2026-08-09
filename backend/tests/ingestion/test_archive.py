@@ -6,7 +6,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 import pytest
 
 from app.ingestion.archive import ArchiveExtractor
-from app.ingestion.scanner import DiscoveredFile
+from app.ingestion.scanner import DiscoveredFile, SourceScanner
 
 
 def test_rejects_extraction_below_hard_disk_reserve(
@@ -239,3 +239,32 @@ def test_calculate_expansion_ratio_zero_compressed_size() -> None:
     )
 
     assert ratio == float("inf")
+
+
+def test_extract_accepts_source_scanner_output(tmp_path: Path) -> None:
+    """Archive extraction should accept files discovered by SourceScanner."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+
+    (source / "notes.txt").write_text("notes")
+
+    zip_path = source / "documents.zip"
+    with ZipFile(zip_path, "w") as archive:
+        archive.writestr("book.txt", "book")
+
+    discovered = SourceScanner().scan(source)
+    destination = tmp_path / "extracted"
+
+    result = ArchiveExtractor().extract(
+        discovered,
+        destination,
+    )
+
+    assert [file.relative_path for file in discovered] == [
+        Path("documents.zip"),
+        Path("notes.txt"),
+    ]
+
+    assert (destination / "book.txt").read_text() == "book"
+    assert len(result) == 3
