@@ -130,4 +130,19 @@ class ArchiveExtractor:
         archive: ZipFile,
     ) -> None:
         """Reject archive members that exceed the hard expansion-ratio limit."""
-        pass
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
+
+            ratio = self._calculate_expansion_ratio(
+                member.compress_size,
+                member.file_size,
+            )
+
+            if ratio > self.HARD_EXPANSION_RATIO:
+                raise ValueError(
+                    "Archive member exceeds hard expansion ratio: "
+                    f"member={member.filename}, "
+                    f"ratio={ratio:.2f}, "
+                    f"hard_limit={self.HARD_EXPANSION_RATIO}"
+                )
