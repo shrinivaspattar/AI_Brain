@@ -195,3 +195,47 @@ def test_rejects_member_with_zero_compressed_size() -> None:
         match="hard expansion ratio",
     ):
         ArchiveExtractor()._validate_expansion(archive)
+
+
+def test_calculate_expansion_ratio_normal() -> None:
+    """Expansion ratio should be uncompressed size divided by compressed size."""
+
+    ratio = ArchiveExtractor()._calculate_expansion_ratio(
+        compressed_size=100,
+        uncompressed_size=500,
+    )
+
+    assert ratio == 5.0
+
+
+def test_calculate_expansion_ratio_exact_limit() -> None:
+    """Expansion ratio should correctly represent the hard limit."""
+
+    ratio = ArchiveExtractor()._calculate_expansion_ratio(
+        compressed_size=1,
+        uncompressed_size=ArchiveExtractor.HARD_EXPANSION_RATIO,
+    )
+
+    assert ratio == 1000.0
+
+
+def test_calculate_expansion_ratio_above_limit() -> None:
+    """Expansion ratio should correctly represent values above the hard limit."""
+
+    ratio = ArchiveExtractor()._calculate_expansion_ratio(
+        compressed_size=1,
+        uncompressed_size=ArchiveExtractor.HARD_EXPANSION_RATIO + 1,
+    )
+
+    assert ratio > ArchiveExtractor.HARD_EXPANSION_RATIO
+
+
+def test_calculate_expansion_ratio_zero_compressed_size() -> None:
+    """Zero compressed size should produce an infinite expansion ratio."""
+
+    ratio = ArchiveExtractor()._calculate_expansion_ratio(
+        compressed_size=0,
+        uncompressed_size=1,
+    )
+
+    assert ratio == float("inf")
