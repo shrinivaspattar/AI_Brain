@@ -39,7 +39,7 @@ postgres/data/
 redis/data/
 
 # AI Models
-models/
+/models/
 
 # Temporary
 tmp/
