@@ -99,3 +99,24 @@ def complete_import_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         )
+
+
+@router.post(
+    "/{job_id}/execute",
+    response_model=ImportJobResponse,
+    responses={404: {"description": "Import job not found"}},
+)
+def execute_import_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+) -> ImportJobResponse:
+    service = ImportJobService(db)
+
+    try:
+        return service.execute_job(job_id)
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
