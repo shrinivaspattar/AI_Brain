@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     VERSION: str = "0.1.0"
 
     DATABASE_URL: str = ""
+    INGESTION_DIR: Path = BASE_DIR / "documents" / "imports"
     REDIS_URL: str = "redis://localhost:6379"
 
     OLLAMA_HOST: str = "http://localhost:11434"

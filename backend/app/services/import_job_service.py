@@ -1,15 +1,20 @@
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.ingestion.document_ingestor import DocumentIngestor
 from app.models.import_job import ImportJob, ImportStatus
 from app.schemas.import_job import ImportJobCreate
+from app.services.document_service import DocumentService
 
 
 class ImportJobService:
     def __init__(self, db: Session):
         self.db = db
+        self.ingestion_dir = settings.INGESTION_DIR
 
     def create_job(
         self,
@@ -51,6 +56,7 @@ class ImportJobService:
 
         if job is None:
             raise ValueError(f"Import job {job_id} not found")
+
         return job
 
     def mark_running(
@@ -90,4 +96,43 @@ class ImportJobService:
 
         except Exception:
             self.db.rollback()
+            raise
+
+    def execute_job(
+        self,
+        job_id: int,
+    ) -> ImportJob:
+        job = self._get_job_or_raise(job_id)
+
+        self.mark_running(job_id)
+
+        try:
+            destination = self.ingestion_dir / str(job.id)
+
+            document_service = DocumentService(self.db)
+            ingestor = DocumentIngestor(document_service)
+
+            documents = ingestor.ingest(
+                Path(job.source_path),
+                destination,
+            )
+
+            job.files_discovered = len(documents)
+            job.files_processed = len(documents)
+
+            self.db.commit()
+            self.db.refresh(job)
+
+            return self.mark_completed(job_id)
+
+        except Exception as exc:
+            self.db.rollback()
+
+            job.status = ImportStatus.FAILED
+            job.error_message = str(exc)
+            job.finished_at = datetime.now(UTC)
+
+            self.db.commit()
+            self.db.refresh(job)
+
             raise
