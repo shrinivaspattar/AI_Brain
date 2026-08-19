@@ -76,3 +76,64 @@ def test_execute_job_rejects_missing_job() -> None:
 
     with pytest.raises(ValueError, match="Import job 42 not found"):
         service.execute_job(42)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ImportStatus.RUNNING,
+        ImportStatus.PAUSED,
+        ImportStatus.COMPLETED,
+        ImportStatus.CANCELLED,
+    ],
+)
+def test_execute_job_rejects_non_executable_statuses(
+    status: ImportStatus,
+) -> None:
+    db = MagicMock()
+
+    job = ImportJob(
+        id=42,
+        name="Test Import",
+        source_path="/documents/source",
+        source_type="filesystem",
+        status=status,
+    )
+
+    db.get.return_value = job
+
+    service = ImportJobService(db)
+
+    with pytest.raises(
+        ValueError,
+        match="Import job 42 cannot be executed",
+    ):
+        service.execute_job(42)
+
+
+def test_execute_job_allows_failed_job_retry() -> None:
+    db = MagicMock()
+
+    job = ImportJob(
+        id=42,
+        name="Test Import",
+        source_path="/documents/source",
+        source_type="filesystem",
+        status=ImportStatus.FAILED,
+    )
+
+    db.get.return_value = job
+
+    documents = [MagicMock()]
+
+    service = ImportJobService(db)
+
+    with patch("app.services.import_job_service.DocumentIngestor") as ingestor_class:
+        ingestor_class.return_value.ingest.return_value = documents
+
+        result = service.execute_job(42)
+
+    assert result is job
+    assert result.status == ImportStatus.COMPLETED
+    assert result.files_discovered == 1
+    assert result.files_processed == 1

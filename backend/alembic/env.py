@@ -1,3 +1,4 @@
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,9 +10,11 @@ import app.models  # noqa: F401
 
 config = context.config
 
+database_url = os.environ.get("DATABASE_URL", settings.DATABASE_URL)
+
 config.set_main_option(
     "sqlalchemy.url",
-    settings.DATABASE_URL,
+    database_url,
 )
 
 target_metadata = Base.metadata

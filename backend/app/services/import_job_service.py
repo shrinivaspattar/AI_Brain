@@ -12,9 +12,13 @@ from app.services.document_service import DocumentService
 
 
 class ImportJobService:
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        ingestion_dir: Path | None = None,
+    ):
         self.db = db
-        self.ingestion_dir = settings.INGESTION_DIR
+        self.ingestion_dir = ingestion_dir or settings.INGESTION_DIR
 
     def create_job(
         self,
@@ -103,6 +107,14 @@ class ImportJobService:
         job_id: int,
     ) -> ImportJob:
         job = self._get_job_or_raise(job_id)
+
+        if job.status in {
+            ImportStatus.RUNNING,
+            ImportStatus.PAUSED,
+            ImportStatus.COMPLETED,
+            ImportStatus.CANCELLED,
+        }:
+            raise ValueError(f"Import job {job.id} cannot be executed")
 
         self.mark_running(job_id)
 
