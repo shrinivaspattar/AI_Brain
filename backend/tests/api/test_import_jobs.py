@@ -57,3 +57,51 @@ def test_execute_import_job() -> None:
 
     finally:
         app.dependency_overrides.clear()
+
+
+def test_execute_import_job_returns_conflict_for_invalid_state() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.execute_job.side_effect = ValueError(
+                "Import job 42 cannot be executed"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/execute")
+
+            assert response.status_code == 409
+            assert response.json() == {"detail": "Import job 42 cannot be executed"}
+
+            service_class.return_value.execute_job.assert_called_once_with(42)
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_execute_import_job_returns_not_found() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.execute_job.side_effect = ValueError(
+                "Import job 42 not found"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/execute")
+
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Import job 42 not found"}
+
+            service_class.return_value.execute_job.assert_called_once_with(42)
+
+    finally:
+        app.dependency_overrides.clear()
