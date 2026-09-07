@@ -69,6 +69,12 @@ class ImportJobService:
     ) -> ImportJob:
         job = self._get_job_or_raise(job_id)
 
+        if job.status not in {
+            ImportStatus.PENDING,
+            ImportStatus.FAILED,
+        }:
+            raise ValueError(f"Import job {job.id} cannot transition to RUNNING")
+
         try:
             job.status = ImportStatus.RUNNING
             job.started_at = datetime.now(UTC)
@@ -124,13 +130,13 @@ class ImportJobService:
             document_service = DocumentService(self.db)
             ingestor = DocumentIngestor(document_service)
 
-            documents = ingestor.ingest(
+            ingestor.ingest(
                 Path(job.source_path),
                 destination,
             )
 
-            job.files_discovered = len(documents)
-            job.files_processed = len(documents)
+            job.files_discovered = ingestor.last_discovered_count
+            job.files_processed = ingestor.last_discovered_count
 
             self.db.commit()
             self.db.refresh(job)

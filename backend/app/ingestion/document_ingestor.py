@@ -19,6 +19,7 @@ class DocumentIngestor:
         self.document_service = document_service
         self.scanner = scanner or SourceScanner()
         self.archive_extractor = archive_extractor or ArchiveExtractor()
+        self.last_discovered_count = 0
 
     def ingest(
         self,
@@ -28,14 +29,20 @@ class DocumentIngestor:
         """Discover source files, expand archives, and persist documents."""
 
         discovered = self.scanner.scan(source)
+
         discovered = self.archive_extractor.extract(
             discovered,
             destination,
         )
 
+        self.last_discovered_count = len(discovered)
+
         documents: list[Document] = []
 
         for file in discovered:
+            if file.path.suffix.lower() == ".zip":
+                continue
+
             document = self.document_service.create_document(
                 self._build_document_data(file)
             )

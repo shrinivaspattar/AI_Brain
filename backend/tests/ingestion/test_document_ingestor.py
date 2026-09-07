@@ -84,3 +84,35 @@ def test_ingest_returns_empty_list_for_empty_source(
 
     assert result == []
     document_service.create_document.assert_not_called()
+
+
+def test_ingest_skips_archive_container_documents(
+    tmp_path: Path,
+) -> None:
+    from zipfile import ZipFile
+
+    source = tmp_path / "source"
+    destination = tmp_path / "extracted"
+
+    source.mkdir()
+    destination.mkdir()
+
+    archive = source / "knowledge.zip"
+
+    with ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("notes.txt", "hello from ZIP")
+
+    document_service = MagicMock()
+
+    ingestor = DocumentIngestor(
+        document_service=document_service,
+    )
+
+    result = ingestor.ingest(source, destination)
+
+    assert len(result) == 1
+
+    document_data = document_service.create_document.call_args.args[0]
+
+    assert document_data.title == "notes.txt"
+    assert document_data.source_type == "txt"

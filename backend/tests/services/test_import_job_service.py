@@ -15,6 +15,7 @@ def test_execute_job_ingests_source_and_completes() -> None:
         name="Test Import",
         source_path="/documents/source",
         source_type="filesystem",
+        status=ImportStatus.PENDING,
     )
 
     db.get.return_value = job
@@ -25,6 +26,7 @@ def test_execute_job_ingests_source_and_completes() -> None:
 
     with patch("app.services.import_job_service.DocumentIngestor") as ingestor_class:
         ingestor_class.return_value.ingest.return_value = documents
+        ingestor_class.return_value.last_discovered_count = len(documents)
 
         result = service.execute_job(42)
 
@@ -49,6 +51,7 @@ def test_execute_job_marks_failed_on_ingestion_error() -> None:
         name="Test Import",
         source_path="/documents/source",
         source_type="filesystem",
+        status=ImportStatus.PENDING,
     )
 
     db.get.return_value = job
@@ -130,6 +133,7 @@ def test_execute_job_allows_failed_job_retry() -> None:
 
     with patch("app.services.import_job_service.DocumentIngestor") as ingestor_class:
         ingestor_class.return_value.ingest.return_value = documents
+        ingestor_class.return_value.last_discovered_count = len(documents)
 
         result = service.execute_job(42)
 
@@ -137,3 +141,47 @@ def test_execute_job_allows_failed_job_retry() -> None:
     assert result.status == ImportStatus.COMPLETED
     assert result.files_discovered == 1
     assert result.files_processed == 1
+
+
+def test_mark_running_allows_pending_job() -> None:
+    db = MagicMock()
+
+    job = ImportJob(
+        id=42,
+        name="Test Import",
+        source_path="/documents/source",
+        source_type="filesystem",
+        status=ImportStatus.PENDING,
+    )
+
+    db.get.return_value = job
+
+    service = ImportJobService(db)
+
+    result = service.mark_running(42)
+
+    assert result is job
+    assert result.status == ImportStatus.RUNNING
+    assert result.started_at is not None
+
+
+def test_mark_running_allows_failed_job_retry() -> None:
+    db = MagicMock()
+
+    job = ImportJob(
+        id=42,
+        name="Test Import",
+        source_path="/documents/source",
+        source_type="filesystem",
+        status=ImportStatus.FAILED,
+    )
+
+    db.get.return_value = job
+
+    service = ImportJobService(db)
+
+    result = service.mark_running(42)
+
+    assert result is job
+    assert result.status == ImportStatus.RUNNING
+    assert result.started_at is not None

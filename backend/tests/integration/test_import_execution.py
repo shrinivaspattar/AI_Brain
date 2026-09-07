@@ -95,7 +95,10 @@ def test_import_job_executes_zip_against_test_database(
         db.commit()
         db.refresh(job)
 
-        service = ImportJobService(db)
+        service = ImportJobService(
+            db,
+            ingestion_dir=tmp_path / "imports",
+        )
 
         result = service.execute_job(job.id)
 
