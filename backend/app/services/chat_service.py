@@ -7,10 +7,11 @@ from app.memory.service import MemoryService
 from app.models.conversation import Conversation
 from app.models.memory import Memory
 from app.models.message import Message, MessageRole
+from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
 from app.services.chat_client import ChatClient
 from app.tools.builtin import build_default_registry
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolCallResult, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,12 @@ SYSTEM_PROMPT = (
 MAX_HISTORY_MESSAGES = 20
 MAX_MEMORIES = 50
 MAX_TOOL_ITERATIONS = 5
+
+# Cap on how much of a tool's result text gets persisted in the audit
+# record (ToolCallRecord.result). This bounds the tool_calls table, not
+# the model's actual context — the full, untruncated result is always
+# what gets fed back to the model; only the stored audit copy is capped.
+MAX_TOOL_RESULT_LENGTH = 4000
 
 
 class ChatService:
@@ -68,7 +75,7 @@ class ChatService:
         history = self._load_history(conversation.id)
         prompt = self._build_prompt(history, retrieved, memories)
 
-        reply_text = self._run_tool_loop(prompt)
+        reply_text, tool_call_ids = self._run_tool_loop(prompt, conversation.id)
 
         citations = self._build_citations(retrieved)
 
@@ -83,29 +90,44 @@ class ChatService:
             self.db.add(assistant_message)
             self.db.commit()
             self.db.refresh(assistant_message)
-            return assistant_message
 
         except Exception:
             self.db.rollback()
             raise
 
-    def _run_tool_loop(self, messages: list[dict]) -> str:
+        if tool_call_ids:
+            self._link_tool_calls_to_message(tool_call_ids, assistant_message.id)
+
+        return assistant_message
+
+    def _run_tool_loop(
+        self,
+        messages: list[dict],
+        conversation_id: str,
+    ) -> tuple[str, list[int]]:
         """Drive the chat/tool-call loop until the model gives a plain reply.
 
         Each iteration: send the conversation so far (plus any tool
         results already gathered) to the model. If it asks to call
-        tools, execute them and feed the results back for the next
+        tools, execute them, persist an audit record for each (see
+        ToolCallRecord), and feed the results back for the next
         iteration. Capped at MAX_TOOL_ITERATIONS so a model that keeps
         calling tools without ever answering can't loop forever.
+
+        Returns the final reply text and the ids of any ToolCallRecord
+        rows created, so the caller can link them to the assistant
+        Message once it exists (the message doesn't exist yet at the
+        point a tool call happens mid-loop).
         """
         working_messages = list(messages)
         tools_schema = self.tool_registry.to_ollama_schema()
+        tool_call_record_ids: list[int] = []
 
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(1, MAX_TOOL_ITERATIONS + 1):
             reply = self.chat_client.chat(working_messages, tools=tools_schema)
 
             if not reply.tool_calls:
-                return reply.content or ""
+                return reply.content or "", tool_call_record_ids
 
             working_messages.append(
                 {
@@ -123,17 +145,28 @@ class ChatService:
                 }
             )
 
-            for call in reply.tool_calls:
+            for call_index, call in enumerate(reply.tool_calls):
                 arguments = dict(call.function.arguments)
                 logger.info("Tool call: %s(%s)", call.function.name, arguments)
 
                 result = self.tool_registry.call(call.function.name, arguments)
 
+                record_id = self._record_tool_call(
+                    conversation_id=conversation_id,
+                    tool_name=call.function.name,
+                    iteration=iteration,
+                    call_index=call_index,
+                    arguments=arguments,
+                    result=result,
+                )
+                if record_id is not None:
+                    tool_call_record_ids.append(record_id)
+
                 working_messages.append(
                     {
                         "role": "tool",
                         "tool_name": call.function.name,
-                        "content": result,
+                        "content": result.content,
                     }
                 )
 
@@ -144,7 +177,78 @@ class ChatService:
         return (
             "I wasn't able to finish that after several tool calls — "
             "could you try rephrasing?"
+        ), tool_call_record_ids
+
+    def _record_tool_call(
+        self,
+        conversation_id: str,
+        tool_name: str,
+        iteration: int,
+        call_index: int,
+        arguments: dict,
+        result: ToolCallResult,
+    ) -> int | None:
+        """Persist an audit record for one tool call. Best-effort: a
+        failure here is logged and swallowed rather than breaking the
+        chat turn — audit logging must never be why a user doesn't get
+        an answer.
+        """
+        result_text, was_truncated = self._truncate_for_audit(result.content)
+
+        record = ToolCallRecord(
+            conversation_id=conversation_id,
+            message_id=None,
+            tool_name=tool_name,
+            iteration=iteration,
+            call_index=call_index,
+            arguments=arguments,
+            status=ToolCallStatus.ERROR if result.is_error else ToolCallStatus.SUCCESS,
+            result=result_text,
+            result_truncated=was_truncated,
+            error_message=result.error,
+            duration_ms=result.duration_ms,
         )
+
+        try:
+            self.db.add(record)
+            self.db.commit()
+            self.db.refresh(record)
+            return record.id
+
+        except Exception:
+            self.db.rollback()
+            logger.warning(
+                "Failed to persist tool call audit record for '%s'",
+                tool_name,
+                exc_info=True,
+            )
+            return None
+
+    def _link_tool_calls_to_message(
+        self,
+        tool_call_ids: list[int],
+        message_id: int,
+    ) -> None:
+        try:
+            self.db.query(ToolCallRecord).filter(
+                ToolCallRecord.id.in_(tool_call_ids)
+            ).update({"message_id": message_id}, synchronize_session=False)
+            self.db.commit()
+
+        except Exception:
+            self.db.rollback()
+            logger.warning(
+                "Failed to link tool call records %s to message %s",
+                tool_call_ids,
+                message_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _truncate_for_audit(text: str) -> tuple[str, bool]:
+        if len(text) <= MAX_TOOL_RESULT_LENGTH:
+            return text, False
+        return text[:MAX_TOOL_RESULT_LENGTH], True
 
     def _get_or_create_conversation(
         self,

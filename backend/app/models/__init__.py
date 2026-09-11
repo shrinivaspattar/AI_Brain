@@ -4,6 +4,7 @@ from app.models.document_chunk import DocumentChunk
 from app.models.import_job import ImportJob
 from app.models.memory import Memory
 from app.models.message import Message
+from app.models.tool_call import ToolCallRecord
 
 __all__ = [
     "Conversation",
@@ -12,4 +13,5 @@ __all__ = [
     "ImportJob",
     "Memory",
     "Message",
+    "ToolCallRecord",
 ]

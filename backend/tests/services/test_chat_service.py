@@ -7,8 +7,31 @@ from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.memory import Memory
 from app.models.message import Message, MessageRole
+from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievedChunk
 from app.services.chat_service import ChatService
+from app.tools.registry import ToolCallResult
+
+
+def _make_fake_refresh():
+    """A db.refresh side_effect that assigns ids the way a real commit
+    would, for Conversation/Message/ToolCallRecord - so code that reads
+    `.id` right after refresh() behaves the same as it would against a
+    real database.
+    """
+    counters = {"message": 0, "tool_call": 0}
+
+    def fake_refresh(obj):
+        if isinstance(obj, Conversation) and obj.id is None:
+            obj.id = "conv-1"
+        if isinstance(obj, Message) and obj.id is None:
+            counters["message"] += 1
+            obj.id = counters["message"]
+        if isinstance(obj, ToolCallRecord) and obj.id is None:
+            counters["tool_call"] += 1
+            obj.id = counters["tool_call"]
+
+    return fake_refresh
 
 
 def _reply(content: str) -> MagicMock:
@@ -289,14 +312,7 @@ def test_send_message_executes_a_tool_call_and_returns_final_reply() -> None:
     db = MagicMock()
     db.get.return_value = None
     db.scalars.return_value = []
-
-    def fake_refresh(obj):
-        if isinstance(obj, Conversation) and obj.id is None:
-            obj.id = "conv-1"
-        if isinstance(obj, Message) and obj.id is None:
-            obj.id = 1
-
-    db.refresh.side_effect = fake_refresh
+    db.refresh.side_effect = _make_fake_refresh()
 
     chat_client = MagicMock()
     chat_client.chat.side_effect = [
@@ -309,7 +325,11 @@ def test_send_message_executes_a_tool_call_and_returns_final_reply() -> None:
 
     tool_registry = MagicMock()
     tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
-    tool_registry.call.return_value = "2026-09-12T00:00:00+00:00"
+    tool_registry.call.return_value = ToolCallResult(
+        content="2026-09-12T00:00:00+00:00",
+        is_error=False,
+        duration_ms=1,
+    )
 
     service = ChatService(
         db,
@@ -336,18 +356,296 @@ def test_send_message_executes_a_tool_call_and_returns_final_reply() -> None:
     }
 
 
+def test_send_message_persists_audit_record_for_successful_tool_call() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("get_current_datetime")),
+        _reply("It's currently 2026-09-12."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
+    tool_registry.call.return_value = ToolCallResult(
+        content="2026-09-12T00:00:00+00:00",
+        is_error=False,
+        duration_ms=7,
+    )
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        tool_registry=tool_registry,
+    )
+
+    assistant_message = service.send_message("what time is it?")
+
+    added_records = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], ToolCallRecord)
+    ]
+
+    assert len(added_records) == 1
+    record = added_records[0]
+
+    assert record.conversation_id == "conv-1"
+    assert record.tool_name == "get_current_datetime"
+    assert record.iteration == 1
+    assert record.call_index == 0
+    assert record.arguments == {}
+    assert record.status == ToolCallStatus.SUCCESS
+    assert record.result == "2026-09-12T00:00:00+00:00"
+    assert record.result_truncated is False
+    assert record.error_message is None
+    assert record.duration_ms == 7
+
+    # linked to the assistant message once it exists
+    link_filters = db.query.return_value.filter.return_value
+    link_filters.update.assert_called_once_with(
+        {"message_id": assistant_message.id}, synchronize_session=False
+    )
+
+
+def test_send_message_persists_audit_record_for_failed_tool_call() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("search_knowledge_base", query="x")),
+        _reply("Sorry, that search failed."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
+    tool_registry.call.return_value = ToolCallResult(
+        content="Error running tool 'search_knowledge_base': boom",
+        is_error=True,
+        error="boom",
+        duration_ms=3,
+    )
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        tool_registry=tool_registry,
+    )
+
+    service.send_message("search for something")
+
+    added_records = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], ToolCallRecord)
+    ]
+
+    assert len(added_records) == 1
+    record = added_records[0]
+
+    assert record.status == ToolCallStatus.ERROR
+    assert record.error_message == "boom"
+    assert "boom" in record.result
+
+
+def test_send_message_succeeds_even_if_audit_persistence_fails() -> None:
+    """Audit logging is best-effort: a DB failure while persisting a
+    ToolCallRecord must not prevent the user from getting an answer.
+    """
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    last_added = {"obj": None}
+    db.add.side_effect = lambda obj: last_added.__setitem__("obj", obj)
+
+    def maybe_fail_commit():
+        if isinstance(last_added["obj"], ToolCallRecord):
+            raise RuntimeError("db unavailable")
+
+    db.commit.side_effect = maybe_fail_commit
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("get_current_datetime")),
+        _reply("It's currently 2026-09-12."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
+    tool_registry.call.return_value = ToolCallResult(
+        content="2026-09-12T00:00:00+00:00",
+        is_error=False,
+    )
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        tool_registry=tool_registry,
+    )
+
+    result = service.send_message("what time is it?")
+
+    assert result.content == "It's currently 2026-09-12."
+    db.rollback.assert_called()
+
+
+def test_send_message_persists_audit_records_across_multiple_iterations() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("get_current_datetime")),
+        _tool_reply(_tool_call("list_recent_documents", limit=5)),
+        _reply("Here's what I found."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
+    tool_registry.call.side_effect = [
+        ToolCallResult(content="2026-09-12T00:00:00+00:00", is_error=False),
+        ToolCallResult(content="notes.txt (txt) - /documents/notes.txt", is_error=False),
+    ]
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        tool_registry=tool_registry,
+    )
+
+    service.send_message("what time is it, and what have I imported?")
+
+    added_records = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], ToolCallRecord)
+    ]
+
+    assert len(added_records) == 2
+    assert (added_records[0].iteration, added_records[0].call_index) == (1, 0)
+    assert added_records[0].tool_name == "get_current_datetime"
+    assert (added_records[1].iteration, added_records[1].call_index) == (2, 0)
+    assert added_records[1].tool_name == "list_recent_documents"
+
+
+def test_send_message_truncates_large_tool_results_for_audit() -> None:
+    from app.services.chat_service import MAX_TOOL_RESULT_LENGTH
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    huge_result = "x" * (MAX_TOOL_RESULT_LENGTH + 500)
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("search_knowledge_base", query="x")),
+        _reply("Found a lot of text."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
+    tool_registry.call.return_value = ToolCallResult(content=huge_result, is_error=False)
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        tool_registry=tool_registry,
+    )
+
+    service.send_message("search for a lot of stuff")
+
+    added_records = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], ToolCallRecord)
+    ]
+
+    record = added_records[0]
+    assert record.result_truncated is True
+    assert len(record.result) == MAX_TOOL_RESULT_LENGTH
+
+    # the model itself must still see the FULL result, not the truncated
+    # audit copy
+    second_call_messages = chat_client.chat.call_args_list[1].args[0]
+    tool_message = second_call_messages[-1]
+    assert tool_message["content"] == huge_result
+
+
+def test_send_message_does_not_truncate_small_tool_results() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("get_current_datetime")),
+        _reply("Sure."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = [{"type": "function"}]
+    tool_registry.call.return_value = ToolCallResult(content="short", is_error=False)
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        tool_registry=tool_registry,
+    )
+
+    service.send_message("hi")
+
+    added_records = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], ToolCallRecord)
+    ]
+
+    assert added_records[0].result_truncated is False
+    assert added_records[0].result == "short"
+
+
 def test_send_message_stops_after_max_tool_iterations() -> None:
     db = MagicMock()
     db.get.return_value = None
     db.scalars.return_value = []
-
-    def fake_refresh(obj):
-        if isinstance(obj, Conversation) and obj.id is None:
-            obj.id = "conv-1"
-        if isinstance(obj, Message) and obj.id is None:
-            obj.id = 1
-
-    db.refresh.side_effect = fake_refresh
+    db.refresh.side_effect = _make_fake_refresh()
 
     chat_client = MagicMock()
     chat_client.chat.return_value = _tool_reply(_tool_call("search_knowledge_base", query="x"))
@@ -357,7 +655,7 @@ def test_send_message_stops_after_max_tool_iterations() -> None:
 
     tool_registry = MagicMock()
     tool_registry.to_ollama_schema.return_value = []
-    tool_registry.call.return_value = "some result"
+    tool_registry.call.return_value = ToolCallResult(content="some result", is_error=False)
 
     service = ChatService(
         db,
@@ -372,6 +670,15 @@ def test_send_message_stops_after_max_tool_iterations() -> None:
 
     assert chat_client.chat.call_count == MAX_TOOL_ITERATIONS
     assert "wasn't able to finish" in result.content
+
+    # every iteration's tool call should still get an audit record, even
+    # though the loop never converges to a final reply
+    added_records = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], ToolCallRecord)
+    ]
+    assert len(added_records) == MAX_TOOL_ITERATIONS
 
 
 def test_chat_service_defaults_to_builtin_tool_registry() -> None:

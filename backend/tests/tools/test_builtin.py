@@ -36,7 +36,8 @@ def test_search_knowledge_base_formats_results() -> None:
 
     result = registry.call("search_knowledge_base", {"query": "hello"})
 
-    assert result == "[1] notes.txt: hello"
+    assert result.content == "[1] notes.txt: hello"
+    assert result.is_error is False
 
 
 def test_search_knowledge_base_reports_no_results() -> None:
@@ -49,7 +50,7 @@ def test_search_knowledge_base_reports_no_results() -> None:
 
     result = registry.call("search_knowledge_base", {"query": "nothing"})
 
-    assert result == "No relevant documents found."
+    assert result.content == "No relevant documents found."
 
 
 def test_get_current_datetime_returns_iso_format() -> None:
@@ -61,7 +62,8 @@ def test_get_current_datetime_returns_iso_format() -> None:
     # Should parse as ISO 8601 without raising.
     from datetime import datetime
 
-    datetime.fromisoformat(result)
+    datetime.fromisoformat(result.content)
+    assert result.is_error is False
 
 
 def test_list_recent_documents_formats_results() -> None:
@@ -78,7 +80,7 @@ def test_list_recent_documents_formats_results() -> None:
 
     result = registry.call("list_recent_documents", {})
 
-    assert result == "notes.txt (txt) - /documents/notes.txt"
+    assert result.content == "notes.txt (txt) - /documents/notes.txt"
 
 
 def test_list_recent_documents_reports_none_ingested() -> None:
@@ -91,4 +93,4 @@ def test_list_recent_documents_reports_none_ingested() -> None:
 
     result = registry.call("list_recent_documents", {})
 
-    assert result == "No documents have been ingested yet."
+    assert result.content == "No documents have been ingested yet."

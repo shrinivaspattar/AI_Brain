@@ -62,19 +62,24 @@ def test_call_invokes_handler_with_arguments() -> None:
 
     result = registry.call("echo", {"text": "hello"})
 
-    assert result == "hello"
+    assert result.content == "hello"
+    assert result.is_error is False
+    assert result.error is None
+    assert result.duration_ms >= 0
 
 
-def test_call_returns_error_string_for_unknown_tool() -> None:
+def test_call_returns_error_result_for_unknown_tool() -> None:
     registry = ToolRegistry()
 
     result = registry.call("does_not_exist", {})
 
-    assert "unknown tool" in result
-    assert "does_not_exist" in result
+    assert result.is_error is True
+    assert "unknown tool" in result.content
+    assert "does_not_exist" in result.content
+    assert "unknown tool" in result.error
 
 
-def test_call_returns_error_string_when_handler_raises() -> None:
+def test_call_returns_error_result_when_handler_raises() -> None:
     registry = ToolRegistry()
     registry.register(
         Tool(
@@ -87,5 +92,7 @@ def test_call_returns_error_string_when_handler_raises() -> None:
 
     result = registry.call("broken", {})
 
-    assert "Error running tool 'broken'" in result
-    assert "boom" in result
+    assert result.is_error is True
+    assert "Error running tool 'broken'" in result.content
+    assert result.error == "boom"
+    assert result.duration_ms >= 0
