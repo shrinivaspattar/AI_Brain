@@ -46,7 +46,7 @@ master backup / source files (read-only)
 
 | Module | Status | Responsibility |
 |---|---|---|
-| `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist. |
+| `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
 | `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
 | `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag. |
@@ -66,14 +66,21 @@ master backup / source files (read-only)
 
 `EmbeddingService` itself takes already-extracted text `content`, not a file
 path. `ImportJobService._embed_documents` (called from `execute_job`, after
-ingestion) bridges the gap for now: it reads each created `Document`'s file
-at `document.source` as UTF-8 text and hands that to `EmbeddingService`,
-synchronously, best-effort per document — an unreadable or failed embed is
-logged and skipped, not fatal to the job. No text-extraction-by-file-type
-(PDF, DOCX, etc.) exists yet, so this only does something useful for plain
-text/markdown sources today; everything else is silently skipped. Revisit
-sync vs. a background worker (Redis) once import volumes get large enough
-that embedding noticeably slows down `execute_job`.
+ingestion) bridges the gap: for each created `Document`, it calls
+`extract_text(Path(document.source))` (`app/ingestion/text_extractor.py`)
+and hands the result to `EmbeddingService`, synchronously, best-effort per
+document — an unextractable file or failed embed is logged and skipped,
+not fatal to the job.
+
+`extract_text` dispatches by extension: `.pdf` via `pypdf` (joins each
+page's `extract_text()`, so a scanned/image-only PDF with no text layer
+yields `""` — no crash, just no chunks), `.docx` via `python-docx` (joins
+paragraph text), and everything else falls back to a plain UTF-8 read —
+which is what makes true binaries (images, video, unsupported formats)
+raise and get skipped, same as before. No OCR, `.doc` (legacy Word), or
+other formats yet. Revisit sync vs. a background worker (Redis) once
+import volumes get large enough that embedding noticeably slows down
+`execute_job`.
 
 ## Retrieval
 `RetrievalService.search(query, top_k=5)` (`app/rag/retrieval_service.py`):

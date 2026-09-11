@@ -22,18 +22,19 @@ for the current module-by-module status this roadmap tracks against.
       migration applied to `aibrain` and `aibrain_test`, verified end-to-end
       against a real Ollama `nomic-embed-text` call
 - [x] Wire embedding into `execute_job`, synchronously: each ingested
-      document is read as UTF-8 text and embedded inline before the job
-      completes. Best-effort per document (unreadable/failed embeds are
+      document has its text extracted and embedded inline before the job
+      completes. Best-effort per document (unextractable/failed embeds are
       logged and skipped, not fatal to the job). Revisit sync vs. a
       background worker (Redis) once import volumes get large enough
       that embedding noticeably slows down `execute_job`.
 - [x] Retrieval: `RetrievalService.search(query, top_k)` (`app/rag`) embeds
       the query and ranks `document_chunks` by pgvector cosine distance,
       joined to source `Document`. Exposed via `POST /rag/search`.
-- [ ] Text extraction by file type (currently only works for plain text;
-      a binary file like a PDF is skipped rather than having its text
-      extracted — no PDF/DOCX/etc. extraction exists yet, which also means
-      retrieval only covers plain text/markdown sources today)
+- [x] Text extraction by file type (`app/ingestion/text_extractor.py`):
+      `.pdf` via pypdf, `.docx` via python-docx, everything else falls
+      back to plain UTF-8 (unchanged for txt/md/code/etc.). No OCR or
+      legacy `.doc` support yet — a scanned/image-only PDF yields no text
+      (skipped gracefully, not an error).
 - [ ] Reranking / relevance filtering beyond raw cosine distance (Phase 1's
       diagram anticipates this; not implemented — `/rag/search` returns
       raw nearest-neighbor results)
