@@ -21,9 +21,15 @@ for the current module-by-module status this roadmap tracks against.
 - [x] Vector storage: pgvector `document_chunks` table (`EmbeddingService`),
       migration applied to `aibrain` and `aibrain_test`, verified end-to-end
       against a real Ollama `nomic-embed-text` call
-- [ ] Text extraction by file type (currently only works for plain text
-      content handed to `EmbeddingService` directly; no PDF/DOCX/etc. extraction)
-- [ ] Wire embedding into `execute_job` (decide sync vs. background worker via Redis)
+- [x] Wire embedding into `execute_job`, synchronously: each ingested
+      document is read as UTF-8 text and embedded inline before the job
+      completes. Best-effort per document (unreadable/failed embeds are
+      logged and skipped, not fatal to the job). Revisit sync vs. a
+      background worker (Redis) once import volumes get large enough
+      that embedding noticeably slows down `execute_job`.
+- [ ] Text extraction by file type (currently only works for plain text;
+      a binary file like a PDF is skipped rather than having its text
+      extracted — no PDF/DOCX/etc. extraction exists yet)
 - [ ] Retrieval: given a query, embed it and return top-k `DocumentChunk`s + source `Document`
 
 ## Phase 2 — Conversation
