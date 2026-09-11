@@ -73,3 +73,42 @@ def test_extract_text_reads_docx_paragraphs(tmp_path: Path) -> None:
     document.save(str(file_path))
 
     assert extract_text(file_path) == "First paragraph.\nSecond paragraph."
+
+
+def test_extract_text_handles_pdf_renamed_with_conflict_suffix() -> None:
+    # Real-world pattern: a bulk conflict-resolution/dedup rename appends
+    # "_<timestamp>" directly after the extension, no separating dot -
+    # e.g. "Sept-Oct-2022 - 2nd Sem M Tech VLSI-min.pdf_1768918262".
+    page = MagicMock()
+    page.extract_text.return_value = "exam questions"
+
+    with patch("app.ingestion.text_extractor.pypdf.PdfReader") as reader_class:
+        reader_class.return_value.pages = [page]
+
+        result = extract_text(Path("question-paper.pdf_1768918262"))
+
+    assert result == "exam questions"
+    reader_class.assert_called_once_with("question-paper.pdf_1768918262")
+
+
+def test_extract_text_handles_docx_renamed_with_conflict_suffix(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "notes.docx_1768918262"
+
+    document = docx.Document()
+    document.add_paragraph("Renamed but still a real docx.")
+    document.save(str(file_path))
+
+    assert extract_text(file_path) == "Renamed but still a real docx."
+
+
+def test_extract_text_does_not_misfire_on_unrelated_extension_prefix(
+    tmp_path: Path,
+) -> None:
+    # Guard against overly broad matching: ".pdfx" or similar must not be
+    # treated as a renamed PDF.
+    file_path = tmp_path / "notes.pdfx"
+    file_path.write_text("just text, not a pdf")
+
+    assert extract_text(file_path) == "just text, not a pdf"
