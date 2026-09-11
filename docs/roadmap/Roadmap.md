@@ -18,9 +18,9 @@ for the current module-by-module status this roadmap tracks against.
 ## Phase 1 — Retrieval (RAG)
 - [x] Chunking (`app/embeddings/chunker.py`)
 - [x] Embedding generation via Ollama (`app/embeddings/client.py`, `nomic-embed-text`)
-- [x] Vector storage: pgvector `document_chunks` table (`EmbeddingService`) —
-      migration written, blocked on `sudo apt install postgresql-16-pgvector`
-      on the host before it can be applied
+- [x] Vector storage: pgvector `document_chunks` table (`EmbeddingService`),
+      migration applied to `aibrain` and `aibrain_test`, verified end-to-end
+      against a real Ollama `nomic-embed-text` call
 - [ ] Text extraction by file type (currently only works for plain text
       content handed to `EmbeddingService` directly; no PDF/DOCX/etc. extraction)
 - [ ] Wire embedding into `execute_job` (decide sync vs. background worker via Redis)

@@ -93,9 +93,10 @@ and are surfaced as 409 Conflict at the API layer.
 - `docker-compose.yml` is currently empty — services (Postgres, Redis,
   Ollama) are expected to run some other way for now (e.g. local
   installs) until Compose is filled in.
-- The `vector` Postgres extension must be installed on the host
-  (`sudo apt install postgresql-16-pgvector`) before the `document_chunks`
-  migration can run; it is not part of any automated setup yet.
+- The `vector` Postgres extension (`postgresql-16-pgvector`) and the
+  `document_chunks` migration are applied on this host, but neither step
+  is automated yet — a fresh machine needs both done manually before
+  `EmbeddingService` will work.
 - No frontend yet; the backend is API-only.
 - See [`docs/backlog.md`](../backlog.md) for prioritized future work
   (provenance chain, dedup, audit log, etc.) and
