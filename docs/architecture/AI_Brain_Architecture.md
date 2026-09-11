@@ -11,8 +11,8 @@ foundational data-handling decisions.
 ## Stack
 - Ubuntu 24.04, Docker
 - Backend: FastAPI (Python), SQLAlchemy + Alembic, PostgreSQL
-- LLM runtime: Ollama, running DeepSeek-R1 and Qwen2.5-Coder locally
-- Vector store: ChromaDB
+- LLM runtime: Ollama, running local chat models (`qwen3:8b`, `qwen2.5-coder:14b`, ...) and `nomic-embed-text` for embeddings
+- Vector store: pgvector (Postgres extension) — vectors live alongside `documents`/`document_chunks`, no separate vector service
 - Cache/queue: Redis
 - Frontend: not yet built
 
@@ -27,10 +27,10 @@ master backup / source files (read-only)
    discovered files ──ArchiveExtractor──▶ expanded files (documents/imports/<job>/)
         │
         ▼
-   DocumentIngestor ──▶ Document rows (Postgres)   [current: implemented]
+   DocumentIngestor ──▶ Document rows, tagged with import_job_id   [implemented]
         │
         ▼
-   chunking + embeddings (app/embeddings) ──▶ ChromaDB vectors   [planned]
+   chunking + embeddings (app/embeddings) ──▶ DocumentChunk rows w/ pgvector embedding   [implemented, not yet wired into ingestion]
         │
         ▼
    RAG retrieval (app/rag) ──▶ context for chat   [planned]
@@ -47,15 +47,24 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `ImportJob`) and Pydantic schemas. |
-| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle: create, mark_running, mark_completed, execute_job, with enforced state transitions). |
-| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions), `EmbeddingService` (chunk + embed + persist a document's text). |
+| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs. No endpoints yet for chunks/embeddings/retrieval. |
 | `db/` | Implemented | Session/engine setup, health checks. |
-| `core/` | Implemented | `Settings` (env-driven config: `DATABASE_URL`, `INGESTION_DIR`, `OLLAMA_HOST`, `CHAT_MODEL`, `EMBEDDING_MODEL`, ...). |
-| `embeddings/` | Empty stub | Will chunk `Document` content and call the embedding model (`nomic-embed-text` via Ollama) to produce vectors. |
-| `rag/` | Empty stub | Will store/query vectors in ChromaDB and assemble retrieved context for chat. |
+| `core/` | Implemented | `Settings` (env-driven config: `DATABASE_URL`, `INGESTION_DIR`, `OLLAMA_HOST`, `CHAT_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, ...). |
+| `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. Not yet wired into the ingestion pipeline — must be invoked explicitly via `EmbeddingService`. |
+| `rag/` | Empty stub | Will query `document_chunks.embedding` (pgvector) for a given query and assemble retrieved context for chat. |
 | `memory/` | Empty stub | Long-term memory: durable facts/preferences about the user, distinct from RAG document retrieval. |
 | `tools/` | Empty stub | Tool-calling: lets the assistant act (run scripts, query local APIs, manipulate files) rather than only answer. |
+
+## Chunking and embeddings
+`EmbeddingService.embed_document(document, content)` (`app/services/embedding_service.py`):
+1. Splits `content` into overlapping chunks (`app/embeddings/chunker.py`, default 1000 chars / 200 overlap).
+2. Deletes any existing `DocumentChunk` rows for that document (idempotent re-embedding).
+3. Calls Ollama's embed API in one batched request (`app/embeddings/client.py`) for `EMBEDDING_MODEL` (`nomic-embed-text`, `EMBEDDING_DIMENSIONS=768`).
+4. Persists one `DocumentChunk` row per chunk, `(document_id, chunk_index)` unique, `embedding` as a pgvector column.
+
+This is deliberately decoupled from `DocumentIngestor` — it takes already-extracted text `content`, not a file path. No text-extraction-by-file-type (PDF, DOCX, etc.) exists yet; today it only makes sense for plain text/markdown files. Wiring embedding into `execute_job` automatically (and deciding sync vs. background-worker-via-Redis for large imports) is a deliberate next decision, not yet made.
 
 ## Import job lifecycle
 `ImportJob.status` is a state machine (`app/models/import_job.py`):
@@ -77,14 +86,16 @@ and are surfaced as 409 Conflict at the API layer.
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
 - `knowledge/` — reserved for curated/derived knowledge artifacts (future).
-- `chroma/` — ChromaDB persistent store (future use).
 - `postgres/`, `redis/` — data directories for the Dockerized services.
 - `logs/`, `config/`, `prompts/`, `scripts/` — reserved, currently empty.
 
 ## Open/planned areas
 - `docker-compose.yml` is currently empty — services (Postgres, Redis,
-  Chroma, Ollama) are expected to run some other way for now (e.g. local
+  Ollama) are expected to run some other way for now (e.g. local
   installs) until Compose is filled in.
+- The `vector` Postgres extension must be installed on the host
+  (`sudo apt install postgresql-16-pgvector`) before the `document_chunks`
+  migration can run; it is not part of any automated setup yet.
 - No frontend yet; the backend is API-only.
 - See [`docs/backlog.md`](../backlog.md) for prioritized future work
   (provenance chain, dedup, audit log, etc.) and

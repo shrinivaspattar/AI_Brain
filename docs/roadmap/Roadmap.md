@@ -6,19 +6,25 @@ your own knowledge base (RAG); have it remember things about you over time.
 See [`docs/architecture/AI_Brain_Architecture.md`](../architecture/AI_Brain_Architecture.md)
 for the current module-by-module status this roadmap tracks against.
 
-## Phase 0 — Ingestion foundation (mostly done)
+## Phase 0 — Ingestion foundation (done)
 - [x] Source scanning (`SourceScanner`)
 - [x] Archive extraction with zip-bomb / disk-space protection (`ArchiveExtractor`)
 - [x] Document persistence (`Document` model + `DocumentService`)
 - [x] Import job lifecycle with enforced state transitions (`ImportJobService`)
 - [x] REST API for documents and import jobs
-- [ ] Docker Compose for Postgres, Redis, ChromaDB, Ollama (currently empty)
+- [x] Provenance: `Document.import_job_id` FK back to the import job
+- [ ] Docker Compose for Postgres, Redis, Ollama (currently empty)
 
 ## Phase 1 — Retrieval (RAG)
-- [ ] Chunking strategy for ingested `Document` content (`app/embeddings`)
-- [ ] Embedding generation via Ollama (`nomic-embed-text`)
-- [ ] Vector storage/query against ChromaDB (`app/rag`)
-- [ ] Retrieval API: given a query, return relevant chunks + source `Document`
+- [x] Chunking (`app/embeddings/chunker.py`)
+- [x] Embedding generation via Ollama (`app/embeddings/client.py`, `nomic-embed-text`)
+- [x] Vector storage: pgvector `document_chunks` table (`EmbeddingService`) —
+      migration written, blocked on `sudo apt install postgresql-16-pgvector`
+      on the host before it can be applied
+- [ ] Text extraction by file type (currently only works for plain text
+      content handed to `EmbeddingService` directly; no PDF/DOCX/etc. extraction)
+- [ ] Wire embedding into `execute_job` (decide sync vs. background worker via Redis)
+- [ ] Retrieval: given a query, embed it and return top-k `DocumentChunk`s + source `Document`
 
 ## Phase 2 — Conversation
 - [ ] Chat endpoint wired to Ollama (`CHAT_MODEL`, currently `qwen3:8b` per config)

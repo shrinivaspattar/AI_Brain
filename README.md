@@ -10,8 +10,7 @@ Personal offline AI assistant.
 - Ollama
 - DeepSeek-R1
 - Qwen2.5-Coder
-- ChromaDB
-- PostgreSQL
+- PostgreSQL + pgvector
 - Redis
 
 ## Goals
