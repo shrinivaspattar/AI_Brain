@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from app.api.database import router as database_router
 from app.api.documents import router as documents_router
 from app.api.health import router as health_router
+from app.api.rag import router as rag_router
 from app.api.version import router as version_router
 from app.core.config import settings
 from app.api.import_jobs import router as import_jobs_router
@@ -23,3 +24,4 @@ app.include_router(version_router)
 app.include_router(database_router)
 app.include_router(documents_router)
 app.include_router(import_jobs_router)
+app.include_router(rag_router)
