@@ -104,19 +104,27 @@ and hands the result to `EmbeddingService`, synchronously, best-effort per
 document — an unextractable file or failed embed is logged and skipped,
 not fatal to the job.
 
-`extract_text` dispatches by extension: `.pdf` via `pypdf` (joins each
-page's `extract_text()`, so a scanned/image-only PDF with no text layer
-yields `""` — no crash, just no chunks), `.docx` via `python-docx` (joins
-paragraph text), and everything else falls back to a plain UTF-8 read —
-which is what makes true binaries (images, video, unsupported formats)
-raise and get skipped, same as before. `.pdf`/`.docx` are matched by
+`extract_text` dispatches via a `{extension: extractor}` table
+(`_EXTRACTORS`): `.pdf` via `pypdf` (joins each page's `extract_text()`,
+so a scanned/image-only PDF with no text layer yields `""` — no crash,
+just no chunks), `.docx` via `python-docx` (joins paragraph text),
+`.pptx` via `python-pptx` (joins each shape's `text_frame.text` across
+all slides), `.xlsx` via `openpyxl` (`read_only`+`data_only`, joins each
+row's non-empty cells tab-separated across all sheets — opened as a
+binary file handle rather than a path string, since unlike the other
+three libraries, `openpyxl` validates the *filename's* extension
+internally and would otherwise refuse a conflict-suffix-renamed file).
+Everything else falls back to a plain UTF-8 read — which is what makes
+true binaries (images, video, unsupported formats) raise and get
+skipped, same as before. All four known extensions are matched by
 prefix, not exact equality (`.pdf_1768918262` still extracts as a PDF),
 to tolerate files a conflict-resolution/dedup tool renamed by appending
 `_<timestamp>` with no separating dot — found for real in the user's
-archive corpus, affecting ~3,552 PDFs there. No OCR, `.doc` (legacy
-Word), or other formats yet. Revisit sync vs. a background worker
-(Redis) once import volumes get large enough that embedding noticeably
-slows down `execute_job`.
+archive corpus (a full extension survey found ~3,552 PDFs, 595 xlsx, and
+379 pptx affected in various ways). No OCR, legacy `.doc`/`.ppt`/`.xls`,
+or other formats yet. Revisit sync vs. a background worker (Redis) once
+import volumes get large enough that embedding noticeably slows down
+`execute_job`.
 
 ## Retrieval
 `RetrievalService.search(query, top_k=5)` (`app/rag/retrieval_service.py`):

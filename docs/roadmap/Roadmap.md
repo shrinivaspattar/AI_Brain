@@ -34,10 +34,15 @@ for the current module-by-module status this roadmap tracks against.
       the query and ranks `document_chunks` by pgvector cosine distance,
       joined to source `Document`. Exposed via `POST /rag/search`.
 - [x] Text extraction by file type (`app/ingestion/text_extractor.py`):
-      `.pdf` via pypdf, `.docx` via python-docx, everything else falls
-      back to plain UTF-8 (unchanged for txt/md/code/etc.). No OCR or
-      legacy `.doc` support yet — a scanned/image-only PDF yields no text
-      (skipped gracefully, not an error).
+      `.pdf` (pypdf), `.docx` (python-docx), `.pptx` (python-pptx),
+      `.xlsx` (openpyxl); everything else falls back to plain UTF-8
+      (unchanged for txt/md/code/etc.). Tolerant of a conflict-
+      resolution/dedup rename suffix (`.pdf_<timestamp>`, found for real
+      in the user's corpus — see the `project-master-data-corpus` memory
+      note for the full extension survey and what got fixed vs.
+      deliberately left out of scope). No OCR or legacy
+      `.doc`/`.ppt`/`.xls` support yet — a scanned/image-only PDF yields
+      no text (skipped gracefully, not an error).
 - [ ] Reranking / relevance filtering beyond raw cosine distance (Phase 1's
       diagram anticipates this; not implemented — `/rag/search` returns
       raw nearest-neighbor results)
