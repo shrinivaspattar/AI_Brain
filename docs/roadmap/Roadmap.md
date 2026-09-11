@@ -55,9 +55,28 @@ for the current module-by-module status this roadmap tracks against.
 - [ ] Conversation titles/summaries, listing/deleting conversations
 
 ## Phase 3 — Memory
-- [ ] Long-term memory store (`app/memory`): durable facts/preferences about
-      the user, distinct from document retrieval
-- [ ] Memory read/write hooks into the chat loop
+- [x] Long-term memory store: `Memory` model (migration `e67e8741cbc1`),
+      `MemoryService` (`app/memory/service.py`). Flat store — content +
+      optional confidence (0-1) + optional provenance (conversation_id/
+      message_id it was derived from). No type taxonomy (episodic/semantic/
+      preference/etc.) — deliberately not invented until something actually
+      needs it, per the original project brief.
+- [x] API: `POST /memory`, `GET /memory`, `DELETE /memory/{id}`.
+- [x] Read hook into the chat loop: `ChatService` loads up to 50 memories
+      per turn and injects them into the system prompt as a "What you know
+      about the user" block, separate from the numbered document-context
+      block (citation `[n]` markers apply only to the latter). Verified
+      end-to-end against the real model.
+- [ ] Write hook into the chat loop: writing is explicit-only for now (via
+      the API). Automatic LLM-driven extraction of "facts" from casual
+      conversation is a real quality/trust risk (a hallucinated "fact"
+      silently becoming permanent memory) — needs a deliberate design
+      (confirmation step? confidence threshold? review queue, echoing the
+      KRM backlog's "Confidence Review Queue"?), not a default-on behavior.
+- [ ] Relevance-based memory retrieval — currently "most recent N", not
+      similarity-ranked like document retrieval. Fine at low volume; revisit
+      if the memory store grows large enough that recency stops being a
+      good proxy for relevance.
 
 ## Phase 4 — Tool calling
 - [ ] Tool registry and execution loop (`app/tools`)

@@ -37,7 +37,7 @@ master backup / source files (read-only)
         │
         ▼
    chat (app/services/chat_service.py, POST /chat) ↔ Ollama (CHAT_MODEL)   [implemented]
-        │
+        │  reads Memory rows (app/memory), injected as user-facts context
         ▼
    response, with citations back to source Document(s)   [implemented]
         │
@@ -50,14 +50,14 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
-| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence). |
-| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection). |
+| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory. |
 | `db/` | Implemented | Session/engine setup, health checks. |
 | `core/` | Implemented | `Settings` (env-driven config: `DATABASE_URL`, `INGESTION_DIR`, `OLLAMA_HOST`, `CHAT_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, ...). |
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
-| `memory/` | Empty stub | Long-term memory: durable facts/preferences about the user, distinct from RAG document retrieval. |
+| `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store, no type taxonomy. `POST /memory`, `GET /memory`, `DELETE /memory/{id}`. Read-only hook into `ChatService` (loads up to 50, most-recent-first); no automatic write hook from chat yet. |
 | `tools/` | Empty stub | Tool-calling: lets the assistant act (run scripts, query local APIs, manipulate files) rather than only answer. |
 
 ## Chunking and embeddings
@@ -100,11 +100,37 @@ search over whatever has been embedded.
 `ChatService.send_message(content, conversation_id=None, top_k=5)` (`app/services/chat_service.py`):
 1. Gets or creates the `Conversation` (a `conversation_id` for an unknown conversation raises `ValueError` → 404 at the API layer); persists the user's `Message`.
 2. Calls `RetrievalService.search(content, top_k)` for relevant `document_chunks`.
-3. Loads the conversation's message history (capped at the last 20 messages) and builds an Ollama prompt: a system message (base instructions + numbered `[n]` context blocks from the retrieved chunks, or a note that nothing relevant was found) followed by the history.
+3. Loads up to 50 `Memory` rows (most-recent-first) and the conversation's message history (capped at the last 20 messages), then builds an Ollama prompt: a system message (base instructions + numbered `[n]` document-context block, or a note that nothing relevant was found + a "What you know about the user" block from memory, if any) followed by the history.
 4. Calls `ChatClient.chat(...)` (`app/services/chat_client.py`, thin wrapper around Ollama's chat API for `CHAT_MODEL`); a failure raises `ChatUnavailableError` → 503 at the API layer.
 5. Persists and returns the assistant `Message`, with `citations` set to a denormalized snapshot of the retrieved chunks (`document_chunk_id`, `document_id`, `document_title`, `document_source`) — captured at reply time so a citation stays legible even if that chunk is later re-embedded or deleted.
 
-Exposed via `POST /chat` (`{message, conversation_id?, top_k?}` → `{conversation_id, message}`) and `GET /chat/{conversation_id}` (full message history). Verified end-to-end against the real `qwen3:8b` model: it correctly cites `[n]` markers and uses prior turns as context on follow-up questions. Single blocking response only — no streaming yet.
+Exposed via `POST /chat` (`{message, conversation_id?, top_k?}` → `{conversation_id, message}`) and `GET /chat/{conversation_id}` (full message history). Verified end-to-end against the real `qwen3:8b` model: it correctly cites `[n]` markers for document context, states memory facts plainly (no citation marker — the system prompt explicitly scopes `[n]` citations to the numbered document list only), and uses prior turns as context on follow-up questions. Single blocking response only — no streaming yet.
+
+## Memory
+`Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
+optional `confidence` (0–1), optional provenance (`conversation_id`/
+`message_id` it was derived from — null for anything written directly via
+the API). No `memory_type` taxonomy (episodic/semantic/preference/etc.) —
+the original project brief explicitly said not to invent one until
+something in the actual implementation needs it, and nothing does yet.
+
+`MemoryService` (`app/memory/service.py`): `create_memory`, `get_memory`,
+`list_memories` (most-recent-first, capped), `delete_memory` (raises
+`ValueError` → 404 if missing). Exposed via `POST /memory`, `GET /memory`,
+`DELETE /memory/{id}`.
+
+Read-only hook into `ChatService` today: every chat turn loads up to 50
+memories and injects them into the prompt (see Chat, above). There is
+deliberately no write hook yet — nothing in the chat loop automatically
+extracts "facts" from casual conversation into memory. An LLM silently
+deciding what's worth remembering is a real trust/quality risk (a
+hallucinated "fact" becoming permanent, unreviewed context for every future
+turn); that needs its own deliberate design — e.g. a confidence threshold,
+an explicit confirmation step, or a review queue akin to the KRM backlog's
+"Confidence Review Queue" — not a default-on side effect of chatting.
+Memory retrieval is "most recent N", not similarity-ranked like document
+retrieval; revisit if the store grows large enough that recency stops
+being a good proxy for relevance.
 
 ## Import job lifecycle
 `ImportJob.status` is a state machine (`app/models/import_job.py`):
