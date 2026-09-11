@@ -16,6 +16,7 @@ class DocumentService:
             title=document_data.title,
             source=document_data.source,
             source_type=document_data.source_type,
+            import_job_id=document_data.import_job_id,
         )
 
         try:

@@ -19,6 +19,7 @@ def test_create_document() -> None:
             document.title = "Test Document"
             document.source = "/documents/test.txt"
             document.source_type = "text"
+            document.import_job_id = None
             document.created_at = datetime(2026, 8, 12, 10, 0, tzinfo=UTC)
             document.updated_at = datetime(2026, 8, 12, 10, 0, tzinfo=UTC)
 
@@ -41,6 +42,7 @@ def test_create_document() -> None:
                 "title": "Test Document",
                 "source": "/documents/test.txt",
                 "source_type": "text",
+                "import_job_id": None,
                 "created_at": "2026-08-12T10:00:00Z",
                 "updated_at": "2026-08-12T10:00:00Z",
             }

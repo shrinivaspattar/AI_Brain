@@ -7,6 +7,7 @@ class DocumentCreate(BaseModel):
     title: str
     source: str
     source_type: str
+    import_job_id: int | None = None
 
 
 class DocumentResponse(BaseModel):
@@ -14,6 +15,7 @@ class DocumentResponse(BaseModel):
     title: str
     source: str
     source_type: str
+    import_job_id: int | None
     created_at: datetime
     updated_at: datetime
 

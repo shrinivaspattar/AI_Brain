@@ -66,6 +66,8 @@ def test_import_job_executes_against_test_database(
             "readme.md",
         }
 
+        assert {document.import_job_id for document in documents} == {job.id}
+
 
 def test_import_job_executes_zip_against_test_database(
     tmp_path: Path,

@@ -25,6 +25,7 @@ class DocumentIngestor:
         self,
         source: Path,
         destination: Path,
+        import_job_id: int | None = None,
     ) -> list[Document]:
         """Discover source files, expand archives, and persist documents."""
 
@@ -44,16 +45,20 @@ class DocumentIngestor:
                 continue
 
             document = self.document_service.create_document(
-                self._build_document_data(file)
+                self._build_document_data(file, import_job_id)
             )
             documents.append(document)
 
         return documents
 
     @staticmethod
-    def _build_document_data(file: DiscoveredFile) -> DocumentCreate:
+    def _build_document_data(
+        file: DiscoveredFile,
+        import_job_id: int | None,
+    ) -> DocumentCreate:
         return DocumentCreate(
             title=file.path.name,
             source=str(file.path),
             source_type=file.path.suffix.lower().lstrip(".") or "unknown",
+            import_job_id=import_job_id,
         )

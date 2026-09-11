@@ -20,6 +20,7 @@ def test_ingest_scans_and_persists_documents(tmp_path: Path) -> None:
         title=data.title,
         source=data.source,
         source_type=data.source_type,
+        import_job_id=data.import_job_id,
     )
 
     ingestor = DocumentIngestor(
@@ -63,6 +64,31 @@ def test_ingest_uses_discovered_file_metadata(
     assert document_data.title == "README.md"
     assert document_data.source == str((source / "README.md").resolve())
     assert document_data.source_type == "md"
+    assert document_data.import_job_id is None
+
+
+def test_ingest_tags_documents_with_import_job_id(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "extracted"
+
+    source.mkdir()
+    destination.mkdir()
+
+    (source / "notes.txt").write_text("hello AI_Brain")
+
+    document_service = MagicMock()
+
+    ingestor = DocumentIngestor(
+        document_service=document_service,
+    )
+
+    ingestor.ingest(source, destination, import_job_id=99)
+
+    document_data = document_service.create_document.call_args.args[0]
+
+    assert document_data.import_job_id == 99
 
 
 def test_ingest_returns_empty_list_for_empty_source(

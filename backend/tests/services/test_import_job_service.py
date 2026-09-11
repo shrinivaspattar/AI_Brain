@@ -40,6 +40,7 @@ def test_execute_job_ingests_source_and_completes() -> None:
     ingestor_class.return_value.ingest.assert_called_once_with(
         Path("/documents/source"),
         service.ingestion_dir / "42",
+        import_job_id=42,
     )
 
 

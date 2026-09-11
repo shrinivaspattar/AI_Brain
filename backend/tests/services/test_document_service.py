@@ -23,11 +23,28 @@ def test_create_document_persists_document() -> None:
     assert result.title == "Test Document"
     assert result.source == "/documents/test.txt"
     assert result.source_type == "text"
+    assert result.import_job_id is None
 
     db.add.assert_called_once_with(result)
     db.commit.assert_called_once_with()
     db.refresh.assert_called_once_with(result)
     db.rollback.assert_not_called()
+
+
+def test_create_document_persists_import_job_id() -> None:
+    db = MagicMock()
+    service = DocumentService(db)
+
+    document_data = DocumentCreate(
+        title="Test Document",
+        source="/documents/test.txt",
+        source_type="text",
+        import_job_id=7,
+    )
+
+    result = service.create_document(document_data)
+
+    assert result.import_job_id == 7
 
 
 def test_create_document_rolls_back_on_commit_failure() -> None:

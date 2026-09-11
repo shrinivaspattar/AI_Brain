@@ -138,6 +138,7 @@ class ImportJobService:
             ingestor.ingest(
                 Path(job.source_path),
                 destination,
+                import_job_id=job.id,
             )
 
             job.files_discovered = ingestor.last_discovered_count
