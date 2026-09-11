@@ -112,3 +112,74 @@ def test_extract_text_does_not_misfire_on_unrelated_extension_prefix(
     file_path.write_text("just text, not a pdf")
 
     assert extract_text(file_path) == "just text, not a pdf"
+
+
+def test_extract_text_reads_pptx_slide_text(tmp_path: Path) -> None:
+    import pptx
+
+    file_path = tmp_path / "deck.pptx"
+
+    presentation = pptx.Presentation()
+
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(0, 0, pptx.util.Inches(4), pptx.util.Inches(2))
+    box.text_frame.text = "First slide title"
+
+    slide2 = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box2 = slide2.shapes.add_textbox(0, 0, pptx.util.Inches(4), pptx.util.Inches(2))
+    box2.text_frame.text = "Second slide content"
+
+    presentation.save(str(file_path))
+
+    result = extract_text(file_path)
+
+    assert "First slide title" in result
+    assert "Second slide content" in result
+
+
+def test_extract_text_handles_pptx_renamed_with_conflict_suffix(
+    tmp_path: Path,
+) -> None:
+    import pptx
+
+    file_path = tmp_path / "deck.pptx_1768918262"
+
+    presentation = pptx.Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(0, 0, pptx.util.Inches(4), pptx.util.Inches(2))
+    box.text_frame.text = "Renamed but still a real pptx"
+    presentation.save(str(file_path))
+
+    assert "Renamed but still a real pptx" in extract_text(file_path)
+
+
+def test_extract_text_reads_xlsx_cell_values(tmp_path: Path) -> None:
+    import openpyxl
+
+    file_path = tmp_path / "sheet.xlsx"
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["name", "score"])
+    sheet.append(["Alice", 95])
+    workbook.save(str(file_path))
+
+    result = extract_text(file_path)
+
+    assert "name\tscore" in result
+    assert "Alice\t95" in result
+
+
+def test_extract_text_handles_xlsx_renamed_with_conflict_suffix(
+    tmp_path: Path,
+) -> None:
+    import openpyxl
+
+    file_path = tmp_path / "sheet.xlsx_1768918262"
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["renamed", "still works"])
+    workbook.save(str(file_path))
+
+    assert "renamed\tstill works" in extract_text(file_path)
