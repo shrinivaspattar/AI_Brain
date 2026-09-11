@@ -5,6 +5,7 @@ import pytest
 from app.models.conversation import Conversation
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
+from app.models.memory import Memory
 from app.models.message import Message, MessageRole
 from app.rag.retrieval_service import RetrievedChunk
 from app.services.chat_service import ChatService
@@ -184,3 +185,79 @@ def test_send_message_notes_when_no_context_found() -> None:
 
     prompt = chat_client.chat.call_args.args[0]
     assert "No relevant documents were found" in prompt[0]["content"]
+
+
+def test_send_message_includes_memories_in_prompt() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+
+    def fake_refresh(obj):
+        if isinstance(obj, Conversation) and obj.id is None:
+            obj.id = "conv-1"
+        if isinstance(obj, Message) and obj.id is None:
+            obj.id = 1
+
+    db.refresh.side_effect = fake_refresh
+
+    chat_client = MagicMock()
+    chat_client.chat.return_value = "You prefer dark mode, as I recall."
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    memory_service = MagicMock()
+    memory_service.list_memories.return_value = [
+        Memory(id=1, content="User prefers dark mode.")
+    ]
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        memory_service=memory_service,
+    )
+
+    service.send_message("do you remember my preferences?")
+
+    prompt = chat_client.chat.call_args.args[0]
+    system_content = prompt[0]["content"]
+
+    assert "What you know about the user:" in system_content
+    assert "- User prefers dark mode." in system_content
+    memory_service.list_memories.assert_called_once()
+
+
+def test_send_message_omits_memory_block_when_no_memories() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+
+    def fake_refresh(obj):
+        if isinstance(obj, Conversation) and obj.id is None:
+            obj.id = "conv-1"
+        if isinstance(obj, Message) and obj.id is None:
+            obj.id = 1
+
+    db.refresh.side_effect = fake_refresh
+
+    chat_client = MagicMock()
+    chat_client.chat.return_value = "I don't know that about you yet."
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    memory_service = MagicMock()
+    memory_service.list_memories.return_value = []
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        memory_service=memory_service,
+    )
+
+    service.send_message("what do you know about me?")
+
+    prompt = chat_client.chat.call_args.args[0]
+    assert "What you know about the user:" not in prompt[0]["content"]

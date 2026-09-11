@@ -1,20 +1,25 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.memory.service import MemoryService
 from app.models.conversation import Conversation
+from app.models.memory import Memory
 from app.models.message import Message, MessageRole
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
 from app.services.chat_client import ChatClient
 
 SYSTEM_PROMPT = (
-    "You are AI_Brain, a personal offline assistant. Answer using the "
-    "context below from the user's own documents when it's relevant, and "
-    "cite sources using the [n] markers shown next to each context item. "
-    "If the context isn't relevant, say so and answer from general "
-    "knowledge instead."
+    "You are AI_Brain, a personal offline assistant. When a numbered "
+    "'Context from your documents' list is provided below, answer using "
+    "it when relevant and cite it with the matching [n] marker; if it "
+    "isn't relevant, say so and answer from general knowledge instead. "
+    "A 'What you know about the user' list, if provided, is remembered "
+    "facts about the user — state them plainly when relevant, with no "
+    "[n] citation marker, since they aren't numbered."
 )
 
 MAX_HISTORY_MESSAGES = 20
+MAX_MEMORIES = 50
 
 
 class ChatService:
@@ -23,10 +28,12 @@ class ChatService:
         db: Session,
         chat_client: ChatClient | None = None,
         retrieval_service: RetrievalService | None = None,
+        memory_service: MemoryService | None = None,
     ):
         self.db = db
         self.chat_client = chat_client or ChatClient()
         self.retrieval_service = retrieval_service or RetrievalService(db)
+        self.memory_service = memory_service or MemoryService(db)
 
     def send_message(
         self,
@@ -46,8 +53,9 @@ class ChatService:
         self.db.refresh(user_message)
 
         retrieved = self.retrieval_service.search(content, top_k=top_k)
+        memories = self.memory_service.list_memories(limit=MAX_MEMORIES)
         history = self._load_history(conversation.id)
-        prompt = self._build_prompt(history, retrieved)
+        prompt = self._build_prompt(history, retrieved, memories)
 
         reply = self.chat_client.chat(prompt)
 
@@ -104,14 +112,19 @@ class ChatService:
         self,
         history: list[Message],
         retrieved: list[RetrievedChunk],
+        memories: list[Memory],
     ) -> list[dict[str, str]]:
         context_block = self._format_context(retrieved)
+        memory_block = self._format_memories(memories)
 
         system_content = SYSTEM_PROMPT
         if context_block:
             system_content += "\n\nContext from your documents:\n" + context_block
         else:
             system_content += "\n\nNo relevant documents were found for this query."
+
+        if memory_block:
+            system_content += "\n\nWhat you know about the user:\n" + memory_block
 
         messages = [{"role": "system", "content": system_content}]
         messages.extend(
@@ -127,6 +140,10 @@ class ChatService:
             f"[{index}] {result.document.title}: {result.chunk.content}"
             for index, result in enumerate(retrieved, start=1)
         )
+
+    @staticmethod
+    def _format_memories(memories: list[Memory]) -> str:
+        return "\n".join(f"- {memory.content}" for memory in memories)
 
     @staticmethod
     def _build_citations(
