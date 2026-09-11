@@ -109,10 +109,14 @@ page's `extract_text()`, so a scanned/image-only PDF with no text layer
 yields `""` — no crash, just no chunks), `.docx` via `python-docx` (joins
 paragraph text), and everything else falls back to a plain UTF-8 read —
 which is what makes true binaries (images, video, unsupported formats)
-raise and get skipped, same as before. No OCR, `.doc` (legacy Word), or
-other formats yet. Revisit sync vs. a background worker (Redis) once
-import volumes get large enough that embedding noticeably slows down
-`execute_job`.
+raise and get skipped, same as before. `.pdf`/`.docx` are matched by
+prefix, not exact equality (`.pdf_1768918262` still extracts as a PDF),
+to tolerate files a conflict-resolution/dedup tool renamed by appending
+`_<timestamp>` with no separating dot — found for real in the user's
+archive corpus, affecting ~3,552 PDFs there. No OCR, `.doc` (legacy
+Word), or other formats yet. Revisit sync vs. a background worker
+(Redis) once import volumes get large enough that embedding noticeably
+slows down `execute_job`.
 
 ## Retrieval
 `RetrievalService.search(query, top_k=5)` (`app/rag/retrieval_service.py`):
