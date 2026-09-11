@@ -356,6 +356,61 @@ def test_completed_import_job_cannot_be_executed_again(
             )
 
 
+def test_import_job_embeds_docx_source(
+    tmp_path: Path,
+) -> None:
+    import docx
+
+    source = tmp_path / "source"
+    source.mkdir()
+
+    document = docx.Document()
+    document.add_paragraph("First paragraph.")
+    document.add_paragraph("Second paragraph.")
+    document.save(str(source / "report.docx"))
+
+    database_url = make_url(settings.DATABASE_URL).set(database="aibrain_test")
+    engine = create_engine(database_url)
+
+    with Session(engine) as db:
+        job = ImportJob(
+            name="DOCX Extraction Integration Test",
+            source_path=str(source),
+            source_type="filesystem",
+        )
+
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        service = ImportJobService(
+            db,
+            ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
+        )
+
+        result = service.execute_job(job.id)
+
+        assert result.status == ImportStatus.COMPLETED
+
+        created_document = db.scalars(
+            select(Document).where(
+                Document.source == str(source / "report.docx")
+            )
+        ).one()
+
+        chunks = list(
+            db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == created_document.id
+                )
+            )
+        )
+
+        assert len(chunks) == 1
+        assert chunks[0].content == "First paragraph.\nSecond paragraph."
+
+
 @pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not running locally")
 def test_import_job_execution_embeds_documents_via_real_ollama(
     tmp_path: Path,

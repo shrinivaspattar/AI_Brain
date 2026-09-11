@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.embeddings.client import EmbeddingClient
 from app.ingestion.document_ingestor import DocumentIngestor
+from app.ingestion.text_extractor import extract_text
 from app.models.document import Document
 from app.models.import_job import ImportJob, ImportStatus
 from app.schemas.import_job import ImportJobCreate
@@ -127,9 +128,10 @@ class ImportJobService:
     ) -> None:
         """Embed each document's text content, synchronously, best-effort.
 
-        A document that can't be read as text (binary, missing, wrong
-        encoding) or that fails to embed (e.g. Ollama unreachable) is
-        skipped rather than failing the whole import job.
+        A document whose content can't be extracted (unsupported binary,
+        missing file, corrupt PDF/DOCX, ...) or that fails to embed (e.g.
+        Ollama unreachable) is skipped rather than failing the whole
+        import job.
         """
         embedding_service = EmbeddingService(
             self.db,
@@ -138,7 +140,7 @@ class ImportJobService:
 
         for document in documents:
             try:
-                content = Path(document.source).read_text(encoding="utf-8")
+                content = extract_text(Path(document.source))
                 embedding_service.embed_document(document, content)
             except Exception:
                 logger.warning(
