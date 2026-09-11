@@ -39,10 +39,20 @@ for the current module-by-module status this roadmap tracks against.
       diagram anticipates this; not implemented — `/rag/search` returns
       raw nearest-neighbor results)
 
-## Phase 2 — Conversation
-- [ ] Chat endpoint wired to Ollama (`CHAT_MODEL`, currently `qwen3:8b` per config)
-- [ ] RAG-augmented prompting: inject retrieved context, cite sources
-- [ ] Conversation/session persistence
+## Phase 2 — Conversation (done)
+- [x] Chat endpoint wired to Ollama: `POST /chat` (`CHAT_MODEL=qwen3:8b`),
+      via `ChatService`/`ChatClient` (`app/services`)
+- [x] RAG-augmented prompting: retrieves top-k chunks via `RetrievalService`,
+      injects them as numbered `[n]` context in the system prompt; verified
+      end-to-end against the real model — it correctly cites `[n]` and uses
+      prior turns' context on follow-up questions
+- [x] Conversation/session persistence: `Conversation` + `Message` models
+      (migration `ece8496c665b`), `GET /chat/{conversation_id}` for history.
+      `Message.citations` is a denormalized snapshot (chunk id, document id/
+      title/source) so citations stay legible even if the chunk is later
+      re-embedded or deleted.
+- [ ] Streaming responses (currently a single blocking call/response)
+- [ ] Conversation titles/summaries, listing/deleting conversations
 
 ## Phase 3 — Memory
 - [ ] Long-term memory store (`app/memory`): durable facts/preferences about

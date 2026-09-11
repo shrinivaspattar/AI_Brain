@@ -36,10 +36,13 @@ master backup / source files (read-only)
    RAG retrieval (app/rag/retrieval_service.py, POST /rag/search) ──▶ ranked chunks + source Document   [implemented]
         │
         ▼
-   chat/tool loop (app/memory, app/tools) ↔ Ollama (chat models)   [planned]
+   chat (app/services/chat_service.py, POST /chat) ↔ Ollama (CHAT_MODEL)   [implemented]
         │
         ▼
-   response, with citations back to source Document(s)
+   response, with citations back to source Document(s)   [implemented]
+        │
+        ▼
+   tool-calling loop (app/tools) ↔ Ollama   [planned]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -47,9 +50,9 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
-| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text). |
-| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence). |
+| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat. |
 | `db/` | Implemented | Session/engine setup, health checks. |
 | `core/` | Implemented | `Settings` (env-driven config: `DATABASE_URL`, `INGESTION_DIR`, `OLLAMA_HOST`, `CHAT_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, ...). |
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
@@ -92,6 +95,16 @@ Exposed via `POST /rag/search` (`{query, top_k}` → chunk content + source
 document + similarity `score = 1 - distance`, `top_k` bounded 1–50). No
 reranking or relevance-threshold filtering yet — it's raw nearest-neighbor
 search over whatever has been embedded.
+
+## Chat
+`ChatService.send_message(content, conversation_id=None, top_k=5)` (`app/services/chat_service.py`):
+1. Gets or creates the `Conversation` (a `conversation_id` for an unknown conversation raises `ValueError` → 404 at the API layer); persists the user's `Message`.
+2. Calls `RetrievalService.search(content, top_k)` for relevant `document_chunks`.
+3. Loads the conversation's message history (capped at the last 20 messages) and builds an Ollama prompt: a system message (base instructions + numbered `[n]` context blocks from the retrieved chunks, or a note that nothing relevant was found) followed by the history.
+4. Calls `ChatClient.chat(...)` (`app/services/chat_client.py`, thin wrapper around Ollama's chat API for `CHAT_MODEL`); a failure raises `ChatUnavailableError` → 503 at the API layer.
+5. Persists and returns the assistant `Message`, with `citations` set to a denormalized snapshot of the retrieved chunks (`document_chunk_id`, `document_id`, `document_title`, `document_source`) — captured at reply time so a citation stays legible even if that chunk is later re-embedded or deleted.
+
+Exposed via `POST /chat` (`{message, conversation_id?, top_k?}` → `{conversation_id, message}`) and `GET /chat/{conversation_id}` (full message history). Verified end-to-end against the real `qwen3:8b` model: it correctly cites `[n]` markers and uses prior turns as context on follow-up questions. Single blocking response only — no streaming yet.
 
 ## Import job lifecycle
 `ImportJob.status` is a state machine (`app/models/import_job.py`):
