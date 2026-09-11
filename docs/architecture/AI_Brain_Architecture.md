@@ -51,7 +51,7 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
 | `services/` | Implemented | `DocumentService` (persistence, `list_documents`), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection, tool-calling loop). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory, tools. |
 | `db/` | Implemented | Session/engine setup, health checks. |
@@ -59,7 +59,7 @@ master backup / source files (read-only)
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store, no type taxonomy. `POST /memory`, `GET /memory`, `DELETE /memory/{id}`. Read-only hook into `ChatService` (loads up to 50, most-recent-first); no automatic write hook from chat yet. |
-| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents` — all read-only. Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`. No filesystem or external-network tools yet. |
+| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents` — all read-only. Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -166,9 +166,11 @@ graceful fallback string is returned instead of looping forever.
 `ToolRegistry` (`app/tools/registry.py`): `register`/`get`/`list_tools`,
 `to_ollama_schema()` (the OpenAI-style `{"type": "function", "function":
 {...}}` shape Ollama expects), and `call(name, arguments)` — which never
-raises. An unknown tool name or a handler exception becomes a result
-string (`"Error running tool '<name>': <exc>"`) fed back to the model,
-not a crashed chat turn.
+raises, returning a `ToolCallResult(content, is_error, error, duration_ms)`
+instead. `content` is always what gets fed back to the model as the tool
+message (on failure, a human-readable description); `is_error`/`error`
+give callers (the audit trail, below) a structured status without parsing
+the content string.
 
 `app/tools/builtin.build_default_registry(db)` registers three tools, all
 **read-only**:
@@ -186,6 +188,46 @@ actually advertises the `tools` capability. Verified end-to-end: asked
 the real model for the current date/time and got back a minute-precise
 answer only obtainable by actually calling `get_current_datetime` (the
 model's training data doesn't include 2026).
+
+### Tool-call audit trail
+`ToolCallRecord` (`app/models/tool_call.py`, migration `db6a38db9323`):
+one row per tool call, written inside `_run_tool_loop` immediately as the
+call happens — `conversation_id` (FK), `message_id` (FK, nullable),
+`tool_name`, `iteration`/`call_index` (Ollama's `tool_calls` carry no
+native call id, so these — 1-based loop pass, 0-based position within
+that pass — are what identify a call's position within one turn),
+`arguments` (JSONB), `status` (`success`/`error`), `result` (truncated
+copy), `result_truncated`, `error_message`, `duration_ms`, `created_at`.
+Indexed on `conversation_id`, `message_id`, `tool_name`.
+
+`message_id` is nullable because the call happens mid-loop, before the
+final assistant `Message` exists. `ChatService._link_tool_calls_to_message`
+does one bulk `UPDATE` to backfill it once that `Message` is persisted —
+so a record still exists (with `message_id=NULL`) even if something later
+in `send_message` fails, rather than losing the fact that the call
+happened.
+
+Two safety properties, both directly tested:
+- **Best-effort persistence**: a DB failure while writing a
+  `ToolCallRecord` is logged and swallowed (`_record_tool_call`), never
+  propagated — audit logging must never be why a user doesn't get an
+  answer.
+- **Bounded storage, full model context**: the persisted `result` is
+  truncated to `MAX_TOOL_RESULT_LENGTH` (4000 chars, `result_truncated`
+  flags when this happened); the *full*, untruncated result is still what
+  gets fed back to the model — only the audit copy is capped.
+
+This is explicitly an audit/debug record — never queried for chat context,
+RAG, or memory. Today's three tools don't take secrets as arguments or
+return raw filesystem contents, so no redaction logic exists yet; a future
+filesystem/write tool would need to revisit that before this trail could
+be trusted not to store something sensitive.
+
+Verified end-to-end against the real model and directly against Postgres:
+asked it to list recently ingested documents, it called
+`list_recent_documents(limit=10)` on its own, and the resulting
+`ToolCallRecord` showed the correct arguments, `SUCCESS` status,
+`message_id` linkage, and a 2ms `duration_ms`.
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),

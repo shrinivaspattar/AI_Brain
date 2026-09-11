@@ -104,16 +104,27 @@ for the current module-by-module status this roadmap tracks against.
       `search_knowledge_base` (explicit on-demand RAG via
       `RetrievalService`), `get_current_datetime`, `list_recent_documents`.
       Exposed via `GET /tools`.
+- [x] Persisted tool-call audit trail: `ToolCallRecord` (migration
+      `db6a38db9323`) — conversation/message linkage, tool name,
+      iteration/call_index, arguments, status, truncated result (full
+      result still goes to the model; only the stored copy is capped at
+      `MAX_TOOL_RESULT_LENGTH`=4000 chars), error message, duration_ms.
+      Audit persistence is best-effort — a DB failure while writing a
+      record is logged and swallowed, never breaks the chat turn.
+      Explicitly an audit/debug record, never read back into a prompt.
+      Verified end-to-end against the real model and directly against
+      Postgres. This substantially covers the KRM backlog's "Immutable
+      Audit Log" item for tool calls specifically (not yet extended to
+      other subsystems).
 - [ ] File operations / external API tools — deliberately not built yet.
       A materially bigger security surface for a system meant to index
       720GB of personal data (see the `project-master-data-corpus`
       memory note) than the read-only tools above; needs its own explicit
       scoping decision (which paths, read vs. write, sandboxing) rather
-      than being bundled into "first tools."
-- [ ] No persisted tool-call audit trail yet — calls are logged
-      (`logger.info`) but not written to the database. Worth revisiting
-      alongside the KRM backlog's "Immutable Audit Log" item if tool use
-      grows beyond the current read-only set.
+      than being bundled into "first tools." If/when they land, revisit
+      whether tool arguments/results need redaction before persisting —
+      today's three tools don't take secrets or return raw filesystem
+      contents, so the audit trail didn't need that logic yet.
 
 ## Phase 5 — Repository health & knowledge management (KRM)
 Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
