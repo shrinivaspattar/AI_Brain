@@ -94,6 +94,11 @@ class ImportJobService:
     ) -> ImportJob:
         job = self._get_job_or_raise(job_id)
 
+        if job.status != ImportStatus.RUNNING:
+            raise ValueError(
+                f"Import job {job.id} cannot transition to COMPLETED"
+            )
+
         try:
             job.status = ImportStatus.COMPLETED
             job.progress = 100

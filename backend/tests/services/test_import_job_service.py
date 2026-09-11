@@ -81,38 +81,6 @@ def test_execute_job_rejects_missing_job() -> None:
         service.execute_job(42)
 
 
-@pytest.mark.parametrize(
-    "status",
-    [
-        ImportStatus.RUNNING,
-        ImportStatus.PAUSED,
-        ImportStatus.COMPLETED,
-        ImportStatus.CANCELLED,
-    ],
-)
-def test_execute_job_rejects_non_executable_statuses(
-    status: ImportStatus,
-) -> None:
-    db = MagicMock()
-
-    job = ImportJob(
-        id=42,
-        name="Test Import",
-        source_path="/documents/source",
-        source_type="filesystem",
-        status=status,
-    )
-
-    db.get.return_value = job
-
-    service = ImportJobService(db)
-
-    with pytest.raises(
-        ValueError,
-        match="Import job 42 cannot be executed",
-    ):
-        service.execute_job(42)
-
 
 def test_execute_job_allows_failed_job_retry() -> None:
     db = MagicMock()
@@ -141,6 +109,29 @@ def test_execute_job_allows_failed_job_retry() -> None:
     assert result.status == ImportStatus.COMPLETED
     assert result.files_discovered == 1
     assert result.files_processed == 1
+
+
+def test_mark_completed_allows_running_job() -> None:
+    db = MagicMock()
+
+    job = ImportJob(
+        id=42,
+        name="Test Import",
+        source_path="/documents/source",
+        source_type="filesystem",
+        status=ImportStatus.RUNNING,
+    )
+
+    db.get.return_value = job
+
+    service = ImportJobService(db)
+
+    result = service.mark_completed(42)
+
+    assert result is job
+    assert result.status == ImportStatus.COMPLETED
+    assert result.progress == 100
+    assert result.finished_at is not None
 
 
 def test_mark_running_allows_pending_job() -> None:
@@ -185,3 +176,49 @@ def test_mark_running_allows_failed_job_retry() -> None:
     assert result is job
     assert result.status == ImportStatus.RUNNING
     assert result.started_at is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ImportStatus.PENDING,
+        ImportStatus.FAILED,
+        ImportStatus.PAUSED,
+        ImportStatus.COMPLETED,
+        ImportStatus.CANCELLED,
+    ],
+)
+def test_mark_completed_rejects_invalid_statuses(
+    status: ImportStatus,
+) -> None:
+    db = MagicMock()
+
+    job = ImportJob(
+        id=42,
+        name="Test Import",
+        source_path="/documents/source",
+        source_type="filesystem",
+        status=status,
+    )
+
+    db.get.return_value = job
+
+    service = ImportJobService(db)
+
+    with pytest.raises(
+        ValueError,
+        match="Import job 42 cannot transition to COMPLETED",
+    ):
+        service.mark_completed(42)
+
+    assert job.status == status
+
+
+def test_mark_completed_rejects_missing_job() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+
+    service = ImportJobService(db)
+
+    with pytest.raises(ValueError, match="Import job 42 not found"):
+        service.mark_completed(42)
