@@ -105,3 +105,95 @@ def test_execute_import_job_returns_not_found() -> None:
 
     finally:
         app.dependency_overrides.clear()
+
+
+def test_start_import_job_returns_conflict_for_invalid_state() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.mark_running.side_effect = ValueError(
+                "Import job 42 cannot transition to RUNNING"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/start")
+
+            assert response.status_code == 409
+            assert response.json() == {
+                "detail": "Import job 42 cannot transition to RUNNING"
+            }
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_start_import_job_returns_not_found() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.mark_running.side_effect = ValueError(
+                "Import job 42 not found"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/start")
+
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Import job 42 not found"}
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_complete_import_job_returns_conflict_for_invalid_state() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.mark_completed.side_effect = ValueError(
+                "Import job 42 cannot transition to COMPLETED"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/complete")
+
+            assert response.status_code == 409
+            assert response.json() == {
+                "detail": "Import job 42 cannot transition to COMPLETED"
+            }
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_complete_import_job_returns_not_found() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.mark_completed.side_effect = ValueError(
+                "Import job 42 not found"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/complete")
+
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Import job 42 not found"}
+
+    finally:
+        app.dependency_overrides.clear()

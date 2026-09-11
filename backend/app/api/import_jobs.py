@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -11,6 +11,19 @@ router = APIRouter(
     prefix="/import-jobs",
     tags=["Import Jobs"],
 )
+
+
+def _raise_for_value_error(exc: ValueError) -> NoReturn:
+    if "not found" in str(exc):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=str(exc),
+    )
 
 
 @router.get(
@@ -74,10 +87,7 @@ def start_import_job(
         return service.mark_running(job_id)
 
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e),
-        )
+        _raise_for_value_error(e)
 
 
 @router.post(
@@ -95,10 +105,7 @@ def complete_import_job(
         return service.mark_completed(job_id)
 
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e),
-        )
+        _raise_for_value_error(e)
 
 
 @router.post(
@@ -116,13 +123,4 @@ def execute_import_job(
         return service.execute_job(job_id)
 
     except ValueError as e:
-        if "not found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=str(e),
-            )
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        )
+        _raise_for_value_error(e)

@@ -15,7 +15,7 @@ class ImportJobResponse(BaseModel):
     source_path: str
     source_type: str
     status: str
-    progress: int
+    progress: float
     files_discovered: int
     files_processed: int
     error_message: str | None
