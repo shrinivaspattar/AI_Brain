@@ -86,9 +86,34 @@ for the current module-by-module status this roadmap tracks against.
       if the memory store grows large enough that recency stops being a
       good proxy for relevance.
 
-## Phase 4 — Tool calling
-- [ ] Tool registry and execution loop (`app/tools`)
-- [ ] First tools: local file operations, local API calls
+## Phase 4 — Tool calling (started)
+- [x] Confirmed `qwen3:8b` advertises Ollama's `tools` capability before
+      building around it (`ollama /api/show`).
+- [x] Tool registry and execution loop: `Tool`/`ToolRegistry`
+      (`app/tools/registry.py`). `ToolRegistry.call()` never raises — an
+      unknown tool or handler exception becomes a result string fed back
+      to the model, not a crashed chat turn.
+- [x] `ChatService._run_tool_loop`: real agentic loop — send
+      messages+tools, execute any requested tool calls, feed results back
+      as `role="tool"` messages, repeat until a plain reply or
+      `MAX_TOOL_ITERATIONS` (5) is hit (graceful fallback message, not an
+      infinite loop). Verified end-to-end against the real model: asked
+      for the current date/time, got a minute-precise real answer the
+      model could only have produced by actually calling the tool.
+- [x] First tools (`app/tools/builtin.py`), deliberately all read-only:
+      `search_knowledge_base` (explicit on-demand RAG via
+      `RetrievalService`), `get_current_datetime`, `list_recent_documents`.
+      Exposed via `GET /tools`.
+- [ ] File operations / external API tools — deliberately not built yet.
+      A materially bigger security surface for a system meant to index
+      720GB of personal data (see the `project-master-data-corpus`
+      memory note) than the read-only tools above; needs its own explicit
+      scoping decision (which paths, read vs. write, sandboxing) rather
+      than being bundled into "first tools."
+- [ ] No persisted tool-call audit trail yet — calls are logged
+      (`logger.info`) but not written to the database. Worth revisiting
+      alongside the KRM backlog's "Immutable Audit Log" item if tool use
+      grows beyond the current read-only set.
 
 ## Phase 5 — Repository health & knowledge management (KRM)
 Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in

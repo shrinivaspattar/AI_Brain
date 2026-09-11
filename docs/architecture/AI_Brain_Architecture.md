@@ -40,9 +40,10 @@ master backup / source files (read-only)
         │  reads Memory rows (app/memory), injected as user-facts context
         ▼
    response, with citations back to source Document(s)   [implemented]
-        │
+        │  chat_client.chat(messages, tools=...) ↔ tool_calls
         ▼
-   tool-calling loop (app/tools) ↔ Ollama   [planned]
+   tool loop (app/tools, up to 5 iterations) — search_knowledge_base,
+   get_current_datetime, list_recent_documents (all read-only)   [implemented]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -51,14 +52,14 @@ master backup / source files (read-only)
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
 | `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
-| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection). |
-| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory. |
+| `services/` | Implemented | `DocumentService` (persistence, `list_documents`), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection, tool-calling loop). |
+| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory, tools. |
 | `db/` | Implemented | Session/engine setup, health checks. |
 | `core/` | Implemented | `Settings` (env-driven config: `DATABASE_URL`, `INGESTION_DIR`, `OLLAMA_HOST`, `CHAT_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, ...). |
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store, no type taxonomy. `POST /memory`, `GET /memory`, `DELETE /memory/{id}`. Read-only hook into `ChatService` (loads up to 50, most-recent-first); no automatic write hook from chat yet. |
-| `tools/` | Empty stub | Tool-calling: lets the assistant act (run scripts, query local APIs, manipulate files) rather than only answer. |
+| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents` — all read-only. Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`. No filesystem or external-network tools yet. |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -142,10 +143,49 @@ search over whatever has been embedded.
 1. Gets or creates the `Conversation` (a `conversation_id` for an unknown conversation raises `ValueError` → 404 at the API layer); persists the user's `Message`.
 2. Calls `RetrievalService.search(content, top_k)` for relevant `document_chunks`.
 3. Loads up to 50 `Memory` rows (most-recent-first) and the conversation's message history (capped at the last 20 messages), then builds an Ollama prompt: a system message (base instructions + numbered `[n]` document-context block, or a note that nothing relevant was found + a "What you know about the user" block from memory, if any) followed by the history.
-4. Calls `ChatClient.chat(...)` (`app/services/chat_client.py`, thin wrapper around Ollama's chat API for `CHAT_MODEL`); a failure raises `ChatUnavailableError` → 503 at the API layer.
+4. Runs `_run_tool_loop(prompt)` (see Tool calling, below) instead of a single `chat_client.chat()` call.
 5. Persists and returns the assistant `Message`, with `citations` set to a denormalized snapshot of the retrieved chunks (`document_chunk_id`, `document_id`, `document_title`, `document_source`) — captured at reply time so a citation stays legible even if that chunk is later re-embedded or deleted.
 
 Exposed via `POST /chat` (`{message, conversation_id?, top_k?}` → `{conversation_id, message}`) and `GET /chat/{conversation_id}` (full message history). Verified end-to-end against the real `qwen3:8b` model: it correctly cites `[n]` markers for document context, states memory facts plainly (no citation marker — the system prompt explicitly scopes `[n]` citations to the numbered document list only), and uses prior turns as context on follow-up questions. Single blocking response only — no streaming yet.
+
+## Tool calling
+`ChatClient.chat(messages, tools=None)` (`app/services/chat_client.py`) returns
+the raw Ollama response message (`.content` and `.tool_calls`), not just text
+— this is what lets `ChatService` drive a real loop rather than a single
+call. `ChatUnavailableError` (Ollama unreachable/failed) still maps to 503
+at the API layer.
+
+`ChatService._run_tool_loop(messages)`: sends `messages` plus
+`ToolRegistry.to_ollama_schema()` to `chat_client.chat()`. If the reply has
+no `tool_calls`, its `.content` is the final answer. Otherwise: append the
+assistant's tool-call message, execute each requested call via
+`ToolRegistry.call(name, arguments)`, append one `role="tool"` message per
+result, and loop — capped at `MAX_TOOL_ITERATIONS` (5), after which a
+graceful fallback string is returned instead of looping forever.
+
+`ToolRegistry` (`app/tools/registry.py`): `register`/`get`/`list_tools`,
+`to_ollama_schema()` (the OpenAI-style `{"type": "function", "function":
+{...}}` shape Ollama expects), and `call(name, arguments)` — which never
+raises. An unknown tool name or a handler exception becomes a result
+string (`"Error running tool '<name>': <exc>"`) fed back to the model,
+not a crashed chat turn.
+
+`app/tools/builtin.build_default_registry(db)` registers three tools, all
+**read-only**:
+- `search_knowledge_base(query, top_k=5)` — explicit, on-demand
+  `RetrievalService` search, letting the model search multiple times
+  with different queries within one turn, distinct from the always-on
+  context already injected into the prompt.
+- `get_current_datetime()` — UTC, ISO 8601.
+- `list_recent_documents(limit=10)` — wraps `DocumentService.list_documents`.
+
+Exposed via `GET /tools`. Deliberately no filesystem read/write or
+external-network-call tools yet — before building around
+`qwen3:8b`'s tool support, confirmed via `ollama /api/show` that it
+actually advertises the `tools` capability. Verified end-to-end: asked
+the real model for the current date/time and got back a minute-precise
+answer only obtainable by actually calling `get_current_datetime` (the
+model's training data doesn't include 2026).
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
