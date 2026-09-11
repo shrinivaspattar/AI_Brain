@@ -30,13 +30,13 @@ master backup / source files (read-only)
    DocumentIngestor ──▶ Document rows, tagged with import_job_id   [implemented]
         │
         ▼
-   chunking + embeddings (app/embeddings) ──▶ DocumentChunk rows w/ pgvector embedding   [implemented, not yet wired into ingestion]
+   chunking + embeddings (app/embeddings), wired into execute_job   ──▶ DocumentChunk rows w/ pgvector embedding   [implemented]
         │
         ▼
-   RAG retrieval (app/rag) ──▶ context for chat   [planned]
+   RAG retrieval (app/rag/retrieval_service.py, POST /rag/search) ──▶ ranked chunks + source Document   [implemented]
         │
         ▼
-   chat/tool loop (app/memory, app/tools) ↔ Ollama (DeepSeek-R1 / Qwen2.5-Coder)   [planned]
+   chat/tool loop (app/memory, app/tools) ↔ Ollama (chat models)   [planned]
         │
         ▼
    response, with citations back to source Document(s)
@@ -48,12 +48,12 @@ master backup / source files (read-only)
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist. |
 | `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
-| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions), `EmbeddingService` (chunk + embed + persist a document's text). |
-| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs. No endpoints yet for chunks/embeddings/retrieval. |
+| `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text). |
+| `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag. |
 | `db/` | Implemented | Session/engine setup, health checks. |
 | `core/` | Implemented | `Settings` (env-driven config: `DATABASE_URL`, `INGESTION_DIR`, `OLLAMA_HOST`, `CHAT_MODEL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, ...). |
-| `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. Not yet wired into the ingestion pipeline — must be invoked explicitly via `EmbeddingService`. |
-| `rag/` | Empty stub | Will query `document_chunks.embedding` (pgvector) for a given query and assemble retrieved context for chat. |
+| `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
+| `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Empty stub | Long-term memory: durable facts/preferences about the user, distinct from RAG document retrieval. |
 | `tools/` | Empty stub | Tool-calling: lets the assistant act (run scripts, query local APIs, manipulate files) rather than only answer. |
 
@@ -64,7 +64,27 @@ master backup / source files (read-only)
 3. Calls Ollama's embed API in one batched request (`app/embeddings/client.py`) for `EMBEDDING_MODEL` (`nomic-embed-text`, `EMBEDDING_DIMENSIONS=768`).
 4. Persists one `DocumentChunk` row per chunk, `(document_id, chunk_index)` unique, `embedding` as a pgvector column.
 
-This is deliberately decoupled from `DocumentIngestor` — it takes already-extracted text `content`, not a file path. No text-extraction-by-file-type (PDF, DOCX, etc.) exists yet; today it only makes sense for plain text/markdown files. Wiring embedding into `execute_job` automatically (and deciding sync vs. background-worker-via-Redis for large imports) is a deliberate next decision, not yet made.
+`EmbeddingService` itself takes already-extracted text `content`, not a file
+path. `ImportJobService._embed_documents` (called from `execute_job`, after
+ingestion) bridges the gap for now: it reads each created `Document`'s file
+at `document.source` as UTF-8 text and hands that to `EmbeddingService`,
+synchronously, best-effort per document — an unreadable or failed embed is
+logged and skipped, not fatal to the job. No text-extraction-by-file-type
+(PDF, DOCX, etc.) exists yet, so this only does something useful for plain
+text/markdown sources today; everything else is silently skipped. Revisit
+sync vs. a background worker (Redis) once import volumes get large enough
+that embedding noticeably slows down `execute_job`.
+
+## Retrieval
+`RetrievalService.search(query, top_k=5)` (`app/rag/retrieval_service.py`):
+1. Embeds `query` via `EmbeddingClient` (same `nomic-embed-text` model as ingestion).
+2. Orders `document_chunks` by pgvector cosine distance to that embedding (`DocumentChunk.embedding.cosine_distance(...)`), joined to their source `Document`.
+3. Returns the nearest `top_k` as `RetrievedChunk(chunk, document, distance)`.
+
+Exposed via `POST /rag/search` (`{query, top_k}` → chunk content + source
+document + similarity `score = 1 - distance`, `top_k` bounded 1–50). No
+reranking or relevance-threshold filtering yet — it's raw nearest-neighbor
+search over whatever has been embedded.
 
 ## Import job lifecycle
 `ImportJob.status` is a state machine (`app/models/import_job.py`):

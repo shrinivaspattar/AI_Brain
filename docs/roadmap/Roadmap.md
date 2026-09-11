@@ -27,10 +27,16 @@ for the current module-by-module status this roadmap tracks against.
       logged and skipped, not fatal to the job). Revisit sync vs. a
       background worker (Redis) once import volumes get large enough
       that embedding noticeably slows down `execute_job`.
+- [x] Retrieval: `RetrievalService.search(query, top_k)` (`app/rag`) embeds
+      the query and ranks `document_chunks` by pgvector cosine distance,
+      joined to source `Document`. Exposed via `POST /rag/search`.
 - [ ] Text extraction by file type (currently only works for plain text;
       a binary file like a PDF is skipped rather than having its text
-      extracted — no PDF/DOCX/etc. extraction exists yet)
-- [ ] Retrieval: given a query, embed it and return top-k `DocumentChunk`s + source `Document`
+      extracted — no PDF/DOCX/etc. extraction exists yet, which also means
+      retrieval only covers plain text/markdown sources today)
+- [ ] Reranking / relevance filtering beyond raw cosine distance (Phase 1's
+      diagram anticipates this; not implemented — `/rag/search` returns
+      raw nearest-neighbor results)
 
 ## Phase 2 — Conversation
 - [ ] Chat endpoint wired to Ollama (`CHAT_MODEL`, currently `qwen3:8b` per config)
