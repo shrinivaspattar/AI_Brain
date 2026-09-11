@@ -7,6 +7,9 @@ from app.schemas.document import DocumentCreate
 from app.services.document_service import DocumentService
 
 
+ARCHIVE_CONTAINER_SUFFIXES = {".zip", ".7z"}
+
+
 class DocumentIngestor:
     """Orchestrates filesystem discovery and document persistence."""
 
@@ -41,7 +44,7 @@ class DocumentIngestor:
         documents: list[Document] = []
 
         for file in discovered:
-            if file.path.suffix.lower() == ".zip":
+            if file.path.suffix.lower() in ARCHIVE_CONTAINER_SUFFIXES:
                 continue
 
             document = self.document_service.create_document(

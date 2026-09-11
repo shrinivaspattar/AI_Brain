@@ -142,3 +142,35 @@ def test_ingest_skips_archive_container_documents(
 
     assert document_data.title == "notes.txt"
     assert document_data.source_type == "txt"
+
+
+def test_ingest_skips_7z_archive_container_documents(
+    tmp_path: Path,
+) -> None:
+    import py7zr
+
+    source = tmp_path / "source"
+    destination = tmp_path / "extracted"
+
+    source.mkdir()
+    destination.mkdir()
+
+    archive = source / "knowledge.7z"
+
+    with py7zr.SevenZipFile(archive, "w") as sevenzip_file:
+        sevenzip_file.writestr(b"hello from 7z", "notes.txt")
+
+    document_service = MagicMock()
+
+    ingestor = DocumentIngestor(
+        document_service=document_service,
+    )
+
+    result = ingestor.ingest(source, destination)
+
+    assert len(result) == 1
+
+    document_data = document_service.create_document.call_args.args[0]
+
+    assert document_data.title == "notes.txt"
+    assert document_data.source_type == "txt"
