@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -5,10 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.embeddings.client import EmbeddingClient
 from app.ingestion.document_ingestor import DocumentIngestor
+from app.models.document import Document
 from app.models.import_job import ImportJob, ImportStatus
 from app.schemas.import_job import ImportJobCreate
 from app.services.document_service import DocumentService
+from app.services.embedding_service import EmbeddingService
+
+logger = logging.getLogger(__name__)
 
 
 class ImportJobService:
@@ -16,9 +22,11 @@ class ImportJobService:
         self,
         db: Session,
         ingestion_dir: Path | None = None,
+        embedding_client: EmbeddingClient | None = None,
     ):
         self.db = db
         self.ingestion_dir = ingestion_dir or settings.INGESTION_DIR
+        self.embedding_client = embedding_client
 
     def create_job(
         self,
@@ -113,6 +121,32 @@ class ImportJobService:
             self.db.rollback()
             raise
 
+    def _embed_documents(
+        self,
+        documents: list[Document],
+    ) -> None:
+        """Embed each document's text content, synchronously, best-effort.
+
+        A document that can't be read as text (binary, missing, wrong
+        encoding) or that fails to embed (e.g. Ollama unreachable) is
+        skipped rather than failing the whole import job.
+        """
+        embedding_service = EmbeddingService(
+            self.db,
+            embedding_client=self.embedding_client,
+        )
+
+        for document in documents:
+            try:
+                content = Path(document.source).read_text(encoding="utf-8")
+                embedding_service.embed_document(document, content)
+            except Exception:
+                logger.warning(
+                    "Skipping embedding for document %s",
+                    document.id,
+                    exc_info=True,
+                )
+
     def execute_job(
         self,
         job_id: int,
@@ -135,7 +169,7 @@ class ImportJobService:
             document_service = DocumentService(self.db)
             ingestor = DocumentIngestor(document_service)
 
-            ingestor.ingest(
+            documents = ingestor.ingest(
                 Path(job.source_path),
                 destination,
                 import_job_id=job.id,
@@ -143,6 +177,8 @@ class ImportJobService:
 
             job.files_discovered = ingestor.last_discovered_count
             job.files_processed = ingestor.last_discovered_count
+
+            self._embed_documents(documents)
 
             self.db.commit()
             self.db.refresh(job)

@@ -1,13 +1,37 @@
+import socket
 from pathlib import Path
+from unittest.mock import MagicMock
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.document import Document
+from app.models.document_chunk import DocumentChunk
 from app.models.import_job import ImportJob, ImportStatus
 from app.services.import_job_service import ImportJobService
+
+
+def fake_embedding_client() -> MagicMock:
+    """A deterministic stand-in for EmbeddingClient, independent of Ollama."""
+    client = MagicMock()
+    client.embed.side_effect = lambda texts: [
+        [0.1] * settings.EMBEDDING_DIMENSIONS for _ in texts
+    ]
+    return client
+
+
+def _ollama_reachable() -> bool:
+    host = settings.OLLAMA_HOST.split("://", 1)[-1]
+    hostname, _, port = host.partition(":")
+
+    try:
+        with socket.create_connection((hostname, int(port or 11434)), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 def test_import_job_executes_against_test_database(
@@ -37,6 +61,7 @@ def test_import_job_executes_against_test_database(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         result = service.execute_job(job.id)
@@ -67,6 +92,22 @@ def test_import_job_executes_against_test_database(
         }
 
         assert {document.import_job_id for document in documents} == {job.id}
+
+        chunks = list(
+            db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id.in_(
+                        [document.id for document in documents]
+                    )
+                )
+            )
+        )
+
+        assert len(chunks) == 2
+        assert all(chunk.embedding is not None for chunk in chunks)
+        assert all(
+            len(chunk.embedding) == settings.EMBEDDING_DIMENSIONS for chunk in chunks
+        )
 
 
 def test_import_job_executes_zip_against_test_database(
@@ -100,6 +141,7 @@ def test_import_job_executes_zip_against_test_database(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         result = service.execute_job(job.id)
@@ -142,6 +184,7 @@ def test_import_job_fails_when_source_is_missing(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         try:
@@ -182,6 +225,7 @@ def test_import_job_completes_when_source_is_empty(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         result = service.execute_job(job.id)
@@ -219,6 +263,7 @@ def test_import_job_records_successful_lifecycle(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         result = service.execute_job(job.id)
@@ -251,6 +296,7 @@ def test_import_job_records_failed_lifecycle(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         try:
@@ -293,6 +339,7 @@ def test_completed_import_job_cannot_be_executed_again(
         service = ImportJobService(
             db,
             ingestion_dir=tmp_path / "imports",
+            embedding_client=fake_embedding_client(),
         )
 
         result = service.execute_job(job.id)
@@ -307,3 +354,50 @@ def test_completed_import_job_cannot_be_executed_again(
             raise AssertionError(
                 "Expected completed import job execution to be rejected"
             )
+
+
+@pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not running locally")
+def test_import_job_execution_embeds_documents_via_real_ollama(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "notes.txt").write_text("AI_Brain is a personal offline assistant.")
+
+    database_url = make_url(settings.DATABASE_URL).set(database="aibrain_test")
+    engine = create_engine(database_url)
+
+    with Session(engine) as db:
+        job = ImportJob(
+            name="Real Ollama Embedding Integration Test",
+            source_path=str(source),
+            source_type="filesystem",
+        )
+
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        service = ImportJobService(
+            db,
+            ingestion_dir=tmp_path / "imports",
+        )
+
+        result = service.execute_job(job.id)
+
+        assert result.status == ImportStatus.COMPLETED
+
+        document = db.scalars(
+            select(Document).where(Document.source == str(source / "notes.txt"))
+        ).one()
+
+        chunks = list(
+            db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == document.id
+                )
+            )
+        )
+
+        assert len(chunks) == 1
+        assert len(chunks[0].embedding) == settings.EMBEDDING_DIMENSIONS
