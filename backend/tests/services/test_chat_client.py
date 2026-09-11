@@ -5,10 +5,11 @@ import pytest
 from app.services.chat_client import ChatClient, ChatUnavailableError
 
 
-def test_chat_returns_reply_content() -> None:
+def test_chat_returns_reply_message() -> None:
     with patch("app.services.chat_client.ollama.Client") as client_class:
         response = MagicMock()
         response.message.content = "Hello there."
+        response.message.tool_calls = None
         client_class.return_value.chat.return_value = response
 
         client = ChatClient(model="qwen3:8b", host="http://ollama:11434")
@@ -16,22 +17,30 @@ def test_chat_returns_reply_content() -> None:
         messages = [{"role": "user", "content": "hi"}]
         result = client.chat(messages)
 
-        assert result == "Hello there."
+        assert result is response.message
+        assert result.content == "Hello there."
         client_class.return_value.chat.assert_called_once_with(
             model="qwen3:8b",
             messages=messages,
+            tools=None,
         )
 
 
-def test_chat_returns_empty_string_for_none_content() -> None:
+def test_chat_passes_tools_through() -> None:
     with patch("app.services.chat_client.ollama.Client") as client_class:
         response = MagicMock()
-        response.message.content = None
         client_class.return_value.chat.return_value = response
 
         client = ChatClient()
 
-        assert client.chat([{"role": "user", "content": "hi"}]) == ""
+        tools = [{"type": "function", "function": {"name": "get_time"}}]
+        client.chat([{"role": "user", "content": "hi"}], tools=tools)
+
+        client_class.return_value.chat.assert_called_once_with(
+            model=client.model,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+        )
 
 
 def test_chat_wraps_failures_in_chat_unavailable_error() -> None:

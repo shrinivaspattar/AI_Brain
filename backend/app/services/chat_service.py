@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -7,6 +9,10 @@ from app.models.memory import Memory
 from app.models.message import Message, MessageRole
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
 from app.services.chat_client import ChatClient
+from app.tools.builtin import build_default_registry
+from app.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are AI_Brain, a personal offline assistant. When a numbered "
@@ -15,11 +21,14 @@ SYSTEM_PROMPT = (
     "isn't relevant, say so and answer from general knowledge instead. "
     "A 'What you know about the user' list, if provided, is remembered "
     "facts about the user — state them plainly when relevant, with no "
-    "[n] citation marker, since they aren't numbered."
+    "[n] citation marker, since they aren't numbered. You also have "
+    "tools available — use them when they'd give a better answer than "
+    "the context already provided."
 )
 
 MAX_HISTORY_MESSAGES = 20
 MAX_MEMORIES = 50
+MAX_TOOL_ITERATIONS = 5
 
 
 class ChatService:
@@ -29,11 +38,13 @@ class ChatService:
         chat_client: ChatClient | None = None,
         retrieval_service: RetrievalService | None = None,
         memory_service: MemoryService | None = None,
+        tool_registry: ToolRegistry | None = None,
     ):
         self.db = db
         self.chat_client = chat_client or ChatClient()
         self.retrieval_service = retrieval_service or RetrievalService(db)
         self.memory_service = memory_service or MemoryService(db)
+        self.tool_registry = tool_registry or build_default_registry(db)
 
     def send_message(
         self,
@@ -57,14 +68,14 @@ class ChatService:
         history = self._load_history(conversation.id)
         prompt = self._build_prompt(history, retrieved, memories)
 
-        reply = self.chat_client.chat(prompt)
+        reply_text = self._run_tool_loop(prompt)
 
         citations = self._build_citations(retrieved)
 
         assistant_message = Message(
             conversation_id=conversation.id,
             role=MessageRole.ASSISTANT,
-            content=reply,
+            content=reply_text,
             citations=citations,
         )
 
@@ -77,6 +88,63 @@ class ChatService:
         except Exception:
             self.db.rollback()
             raise
+
+    def _run_tool_loop(self, messages: list[dict]) -> str:
+        """Drive the chat/tool-call loop until the model gives a plain reply.
+
+        Each iteration: send the conversation so far (plus any tool
+        results already gathered) to the model. If it asks to call
+        tools, execute them and feed the results back for the next
+        iteration. Capped at MAX_TOOL_ITERATIONS so a model that keeps
+        calling tools without ever answering can't loop forever.
+        """
+        working_messages = list(messages)
+        tools_schema = self.tool_registry.to_ollama_schema()
+
+        for _ in range(MAX_TOOL_ITERATIONS):
+            reply = self.chat_client.chat(working_messages, tools=tools_schema)
+
+            if not reply.tool_calls:
+                return reply.content or ""
+
+            working_messages.append(
+                {
+                    "role": "assistant",
+                    "content": reply.content or "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": dict(call.function.arguments),
+                            }
+                        }
+                        for call in reply.tool_calls
+                    ],
+                }
+            )
+
+            for call in reply.tool_calls:
+                arguments = dict(call.function.arguments)
+                logger.info("Tool call: %s(%s)", call.function.name, arguments)
+
+                result = self.tool_registry.call(call.function.name, arguments)
+
+                working_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": call.function.name,
+                        "content": result,
+                    }
+                )
+
+        logger.warning(
+            "Tool loop hit MAX_TOOL_ITERATIONS (%d) without a final reply",
+            MAX_TOOL_ITERATIONS,
+        )
+        return (
+            "I wasn't able to finish that after several tool calls — "
+            "could you try rephrasing?"
+        )
 
     def _get_or_create_conversation(
         self,

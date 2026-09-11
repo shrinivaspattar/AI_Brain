@@ -47,6 +47,18 @@ def test_create_document_persists_import_job_id() -> None:
     assert result.import_job_id == 7
 
 
+def test_list_documents_returns_scalars() -> None:
+    db = MagicMock()
+    documents = [MagicMock(), MagicMock()]
+    db.scalars.return_value = documents
+
+    service = DocumentService(db)
+
+    result = service.list_documents()
+
+    assert result == documents
+
+
 def test_create_document_rolls_back_on_commit_failure() -> None:
     db = MagicMock()
     db.commit.side_effect = RuntimeError("database failure")

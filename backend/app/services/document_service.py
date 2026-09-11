@@ -1,12 +1,26 @@
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.document import Document
 from app.schemas.document import DocumentCreate
 
+DEFAULT_LIST_LIMIT = 100
+
 
 class DocumentService:
     def __init__(self, db: Session):
         self.db = db
+
+    def list_documents(
+        self,
+        limit: int = DEFAULT_LIST_LIMIT,
+    ) -> list[Document]:
+        statement = (
+            select(Document)
+            .order_by(Document.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.db.scalars(statement))
 
     def create_document(
         self,

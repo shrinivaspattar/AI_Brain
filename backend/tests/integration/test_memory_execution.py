@@ -70,7 +70,10 @@ def test_chat_prompt_includes_real_memories_from_database() -> None:
         retrieval_service.search.return_value = []
 
         chat_client = MagicMock()
-        chat_client.chat.return_value = "Hi Shrinivas!"
+        chat_reply = MagicMock()
+        chat_reply.content = "Hi Shrinivas!"
+        chat_reply.tool_calls = None
+        chat_client.chat.return_value = chat_reply
 
         service = ChatService(
             db,

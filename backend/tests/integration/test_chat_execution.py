@@ -16,7 +16,10 @@ from app.schemas.document import DocumentCreate
 
 def fake_chat_client(reply: str) -> MagicMock:
     client = MagicMock()
-    client.chat.return_value = reply
+    message = MagicMock()
+    message.content = reply
+    message.tool_calls = None
+    client.chat.return_value = message
     return client
 
 
