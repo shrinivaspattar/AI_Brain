@@ -8,7 +8,10 @@ for the current module-by-module status this roadmap tracks against.
 
 ## Phase 0 — Ingestion foundation (done)
 - [x] Source scanning (`SourceScanner`)
-- [x] Archive extraction with zip-bomb / disk-space protection (`ArchiveExtractor`)
+- [x] Archive extraction with bomb / path-traversal / disk-space
+      protection (`ArchiveExtractor`), `.zip` and `.7z` — `.7z` added
+      after finding the user's real ~720GB archive corpus leans heavily
+      on it for large backups. No `.tar`/`.tar.gz`/`.rar` support yet.
 - [x] Document persistence (`Document` model + `DocumentService`)
 - [x] Import job lifecycle with enforced state transitions (`ImportJobService`)
 - [x] REST API for documents and import jobs

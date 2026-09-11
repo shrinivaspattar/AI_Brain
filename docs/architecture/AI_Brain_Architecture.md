@@ -49,7 +49,7 @@ master backup / source files (read-only)
 
 | Module | Status | Responsibility |
 |---|---|---|
-| `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands archives (zip-bomb/disk-space guarded); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
+| `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
 | `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
 | `services/` | Implemented | `DocumentService` (persistence), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory. |
@@ -59,6 +59,35 @@ master backup / source files (read-only)
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store, no type taxonomy. `POST /memory`, `GET /memory`, `DELETE /memory/{id}`. Read-only hook into `ChatService` (loads up to 50, most-recent-first); no automatic write hook from chat yet. |
 | `tools/` | Empty stub | Tool-calling: lets the assistant act (run scripts, query local APIs, manipulate files) rather than only answer. |
+
+## Archive extraction
+`ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
+dispatches by extension:
+- `.zip` (`zipfile`, stdlib): per-member checks — path-traversal
+  (`is_relative_to(destination)`), expansion-ratio bomb protection
+  (`compress_size` vs. `file_size`, hard limit 1000×), then a disk-space
+  check (sum of member sizes vs. a 10GB hard free-space reserve).
+- `.7z` (`py7zr`): same three protections, with one structural difference.
+  7z's default "solid" compression shares one compressed block across many
+  files, so `FileInfo.compressed` is `None` for most members — only
+  (typically) the first file in a block gets a real per-file value. The
+  expansion-ratio check is therefore done at the **whole-archive** level
+  (total uncompressed member size vs. the `.7z` file's actual size on
+  disk) rather than per-member. `.7z` also gets a check ZIP never needed:
+  `py7zr` recreates real OS symlinks on extraction (`zipfile` does not),
+  so a symlink member could otherwise point outside the destination —
+  symlink members are rejected outright, not validated.
+
+Both extractors return the archive's extracted contents as `DiscoveredFile`
+entries; `DocumentIngestor` skips the `.zip`/`.7z` container itself from
+becoming a `Document` (only its extracted contents do).
+
+Verified against two real files from the user's actual archive corpus
+(metadata/listing only via `py7zr.is_7zfile` + `.list()`, not full
+extraction — one is 13.6GB): both parsed correctly, confirmed solid
+LZMA2 compression, no symlink members in either.
+
+No other archive formats (`.tar`, `.tar.gz`, `.rar`, ...) are supported yet.
 
 ## Chunking and embeddings
 `EmbeddingService.embed_document(document, content)` (`app/services/embedding_service.py`):
