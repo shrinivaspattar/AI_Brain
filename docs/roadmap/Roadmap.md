@@ -620,6 +620,73 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       run's quarantined output, and — always — `Document` rows
       themselves, since filesystem state and database records stay
       deliberately decoupled).
+- [x] Filesystem executor implementation (synthetic-filesystem-only) —
+      the first code in AI_Brain that can perform a real filesystem
+      mutation, implementing exactly the reviewed design and nothing
+      more: `DedupFilesystemExecutor` (`app/dedup/executor.py`),
+      **not wired into any API endpoint, router, or `app/main.py`** —
+      only ever constructible from trusted Python code, today its own
+      tests. `__init__(db, allowed_root, quarantine_root)` has no
+      default for either root anywhere in the module — omitting one
+      raises `TypeError` before anything else runs, and a source-scan
+      test asserts the module contains no string reference to the real
+      corpus location at all; that plus a real sibling-directory device
+      check under `tmp_path` are how "cannot be selected implicitly"
+      is actually proven, not just asserted. The constructor also
+      refuses non-directory roots, nested/identical roots, and —
+      carried over from the design milestone — roots on different
+      filesystem devices. `execute(execution_id, *, confirm)` requires
+      explicit confirmation (no API layer exists yet to gate this
+      itself), runs exactly once against a fully fresh `RUNNING`
+      execution with zero existing audits (refusing outright — not
+      guessing — if called twice, or on a partially-audited execution;
+      that case belongs to `recover_stale_execution` instead), and
+      performs the full per-action pipeline independently for every
+      action: authorization/plan re-validation scoped to that one
+      action specifically (not the whole plan's aggregate validity,
+      which would wrongly block a fine action over an unrelated one
+      gone stale), symlink refusal on the un-resolved path, resolve
+      and verify containment inside `allowed_root` on the *resolved*
+      path (defeating a symlinked intermediate directory), regular-
+      file and hard-link checks, a **second**, later hash/size
+      re-observation deliberately redundant with the plan-validity
+      check moments earlier (each check closer to the mutation shrinks
+      the TOCTOU window), a same-device check, a destination-collision
+      check that is load-bearing rather than defensive theater
+      (`os.rename()` silently overwrites an existing destination on
+      POSIX with no error at all), exactly one atomic `os.rename()`,
+      and post-move verification before ever recording `SUCCESS` — a
+      `rename()` that raised no error but left something unverifiable
+      is `UNKNOWN`, never a guessed `SUCCESS`. Failure policy exactly
+      as specified: first failure stops the run, prior successes stay
+      recorded, everything after is explicit `NOT_ATTEMPTED`, and a
+      last-resort exception handler around each action ensures the
+      execution always reaches a terminal state rather than getting
+      stuck `RUNNING` from something unanticipated. 28 new tests (all
+      real-database + real-synthetic-filesystem, `aibrain_test` +
+      `tmp_path`) covering every scenario asked for: successful
+      quarantine with byte-for-byte content verification, hash/size
+      mismatch, missing source, symlinked source, multi-hard-linked
+      source, source outside the allowed root, authorization revoked
+      mid-run, a live `Document.source_type` change distinct from a
+      raw file change, destination collision, a real permission
+      failure, stop-on-first-failure with the middle of three actions
+      corrupted, an all-fail case, mocked post-move-verification and
+      unexpected-exception `UNKNOWN` paths, repeated execution
+      attempts (both after completion and against partial audits), and
+      the full constructor fail-closed suite. Full suite: 515 tests,
+      three consecutive runs, zero flakiness. One unrelated finding
+      surfaced while verifying zero leftover rows: two stray
+      authorization/review/document rows in `aibrain_test`, left
+      behind by an *earlier* milestone's now-fixed test cleanup bug
+      (never touched by any later successful run) — found and removed;
+      `aibrain_test`'s dedup tables confirmed empty. **No test in this
+      suite references, reads, or could reach the real personal
+      corpus** — every mutation happened inside a disposable `tmp_path`
+      pair. Deliberately not built: any API/router wiring, any default
+      or configured production root, permanent deletion, resumption of
+      a partially-run `execute()` call, `DedupExecutionActionReconciliation`
+      (still deferred), and any frontend.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

@@ -1921,6 +1921,139 @@ designed, explicitly deferred); any new configuration setting for
 quarantine root or allowed mutation roots (recommended, not added);
 any frontend.
 
+### Filesystem executor implementation (synthetic-filesystem-only)
+
+**This is the first code in AI_Brain that can perform a real
+filesystem mutation.** It exists as one class,
+`DedupFilesystemExecutor` (`app/dedup/executor.py`), implementing
+exactly the reviewed design above and nothing more - the reversible
+`DELETE`-means-quarantine-move operation, never permanent deletion.
+It is **not wired into any API endpoint, router, or `app/main.py`** -
+the only way to construct or call it is from trusted Python code
+(today: its own test suite). Exposing it via HTTP, or to
+arbitrary user-supplied roots, remains explicitly out of scope.
+
+**Fail closed by construction, not by convention**: `__init__(self,
+db, allowed_root, quarantine_root)` has no default value for either
+root anywhere in this module - omitting one raises `TypeError` before
+any other code runs. There is no config setting, environment variable,
+or fallback path referencing a real location anywhere in this file;
+`test_executor_source_never_references_real_corpus_path` asserts the
+module's own source contains no string reference to `/mnt`, `t7ssd`,
+or `vscode/data` at all, and
+`test_executor_requires_explicit_roots_no_defaults` proves the missing-
+argument `TypeError` directly. The constructor also refuses (all
+`ValueError`, before touching any file): either root missing or not a
+directory, the two roots being the same or nested inside each other,
+and - the central safety property carried over from the design
+milestone - the two roots being on different filesystem devices
+(`os.stat().st_dev` comparison; verified with a real sibling-directory
+check under `tmp_path` to confirm the assumption these tests rely on
+actually holds in this environment).
+
+**`execute(execution_id, *, confirm)`** - `confirm` has no default and
+is required as a keyword argument, since no API layer wraps this
+method yet to provide that gate itself. Refuses (`ValueError`, no
+mutation) unless the execution is currently `RUNNING` with **zero**
+existing action audits - this executor runs exactly once, start to
+(stop-on-first-failure) finish, from a fully fresh execution. It is
+deliberately **not resumable**: if `execute()` itself were somehow
+interrupted, leaving an execution `RUNNING` with partial audits, a
+second `execute()` call refuses outright rather than guessing how to
+continue - `DedupExecutionService.recover_stale_execution` (previous
+milestone) is the only supported path for closing out that situation,
+since it makes a conservative, never-guessed determination rather than
+this method silently attempting to pick up an unknown prior attempt.
+
+**Per-action pipeline** (`_attempt_action`, run independently, fresh,
+for every single action - never once for the whole plan): reload
+authorization and plan validity via the existing
+`DedupPlanAuthorizationService.check_currency` and re-derive
+actionability **scoped to this one action** (not the whole plan's
+aggregate `is_valid`, which would incorrectly block an otherwise-fine
+action just because some unrelated action in the same plan had gone
+stale) → refuse symlinks on the un-resolved path, then canonicalize
+(`resolve(strict=True)`) and verify containment inside `allowed_root`
+on the *resolved* path (defeating a symlinked intermediate directory,
+not just a symlinked final component) → verify a regular file → refuse
+multiple hard links (quarantining one name would not remove the
+underlying data) → a **second**, later hash/size re-observation via
+the existing `_observe_file`, deliberately redundant with what
+`check_plan_validity` already confirmed moments earlier - each
+re-check closer to the mutation shrinks the TOCTOU window, which is
+the entire point → verify the source and quarantine share a device →
+verify the destination path (`<quarantine_root>/<execution_id>/
+<plan_action_id>__<basename>`) does not already exist (**load-bearing,
+not defensive theater**: `os.rename()` silently overwrites an existing
+destination on POSIX with no error at all - this check is the only
+thing standing between "nothing there yet" and silent data
+destruction) → exactly one `os.rename()` → verify the result (source
+gone, destination present, hash/size match) before ever recording
+`SUCCESS` - a `rename()` that raised no error but left something the
+verification cannot corroborate is recorded `UNKNOWN`, never trusted
+into a false `SUCCESS`.
+
+**Failure policy, exactly as specified**: the first action that does
+not cleanly succeed stops the run; every action already recorded
+keeps its result; every action after the stopping point is explicitly
+recorded `NOT_ATTEMPTED`. A same-device `rename()` failing (permission
+error, or any other `OSError`) is always recorded with
+`filesystem_mutation_occurred=False`, per the design's atomicity
+refinement. `execute()` also wraps each action attempt in a last-resort
+exception handler: anything genuinely unanticipated is recorded
+`UNKNOWN` (never leaving the execution stuck at `RUNNING` from an
+unhandled exception) and the run stops. `execute()` always finalizes
+via the existing `complete_execution`, which - already, from an
+earlier milestone - can never report `COMPLETED` unless every planned
+action's audit is `SUCCESS`.
+
+**Real, verified device check**: `test_device_of_matches_for_siblings_
+under_tmp_path` confirms two sibling directories under the same
+`tmp_path` genuinely share a device on this environment, validating
+the assumption every other test in the suite depends on for its
+`allowed_root`/`quarantine_root` pair to be meaningful (rather than
+accidentally passing only because the device check never actually
+distinguished them).
+
+**Tests**: 28 real-database (`aibrain_test`) + real-synthetic-
+filesystem (`tmp_path`) tests, covering: successful quarantine
+(including byte-for-byte destination content verification), hash
+mismatch, size mismatch, missing source, a symlinked source, a
+multi-hard-linked source, a source outside `allowed_root`,
+authorization revoked mid-run, a live `Document.source_type` change
+(staleness `check_plan_validity` alone would catch, distinct from a
+raw file change), destination collision, a real permission failure
+(skipped when running as root, where the check is meaningless), stop-
+on-first-failure with the middle of three actions corrupted, an
+all-actions-fail case, a mocked post-move verification mismatch
+(`UNKNOWN`), a mocked unexpected exception (`UNKNOWN`, and the run
+still reaches a terminal state), calling `execute()` twice after
+completion, calling it on an execution with pre-existing partial
+audits, a nonexistent execution id, and the full set of constructor
+fail-closed checks. Every test's `allowed_root`/`quarantine_root` are
+disposable `tmp_path` subdirectories, torn down automatically by
+pytest - **no test in this suite references, could reach, or was ever
+pointed at the real personal corpus.**
+
+One real, unrelated finding surfaced while verifying zero leftover
+rows for this milestone: `aibrain_test` had two stray `dedup_plan_
+authorizations` rows (plus their parent review/plan/documents) left
+over from an *earlier* milestone's now-fixed test cleanup bug (a first,
+failing attempt at `test_reauthorizing_a_plan_after_execution_
+requires_explicit_revoke` left data behind before its cleanup
+argument list was corrected) - never touched by any later successful
+run, since each test tracks only the row IDs it itself creates. Found
+and removed directly; `aibrain_test`'s dedup-related tables are
+confirmed empty as of this milestone.
+
+**Deliberately not built this milestone**: any API endpoint or router
+wiring for the executor; any default or configured production
+`allowed_root`/`quarantine_root`; permanent deletion; any resumption
+of a partially-run `execute()` call (that remains `recover_stale_
+execution`'s job); `DedupExecutionActionReconciliation` (still
+deferred); any frontend. **The real corpus was not read, mutated, or
+referenced by any code or test added in this milestone.**
+
 ## Provenance chain
 The schema already links every derived fact back toward a source file
 via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,
