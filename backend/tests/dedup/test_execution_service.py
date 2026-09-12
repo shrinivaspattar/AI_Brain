@@ -743,8 +743,8 @@ def test_list_executions_filters_by_started_before() -> None:
 
 def test_recover_stale_execution_raises_for_missing_execution() -> None:
     db = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
     service = DedupExecutionService(db)
-    service.get_execution = MagicMock(return_value=None)
 
     with pytest.raises(ValueError, match="not found"):
         service.recover_stale_execution(999)
@@ -753,10 +753,24 @@ def test_recover_stale_execution_raises_for_missing_execution() -> None:
 def test_recover_stale_execution_raises_for_non_running_execution() -> None:
     db = MagicMock()
     execution = _execution(status=DedupExecutionStatus.COMPLETED)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
     service = DedupExecutionService(db)
-    service.get_execution = MagicMock(return_value=execution)
 
     with pytest.raises(ValueError, match="is not RUNNING"):
+        service.recover_stale_execution(1)
+
+
+def test_recover_stale_execution_raises_for_already_claimed_recovery() -> None:
+    """Recovery locking parity with `_claim_execution`: a second
+    concurrent recovery attempt on the same execution must refuse
+    cleanly, not raise a raw IntegrityError."""
+    db = MagicMock()
+    execution = _execution()
+    execution.recovery_claimed_at = datetime(2026, 9, 12, 11, 0, tzinfo=UTC)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
+    service = DedupExecutionService(db)
+
+    with pytest.raises(ValueError, match="already being recovered"):
         service.recover_stale_execution(1)
 
 
@@ -765,8 +779,8 @@ def test_recover_stale_execution_raises_when_nothing_to_recover() -> None:
     execution = _execution()
     plan_action = _plan_action()
     audit = _audit(plan_action_id=plan_action.id)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
     service = DedupExecutionService(db)
-    service.get_execution = MagicMock(return_value=execution)
     service.get_action_audits = MagicMock(return_value=[audit])
     db.scalars.return_value = [plan_action]
 
@@ -795,7 +809,7 @@ def test_recover_stale_execution_records_not_attempted_for_unchanged_file(
     plan_action.observed_file_size = 11
 
     service = DedupExecutionService(db := MagicMock())
-    service.get_execution = MagicMock(return_value=execution)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
     service.get_action_audits = MagicMock(return_value=[])
     db.scalars.return_value = [plan_action]
     service.record_action_result = MagicMock()
@@ -821,7 +835,7 @@ def test_recover_stale_execution_records_unknown_for_missing_file(tmp_path) -> N
     plan_action.observed_file_size = 11
 
     service = DedupExecutionService(db := MagicMock())
-    service.get_execution = MagicMock(return_value=execution)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
     service.get_action_audits = MagicMock(return_value=[])
     db.scalars.return_value = [plan_action]
     service.record_action_result = MagicMock()
@@ -848,7 +862,7 @@ def test_recover_stale_execution_records_unknown_for_changed_file(tmp_path) -> N
     plan_action.observed_file_size = 11
 
     service = DedupExecutionService(db := MagicMock())
-    service.get_execution = MagicMock(return_value=execution)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
     service.get_action_audits = MagicMock(return_value=[])
     db.scalars.return_value = [plan_action]
     service.record_action_result = MagicMock()
@@ -876,7 +890,7 @@ def test_recover_stale_execution_only_recovers_unresolved_actions(tmp_path) -> N
     existing_audit = _audit(plan_action_id=1, result=DedupExecutionActionResult.SUCCESS)
 
     service = DedupExecutionService(db := MagicMock())
-    service.get_execution = MagicMock(return_value=execution)
+    db.execute.return_value.scalar_one_or_none.return_value = execution
     service.get_action_audits = MagicMock(return_value=[existing_audit])
     db.scalars.return_value = [already_resolved, unresolved]
     service.record_action_result = MagicMock()

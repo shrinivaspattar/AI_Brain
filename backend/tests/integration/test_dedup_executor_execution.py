@@ -14,6 +14,7 @@ subdirectory.
 """
 
 import errno
+import hashlib
 import inspect
 import os
 import socket
@@ -32,7 +33,7 @@ from app.core.config import settings
 from app.dedup.authorization_service import DedupPlanAuthorizationService
 from app.dedup.execution_plan_service import DedupExecutionPlanService
 from app.dedup.execution_service import DedupExecutionService
-from app.dedup.executor import DedupFilesystemExecutor, _device_of
+from app.dedup.executor import DedupFilesystemExecutor, _device_of, _pin_and_hash
 from app.dedup.review_service import DedupReviewService
 from app.dedup.service import ExactDuplicateGroup
 from app.models.dedup_authorization import DedupPlanAuthorization
@@ -298,6 +299,61 @@ def test_device_of_matches_for_siblings_under_tmp_path(tmp_path) -> None:
     b = tmp_path / "b"
     b.mkdir()
     assert _device_of(a) == _device_of(b)
+
+
+# --- _pin_and_hash: the TOCTOU-closure primitive, tested directly ------
+
+
+def test_pin_and_hash_matches_manual_sha256_and_real_stat(tmp_path) -> None:
+    """The core correctness property of the pinning primitive itself,
+    isolated from the rest of the executor pipeline: the hash it
+    computes matches a plain, independent SHA-256 of the same bytes,
+    and the identity it captures matches a plain, independent stat()
+    of the same path."""
+    path = tmp_path / "file.txt"
+    content = b"pin and hash me"
+    path.write_bytes(content)
+
+    pinned = _pin_and_hash(path)
+
+    assert pinned.content_hash == hashlib.sha256(content).hexdigest()
+    assert pinned.file_size == len(content)
+    real_stat = path.stat()
+    assert pinned.device == real_stat.st_dev
+    assert pinned.inode == real_stat.st_ino
+
+
+def test_pin_and_hash_raises_for_missing_file(tmp_path) -> None:
+    with pytest.raises(OSError):
+        _pin_and_hash(tmp_path / "does-not-exist.txt")
+
+
+def test_pin_and_hash_raises_for_directory(tmp_path) -> None:
+    """A directory can be opened with O_RDONLY on POSIX - the rejection
+    must come from fstat's own mode check, not from open() failing."""
+    directory = tmp_path / "a-directory"
+    directory.mkdir()
+
+    with pytest.raises(OSError, match="not a regular file"):
+        _pin_and_hash(directory)
+
+
+def test_pin_and_hash_detects_different_inodes_for_identical_content(tmp_path) -> None:
+    """The whole point of pinning: two files with byte-for-byte
+    identical content are still distinguishable by identity, which a
+    hash/size comparison alone could never provide."""
+    content = b"identical bytes"
+    first = tmp_path / "first.txt"
+    first.write_bytes(content)
+    second = tmp_path / "second.txt"
+    second.write_bytes(content)
+
+    pinned_first = _pin_and_hash(first)
+    pinned_second = _pin_and_hash(second)
+
+    assert pinned_first.content_hash == pinned_second.content_hash
+    assert pinned_first.file_size == pinned_second.file_size
+    assert pinned_first.inode != pinned_second.inode
 
 
 # --- execute: happy path ---------------------------------------------
@@ -1902,6 +1958,227 @@ def test_execute_destination_parent_wrong_device_is_failed(tmp_path) -> None:
             assert "quarantine filesystem device" in audits[0].error_message
             assert dup_files[0].exists()
 
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+# --- TOCTOU closure via inode/device identity pinning ------------------
+
+
+def test_execute_identity_substitution_with_identical_content_is_unknown(
+    tmp_path,
+) -> None:
+    """The adversarial proof of the TOCTOU closure itself. Before
+    inode-pinning, a source file substituted for a DIFFERENT file with
+    byte-for-byte IDENTICAL content (same hash, same size) in the
+    window between the executor's final re-observation and
+    `os.rename()` was an accepted, unclosable residual - the moved
+    bytes would be indistinguishable from the intended ones, and the
+    action would be recorded SUCCESS. This test performs that exact
+    substitution for real (not by mocking a comparison result) and
+    proves it is now always caught: the destination's post-rename
+    identity cannot match what was pinned and hashed from the
+    ORIGINAL file, since the substitute is a genuinely different
+    inode."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root, content=b"hello world")
+        )
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        real_rename = os.rename
+
+        def substitute_then_rename(src, dst):
+            # Simulate an external actor replacing the source file, in
+            # the window between the executor pinning/hashing it (which
+            # already happened, earlier in the pipeline, before this
+            # patched rename is ever called) and the real rename that
+            # follows - with a DIFFERENT file that happens to have
+            # byte-for-byte identical content. os.replace is itself
+            # atomic and swaps in a genuinely different inode at this
+            # exact path.
+            substitute = Path(str(src) + ".substitute")
+            substitute.write_bytes(b"hello world")
+            os.replace(substitute, src)
+            real_rename(src, dst)
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            with patch(
+                "app.dedup.executor.os.rename", side_effect=substitute_then_rename
+            ):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.NEEDS_REVIEW
+
+            audits = execution_service.get_action_audits(execution.id)
+            assert len(audits) == 1
+            assert audits[0].result == DedupExecutionActionResult.UNKNOWN
+            assert audits[0].filesystem_mutation_occurred is None
+            assert "pinned and hashed" in audits[0].error_message
+
+            # The substituted file WAS still moved (rename is content-
+            # blind, and only ever inspects identity, not bytes, at the
+            # OS level) - the whole point is that this is never
+            # reported SUCCESS despite the content matching perfectly.
+            assert not dup_files[0].exists()
+            moved_files = [p for p in quarantine_root.rglob("*") if p.is_file()]
+            assert len(moved_files) == 1
+            assert moved_files[0].read_bytes() == b"hello world"
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_destination_identity_unavailable_after_rename_is_unknown(
+    tmp_path,
+) -> None:
+    """If the destination becomes entirely unstat-able after a
+    successful rename (simulated here as ENOENT on every stat of that
+    one path - a permission or filesystem error would look the same)
+    the result must still be `UNKNOWN`, with the identity check named
+    among the reasons, never a guessed `SUCCESS`. Pathlib's own
+    `is_symlink()`/`is_file()` share the identical underlying `os.stat`
+    call this identity check uses, so a destination that is genuinely
+    unstat-able fails EVERY post-move check simultaneously, not just
+    this one - that is the realistic scenario this test represents,
+    not an artificially isolated one. `errno.ENOENT` specifically is
+    used so pathlib's own internal error handling degrades gracefully
+    (returns False) rather than re-raising a bare, errno-less OSError,
+    matching what a genuinely vanished destination would actually look
+    like at the syscall level."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+            plan_action = _plan_actions_ordered(db, plan.id)[0]
+            source_path = Path(dup_files[0]).resolve()
+            destination = (
+                quarantine_root / str(execution.id) / f"{plan_action.id}__{source_path.name}"
+            )
+
+            real_os_stat = os.stat
+
+            def selective_stat_failure(path, *args, **kwargs):
+                if Path(path) == destination:
+                    raise FileNotFoundError(
+                        errno.ENOENT, "stat unavailable for this specific path"
+                    )
+                return real_os_stat(path, *args, **kwargs)
+
+            with patch(
+                "app.dedup.executor.os.stat", side_effect=selective_stat_failure
+            ):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.NEEDS_REVIEW
+            audits = execution_service.get_action_audits(execution.id)
+            assert len(audits) == 1
+            assert audits[0].result == DedupExecutionActionResult.UNKNOWN
+            assert audits[0].filesystem_mutation_occurred is None
+            # Identity is named among the failed checks - it is never
+            # silently dropped just because other destination-based
+            # checks failed for the same underlying reason.
+            assert "pinned and hashed" in audits[0].error_message
+
+            # The file was genuinely moved - a destination stat
+            # failure is a verification-layer problem, never a
+            # rename-layer one, and never undoes the mutation.
+            assert not dup_files[0].exists()
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_source_removed_immediately_before_pin_is_precondition_failed(
+    tmp_path,
+) -> None:
+    """If the source disappears in the narrow window between the
+    earlier path-based regular-file check and `_pin_and_hash`'s own
+    `os.open()` call, the result is a clean `PRECONDITION_FAILED` -
+    `_pin_and_hash` raises `OSError` before any mutation is attempted,
+    and the executor's own try/except around it turns that into a
+    named refusal rather than an uncaught exception."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        def vanish_then_raise(path):
+            dup_files[0].unlink()
+            raise OSError("source vanished immediately before pin-and-hash")
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            with patch(
+                "app.dedup.executor._pin_and_hash", side_effect=vanish_then_raise
+            ):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.FAILED
+            audits = execution_service.get_action_audits(execution.id)
+            assert len(audits) == 1
+            assert audits[0].result == DedupExecutionActionResult.PRECONDITION_FAILED
+            assert audits[0].filesystem_mutation_occurred is False
+            assert "could not open and hash source" in audits[0].error_message
+            assert not dup_files[0].exists()
+            assert list(quarantine_root.rglob("*")) == []
         finally:
             _cleanup(
                 db,

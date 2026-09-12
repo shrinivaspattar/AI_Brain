@@ -822,6 +822,59 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       model/migration/service/API/tests themselves, the fd-pinning
       implementation, the `recover_stale_execution` locking fix, any
       API/UI exposure, any real-corpus execution.
+- [x] Reconciliation & TOCTOU implementation — the six-point scope of
+      the design pass above, implemented exactly, zero unrelated
+      change. `DedupExecutionActionReconciliation` (migration
+      `ef65da409302`) reuses the existing `dedup_execution_action_
+      result` enum for `verified_result` rather than inventing a
+      duplicate type, restricted to SUCCESS/FAILED at the service layer
+      (not a DB CHECK constraint, matching this codebase's existing
+      convention); `verified_by` is required, deliberately unlike the
+      nullable `authorized_by` it otherwise resembles, since
+      accountability is the whole point of the record.
+      `DedupReconciliationService.reconcile_action` corroborates a
+      human's claim against a fresh `_observe_file` re-observation
+      before recording it — SUCCESS requires the source to currently
+      not exist, FAILED requires it to still match its original
+      pre-mutation hash/size — refusing (ValueError) any claim
+      inconsistent with what the system itself can see; not guarded by
+      FOR UPDATE (a documented, accepted residual — reconciliation is a
+      rare single-human action, not a systemic concurrency surface).
+      **TOCTOU closed, not merely minimized**: a new `_pin_and_hash`
+      opens the source once, captures `(device, inode)` via `fstat` on
+      that descriptor, and hashes through the SAME descriptor — this
+      identity is compared against the destination's own post-rename
+      `os.stat(..., follow_symlinks=False)` identity, added as its own
+      independently-named post-move check. Proven for real, not just
+      reasoned about: a new adversarial test performs a genuine
+      `os.replace()` substitution with byte-for-byte IDENTICAL content
+      inside the actual race window and confirms the executor still
+      reports UNKNOWN — the exact residual case the pre-pinning design
+      explicitly accepted as unclosable. `recover_stale_execution` now
+      has FOR-UPDATE claim parity with the executor's own
+      `_claim_execution`, via a new `recovery_claimed_at` column and
+      `_claim_for_recovery` helper — proven under genuine two-thread,
+      two-session contention exactly like the executor's own
+      concurrency test. 18 new tests (529 → 547): 4 direct
+      `_pin_and_hash` unit tests, 3 full-pipeline adversarial tests
+      (the substitution attack; destination identity becoming entirely
+      unstat-able post-rename, still correctly UNKNOWN even though
+      pathlib's own is_symlink()/is_file() share the same underlying
+      syscall so every destination check fails together — a realistic
+      scenario, not an artificially isolated one; source vanishing
+      immediately before pinning, correctly PRECONDITION_FAILED), 10
+      reconciliation integration tests (both happy paths, structural
+      preconditions, and — the corroboration requirement's actual
+      teeth — both contradictory-claim directions refused), and 1
+      concurrent-recovery test mirroring the executor's own. Full
+      suite run 3× consecutively with zero flakiness; the new
+      concurrent-recovery and identity-substitution tests additionally
+      run 5× each in isolation with zero flakiness. `aibrain_test`
+      confirmed empty after the final run, `dedup_execution_action_
+      reconciliations` included. **No API/UI exposure, no automatic
+      authorization, no permanent deletion — the real corpus was not
+      read, mutated, or referenced by any code or test in this
+      milestone.**
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

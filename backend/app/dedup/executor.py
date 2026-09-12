@@ -20,7 +20,9 @@ This executor is not wired into any API endpoint, any router, or
 roots, is explicitly out of scope for this milestone.
 """
 
+import hashlib
 import os
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +51,61 @@ class _ActionOutcome:
     should_continue: bool
 
 
+_HASH_READ_CHUNK_SIZE = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _PinnedIdentity:
+    """The kernel's ground-truth identity of one specific inode,
+    captured via a file descriptor opened and hashed in a single
+    uninterrupted sequence - see the TOCTOU closure in
+    `DedupFilesystemExecutor`'s own class docstring. `(device, inode)`
+    is immune to any later rename or replacement of the *path* that
+    currently points to it; `content_hash`/`file_size` are read through
+    that SAME descriptor, never by re-opening the path a second time,
+    so what gates the decision to mutate is guaranteed to describe the
+    literal bytes behind this exact inode - not whatever happens to be
+    at that path by the time a second, separate open() runs."""
+
+    device: int
+    inode: int
+    content_hash: str
+    file_size: int
+
+
+def _pin_and_hash(path: Path) -> _PinnedIdentity:
+    """Open `path`, capture its identity via `fstat` on the resulting
+    descriptor, and hash its content by reading through that SAME
+    descriptor - one open-fstat-read sequence, not two separate
+    path-based operations that could target different underlying files
+    if something replaced the path in between. Raises `OSError` if the
+    path cannot be opened, or if the descriptor's own `fstat` shows it
+    is not a regular file (checked here via the descriptor itself, the
+    tightest point this can be checked - not by trusting an earlier,
+    separate path-based `is_file()` call)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(f"{path} is not a regular file (per fstat on the open descriptor)")
+
+        hasher = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, _HASH_READ_CHUNK_SIZE)
+            if not chunk:
+                break
+            hasher.update(chunk)
+
+        return _PinnedIdentity(
+            device=file_stat.st_dev,
+            inode=file_stat.st_ino,
+            content_hash=hasher.hexdigest(),
+            file_size=file_stat.st_size,
+        )
+    finally:
+        os.close(fd)
+
+
 class DedupFilesystemExecutor:
     """Performs the already-designed, already-reviewed
     DELETE-means-quarantine-move operation, and nothing else. Every
@@ -64,48 +121,54 @@ class DedupFilesystemExecutor:
     `allowed_root`, and only ever by moving a file into
     `quarantine_root`.
 
-    TOCTOU DECISION (explicit, re-affirmed after a hostile security
-    review - not silently assumed away): a race window exists between
-    this method's final source re-validation and the `os.rename()`
-    call that follows it. This window is MINIMIZED, not eliminated -
-    no file descriptor pinning, no advisory locking, is used, by
-    deliberate choice, because AI_Brain does not own the files it
-    quarantines and holding a lock on a file another process might
-    reasonably touch is not a burden this design accepts.
+    TOCTOU DECISION, CLOSED via inode/device identity pinning (see
+    "Executor Reconciliation & TOCTOU Strategy" in
+    AI_Brain_Architecture.md for the full design this implements):
+    earlier versions of this executor left a substitution window open
+    between final source re-validation and `os.rename()`, accepting a
+    narrow residual risk. That residual is now closed, not merely
+    minimized, WITHOUT advisory locking - AI_Brain does not own the
+    files it quarantines, and a lock other processes have no reason to
+    respect would not have helped anyway.
 
-    What that window can and cannot produce, traced precisely:
+    Mechanism: immediately before `os.rename()`, `_pin_and_hash` opens
+    the source path once and, through that SAME descriptor, captures
+    its kernel-level identity (`device`, `inode` via `fstat`) and hashes
+    its content (via `os.read` on that descriptor, never a second,
+    separate `open()`). After `os.rename()` completes, the destination
+    path's own identity is read (`os.stat(..., follow_symlinks=False)`)
+    and compared against the pinned one. A match proves, independent of
+    content, that the object moved to quarantine is the EXACT inode
+    that was opened and hashed immediately before the call - no
+    substitution in that window, however constructed, changes which
+    inode a rename() call moves.
+
+    What the window can and cannot produce, traced precisely:
     - The source can be deleted in the window: `os.rename()` then
       raises `OSError` -> `FAILED`, `mutation=False`. Safe.
-    - The source can be replaced by a symlink: POSIX `rename()` moves
-      the symlink object itself (never follows it); the post-move
-      check's explicit `is_symlink()` test catches this ->
-      `UNKNOWN`, never `SUCCESS`.
-    - The source can be replaced by a DIFFERENT regular file: the
-      rename succeeds on whatever now occupies that path, but
-      post-move verification compares the DESTINATION's hash/size
-      against `plan_action.observed_content_hash`/`file_size` - the
-      original, plan-time expected values, not a value re-derived
-      from whatever got moved. A content-different substitution is
-      therefore always caught -> `UNKNOWN`, never `SUCCESS`.
-    - RESIDUAL, ACCEPTED CASE: a substituted file with an IDENTICAL
-      SHA-256 and byte size to the expected content would pass
-      verification and be recorded `SUCCESS`. This is not a
-      meaningful attack - the moved bytes are indistinguishable from
-      the intended ones, so nothing different from the intended
-      operation actually occurred. Closing even this residual would
-      require pinning the file by descriptor before any check begins,
-      which this milestone deliberately does not implement.
+    - The source can be replaced by ANYTHING - a symlink, a different
+      regular file, or even a byte-for-byte identical copy with a
+      different inode: `os.rename()` moves whatever now occupies the
+      path, but the destination's post-move identity will not match
+      the pinned `(device, inode)` captured before the call -> always
+      `UNKNOWN`, never `SUCCESS`, regardless of whether the substituted
+      content happens to hash identically to the original. This is the
+      residual the pre-pinning design explicitly accepted as
+      unclosable; pinning closes it.
+    - If identity cannot be established at all - the pin itself fails
+      (`_pin_and_hash` raises before any mutation is attempted, refused
+      as a precondition failure) or the post-rename `os.stat()` on the
+      destination fails - the result is `UNKNOWN`, reported as its own
+      independently-named condition, never guessed as `SUCCESS` and
+      never folded silently into the hash/size check.
 
-    This is judged ACCEPTABLE for the current synthetic-filesystem-
-    only executor, which never runs against real personal data and is
-    not reachable from any API. It is explicitly NOT judged acceptable
-    to carry forward unexamined into a real-corpus-facing milestone -
-    whoever designs that milestone must either re-affirm this
-    reasoning in that new context or implement a stronger primitive
-    (e.g. `openat`-then-`fstat`-then-`renameat` against a held file
-    descriptor) before this executor is ever pointed at real data.
-    Treat that decision as a required, explicit gate, not something
-    this milestone's acceptance implicitly resolves.
+    A successful open()/fstat() at hash-time proves nothing about what
+    `os.rename()` later moves by itself - the proof exists only once
+    the destination's post-rename identity is compared against the
+    pinned one and found to match. This distinction was raised
+    explicitly during this feature's own design review and is the
+    reason identity is checked AFTER the rename, not merely captured
+    before it.
     """
 
     def __init__(self, db: Session, allowed_root: Path, quarantine_root: Path):
@@ -469,16 +532,29 @@ class DedupFilesystemExecutor:
                 "one name would not remove the underlying data",
             )
 
-        # Steps 10-11: a SECOND, later hash/size re-observation,
-        # deliberately redundant with what check_plan_validity already
-        # confirmed in steps 1-4 - minimizing the TOCTOU window means
-        # re-checking as close to the mutation as possible, not
-        # trusting an earlier check because it was recent.
-        observation = _observe_file(str(source_path))
+        # Steps 10-11, now inode-pinned: a SECOND, later hash/size
+        # re-observation, deliberately redundant with what
+        # check_plan_validity already confirmed in steps 1-4 -
+        # minimizing the TOCTOU window means re-checking as close to
+        # the mutation as possible. This re-observation is taken
+        # through an open file descriptor (see `_pin_and_hash`) rather
+        # than by re-opening the path a second time via `_observe_file`
+        # - the (device, inode) captured here is compared against the
+        # destination's own post-rename identity in Step 15, the
+        # TOCTOU closure this milestone implements.
+        try:
+            pinned = _pin_and_hash(source_path)
+        except OSError as exc:
+            return self._refuse(
+                execution.id,
+                plan_action.id,
+                f"could not open and hash source immediately before mutation: "
+                f"{exc}",
+            )
+
         if (
-            not observation.exists
-            or observation.content_hash != plan_action.observed_content_hash
-            or observation.file_size != plan_action.observed_file_size
+            pinned.content_hash != plan_action.observed_content_hash
+            or pinned.file_size != plan_action.observed_file_size
         ):
             return self._refuse(
                 execution.id,
@@ -486,8 +562,11 @@ class DedupFilesystemExecutor:
                 "source file no longer matches the plan's expected hash/size",
             )
 
-        # Step 12: verify source and quarantine share a filesystem.
-        if source_stat.st_dev != self._quarantine_device:
+        # Step 12: verify source and quarantine share a filesystem -
+        # using the pinned identity's device, the freshest information
+        # available, rather than the earlier path-based stat from
+        # Step 7.
+        if pinned.device != self._quarantine_device:
             return self._refuse(
                 execution.id,
                 plan_action.id,
@@ -570,6 +649,24 @@ class DedupFilesystemExecutor:
             and post_observation.content_hash == plan_action.observed_content_hash
             and post_observation.file_size == plan_action.observed_file_size
         )
+        # TOCTOU closure (see the class docstring): a successful
+        # open()/fstat()/hash BEFORE the rename proves nothing about
+        # what os.rename() actually moved - the proof only exists once
+        # the DESTINATION's own post-rename identity is compared
+        # against what was pinned and found to match. Checked via
+        # follow_symlinks=False so a destination that is itself a
+        # symlink is compared by its own inode, never by whatever it
+        # points to. Any failure to establish this identity at all
+        # (the destination cannot be stat'd) counts as a mismatch,
+        # never as "skip this check."
+        try:
+            destination_stat = os.stat(destination, follow_symlinks=False)
+            destination_identity_matches = (
+                destination_stat.st_dev == pinned.device
+                and destination_stat.st_ino == pinned.inode
+            )
+        except OSError:
+            destination_identity_matches = False
         # "No unexpected second filesystem operation occurred" is true
         # by construction, not by a runtime check: this method contains
         # exactly one os.rename() call site (above), and nothing here
@@ -580,11 +677,17 @@ class DedupFilesystemExecutor:
             and destination_is_regular_file
             and not destination_is_symlink
             and destination_hash_matches
+            and destination_identity_matches
         )
         if not verification_passed:
             failed_checks = []
             if source_still_present:
                 failed_checks.append("source still exists")
+            if not destination_identity_matches:
+                failed_checks.append(
+                    "destination is not the same filesystem object that was "
+                    "pinned and hashed immediately before the move"
+                )
             if not destination_is_regular_file:
                 failed_checks.append("destination is not a regular file")
             if destination_is_symlink:

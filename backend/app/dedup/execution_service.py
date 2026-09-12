@@ -417,6 +417,88 @@ class DedupExecutionService:
             self.db.rollback()
             raise
 
+    def _claim_for_recovery(self, execution_id: int) -> DedupExecution:
+        """Acquire exclusive ownership of a stale-execution recovery
+        attempt, before any action is re-observed or (re-)recorded -
+        the same `SELECT ... FOR UPDATE` concurrency discipline
+        `DedupFilesystemExecutor._claim_execution` already uses for the
+        primary execution path, extended here to recovery per the
+        "Executor Reconciliation & TOCTOU Strategy" design pass in
+        AI_Brain_Architecture.md.
+
+        Mechanism, identical in shape to `_claim_execution`: `SELECT
+        ... FOR UPDATE` locks the `DedupExecution` row for this
+        method's own transaction. A concurrent caller's own `SELECT
+        ... FOR UPDATE` on the SAME row blocks until this transaction
+        commits or rolls back, then re-reads the row's current state
+        under its own lock. While holding that lock, this method checks
+        and sets `recovery_claimed_at`: if already non-null, another
+        caller won the race and this one refuses cleanly; otherwise,
+        this caller sets it and commits, releasing the lock with the
+        claim now durably recorded. Every failure path here raises a
+        plain `ValueError` - never a raw `IntegrityError` and never an
+        uncaught exception - because the losing caller is turned away
+        before it can reach `record_action_result`'s own
+        `(execution_id, plan_action_id)` unique constraint.
+
+        Deliberately a SEPARATE field from `claimed_at`: an execution
+        eligible for recovery may never have been claimed for execution
+        at all (e.g. it crashed between `start_execution` and the
+        executor's first `_claim_execution` call), so gating recovery
+        on `claimed_at` being set would wrongly block recovering that
+        execution.
+
+        Residual, not closed by this method (see `DedupReconciliation
+        Service`'s own docstring for the analogous reconciliation-side
+        residual): this protects against two concurrent
+        `recover_stale_execution` calls on the same execution, NOT
+        against a "stale" execution whose original executor process is
+        actually still alive and calling `record_action_result`
+        directly, outside this method, at the same time - that
+        remaining race is bounded only by
+        `DedupExecutionActionAudit`'s own unique constraint, and fully
+        closing it would require restructuring `record_action_result`'s
+        per-call commit behavior, out of scope for this milestone.
+        """
+        execution = self.db.execute(
+            select(DedupExecution)
+            .where(DedupExecution.id == execution_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if execution is None:
+            self.db.rollback()
+            raise ValueError(f"Dedup execution {execution_id} not found")
+
+        if execution.status != DedupExecutionStatus.RUNNING:
+            status_value = execution.status.value
+            self.db.rollback()
+            raise ValueError(
+                f"Execution {execution_id} is not RUNNING "
+                f"(status={status_value}) - only a RUNNING execution can be "
+                "recovered"
+            )
+
+        if execution.recovery_claimed_at is not None:
+            recovery_claimed_at = execution.recovery_claimed_at
+            self.db.rollback()
+            raise ValueError(
+                f"Execution {execution_id} is already being recovered by "
+                f"another call, claimed at {recovery_claimed_at.isoformat()} - "
+                "exactly one recovery attempt may run per execution; this one "
+                "refuses rather than risk a concurrent duplicate action write"
+            )
+
+        execution.recovery_claimed_at = datetime.now(UTC)
+
+        try:
+            self.db.commit()
+            self.db.refresh(execution)
+            return execution
+        except Exception:
+            self.db.rollback()
+            raise
+
     def recover_stale_execution(self, execution_id: int) -> DedupExecution:
         """Close out a RUNNING execution that will never receive any
         further action results - the canonical reason being that its
@@ -469,18 +551,12 @@ class DedupExecutionService:
           exactly what this design refuses to do.
 
         Raises ValueError if the execution does not exist, is not
-        currently RUNNING, or already has a recorded outcome for every
+        currently RUNNING, already has a recorded outcome for every
         planned action (nothing to recover - call `complete_execution`
-        directly instead).
+        directly instead), or is already being recovered by another
+        concurrent call (see `_claim_for_recovery`).
         """
-        execution = self._get_execution_or_raise(execution_id)
-
-        if execution.status != DedupExecutionStatus.RUNNING:
-            raise ValueError(
-                f"Execution {execution_id} is not RUNNING "
-                f"(status={execution.status.value}) - only a RUNNING "
-                "execution can be recovered"
-            )
+        execution = self._claim_for_recovery(execution_id)
 
         plan_actions = list(
             self.db.scalars(

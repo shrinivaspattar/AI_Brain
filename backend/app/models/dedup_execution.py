@@ -252,6 +252,26 @@ class DedupExecution(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Set exactly once, by DedupExecutionService.recover_stale_execution,
+    # under the same SELECT ... FOR UPDATE discipline _claim_execution
+    # already uses - the concurrency-exclusivity parity fix identified
+    # during the Executor Reconciliation & TOCTOU Strategy design pass.
+    # Guards against two concurrent recover_stale_execution calls on the
+    # same execution. Does NOT guard against a still-alive "crashed"
+    # executor concurrently calling record_action_result outside the
+    # recovery path itself - that residual is bounded only by
+    # DedupExecutionActionAudit's own (execution_id, plan_action_id)
+    # unique constraint, and fully closing it would require restructuring
+    # record_action_result's per-call commit behavior, out of scope for
+    # this milestone. Deliberately separate from claimed_at, which an
+    # execution may never have acquired at all (e.g. it crashed between
+    # start_execution and the executor's first _claim_execution call) -
+    # recovery must remain possible in that case too, so this column
+    # cannot simply reuse claimed_at's own semantics.
+    recovery_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -392,6 +412,94 @@ class DedupExecutionActionAudit(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+
+class DedupExecutionActionReconciliation(Base):
+    """A human's later, independently-verified finding about one
+    UNKNOWN `DedupExecutionActionAudit` row - see "Executor
+    Reconciliation & TOCTOU Strategy" in AI_Brain_Architecture.md for
+    the full design this implements. Purely additive: creating this row
+    NEVER edits the audit row it reconciles, and NEVER changes
+    `DedupExecution.status` - a reconciliation answers "what do we now
+    believe happened," not "what should history have said."
+
+    Bound to exactly one audit via the unique constraint below - once
+    an UNKNOWN action is reconciled, it is reconciled once, permanently;
+    there is no update method anywhere in `DedupReconciliationService`.
+    """
+
+    __tablename__ = "dedup_execution_action_reconciliations"
+    __table_args__ = (
+        UniqueConstraint(
+            "audit_id",
+            name="uq_dedup_execution_action_reconciliations_audit_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+
+    audit_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("dedup_execution_action_audits.id"),
+        nullable=False,
+        index=True,
+    )
+
+    # Restricted, at the service layer only (DedupReconciliationService.
+    # reconcile_action), to exactly SUCCESS or FAILED - reusing the
+    # existing DedupExecutionActionResult enum's own storage rather than
+    # inventing a near-duplicate two-value enum. UNKNOWN reconciled to
+    # UNKNOWN would be a no-op not worth a row; PRECONDITION_FAILED and
+    # NOT_ATTEMPTED never need reconciling in the first place, since
+    # only an audit whose result is already UNKNOWN is eligible for
+    # reconciliation at all. Enforced in Python, not by a database CHECK
+    # constraint - matching this codebase's existing convention of
+    # enforcing definitional invariants at the service layer (e.g.
+    # `record_action_result`'s own tri-state `filesystem_mutation_
+    # occurred` checks) rather than pushing them into the schema.
+    verified_result: Mapped[DedupExecutionActionResult] = mapped_column(
+        SQLEnum(DedupExecutionActionResult, name="dedup_execution_action_result"),
+        nullable=False,
+    )
+
+    # Free text, same "no user accounts anywhere in this codebase"
+    # convention as DedupPlanAuthorization.authorized_by - but
+    # deliberately REQUIRED (that field is nullable, this one is not):
+    # a reconciliation exists specifically to record who made a manual
+    # judgment call resolving an ambiguous, previously-indeterminate
+    # filesystem outcome, so leaving this attribution optional would
+    # undermine the accountability the whole record exists to provide.
+    verified_by: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Free text describing HOW the human verified this outcome (e.g.
+    # "inspected the quarantine directory directly, confirmed the file
+    # present with the expected name and content"). Never parsed or
+    # interpreted by any code - purely for a later human reader.
+    verification_method: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # DedupReconciliationService's OWN fresh, independent re-observation
+    # of the audit's source_path, taken at reconciliation time -
+    # captured regardless of the human's claim, and required to be
+    # CONSISTENT with verified_result before this row is ever created
+    # (see DedupReconciliationService.reconcile_action). Never derived
+    # from, or copied out of, the human's verification_method text -
+    # this is what the SYSTEM independently saw, not what the human
+    # reported seeing.
+    observed_content_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    observed_file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

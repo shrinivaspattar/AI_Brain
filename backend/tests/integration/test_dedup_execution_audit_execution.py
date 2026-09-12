@@ -18,6 +18,8 @@ created, deleted, moved, renamed, or modified by any call in this
 service.
 """
 
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine
@@ -1325,6 +1327,111 @@ def test_recover_stale_execution_raises_for_non_running(tmp_path) -> None:
                 plan_ids=[plan.id],
                 authorization_ids=[authorization.id],
                 execution_ids=execution_ids,
+            )
+
+
+def test_concurrent_recover_stale_execution_calls_only_one_claims(tmp_path) -> None:
+    """Recovery locking parity (Executor Reconciliation & TOCTOU
+    Strategy design pass): two genuinely concurrent
+    `recover_stale_execution` calls on the SAME execution, from two
+    SEPARATE database sessions/connections, must never both proceed to
+    record action results for the same unresolved action. Exactly one
+    must win the `SELECT ... FOR UPDATE` claim on `recovery_claimed_at`;
+    the other must fail cleanly and deterministically, never with a raw
+    IntegrityError - the same discipline `_claim_execution` already
+    provides for the primary execution path."""
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello world")
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("hello world")
+
+    engine = _engine()
+
+    with Session(engine) as setup_db:
+        review, canonical_doc, dup_docs, plan, authorization = _setup_authorized_plan(
+            setup_db, canonical_file, [dup_file], "concurrent-recovery-hash"
+        )
+        execution = DedupExecutionService(setup_db).start_execution(authorization.id)
+        execution_id = execution.id
+        # Captured as plain values before this `with` block closes
+        # setup_db - accessing ORM attributes on a detached instance
+        # afterward raises DetachedInstanceError.
+        review_id = review.id
+        canonical_doc_id = canonical_doc.id
+        dup_doc_ids = [d.id for d in dup_docs]
+        plan_id = plan.id
+        authorization_id = authorization.id
+
+    db_a = Session(engine)
+    db_b = Session(engine)
+
+    # Slow down thread A's commit so thread B has a real window to
+    # contend for the SAME row lock, exactly like the executor's own
+    # concurrency test does for `_claim_execution`.
+    real_commit_a = db_a.commit
+
+    def slow_commit():
+        time.sleep(0.3)
+        real_commit_a()
+
+    db_a.commit = slow_commit
+
+    service_a = DedupExecutionService(db_a)
+    service_b = DedupExecutionService(db_b)
+
+    results = {}
+    errors = {}
+    barrier = threading.Barrier(2)
+
+    def run(name, service):
+        barrier.wait()
+        try:
+            results[name] = service.recover_stale_execution(execution_id)
+        except Exception as exc:  # noqa: BLE001 - capturing for assertion below
+            errors[name] = exc
+
+    thread_a = threading.Thread(target=run, args=("A", service_a))
+    thread_b = threading.Thread(target=run, args=("B", service_b))
+
+    try:
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+
+        assert not thread_a.is_alive() and not thread_b.is_alive(), (
+            "a thread did not finish - possible deadlock"
+        )
+
+        assert len(results) == 1, f"expected exactly one success, got {results}"
+        assert len(errors) == 1, f"expected exactly one failure, got {errors}"
+
+        (loser_exc,) = errors.values()
+        assert isinstance(loser_exc, ValueError)
+        assert "IntegrityError" not in type(loser_exc).__name__
+        assert (
+            "already being recovered" in str(loser_exc)
+            or "is not RUNNING" in str(loser_exc)
+        )
+
+        with Session(engine) as verify_db:
+            final_execution = verify_db.get(DedupExecution, execution_id)
+            assert final_execution.status != DedupExecutionStatus.RUNNING
+            audits = DedupExecutionService(verify_db).get_action_audits(execution_id)
+            # Exactly one audit for the one unresolved action - never
+            # two competing rows for the same plan action.
+            assert len(audits) == 1
+    finally:
+        db_a.close()
+        db_b.close()
+        with Session(engine) as cleanup_db:
+            _cleanup(
+                cleanup_db,
+                review_id,
+                [canonical_doc_id, *dup_doc_ids],
+                plan_ids=[plan_id],
+                authorization_ids=[authorization_id],
+                execution_ids=[execution_id],
             )
 
 

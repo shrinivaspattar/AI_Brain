@@ -2427,6 +2427,145 @@ itself (model, migration, service, API, tests - this is decisions only);
 fd-pinning implementation; the `recover_stale_execution` locking fix
 identified in point 7; any API/UI exposure; any real-corpus execution.
 
+### Reconciliation & TOCTOU implementation
+
+Implements exactly the six-point scope of the design pass above -
+`DedupExecutionActionReconciliation`, its service, inode/device identity
+pinning inside the executor, `recover_stale_execution` locking parity,
+adversarial/concurrency tests, and this documentation. **Zero unrelated
+change**: no API/UI exposure, no automatic authorization, no permanent
+deletion, and the real corpus was not read, mutated, or referenced by
+any code or test added.
+
+**1. `DedupExecutionActionReconciliation`** (`app/models/dedup_
+execution.py`, migration `ef65da409302`) - exactly the shape the design
+pass settled: `audit_id` (FK, `UNIQUE` via `uq_dedup_execution_action_
+reconciliations_audit_id` - one reconciliation per audit, permanently),
+`verified_result` (reuses the existing `dedup_execution_action_result`
+Postgres enum rather than inventing a near-duplicate two-value type;
+restricted to `SUCCESS`/`FAILED` at the service layer only, matching
+this codebase's established convention of enforcing definitional
+invariants in Python rather than via database `CHECK` constraints - see
+`record_action_result`'s own tri-state `filesystem_mutation_occurred`
+handling), `verified_by` (required, unlike the nullable `authorized_by`
+it otherwise resembles - a reconciliation exists specifically to record
+who made the judgment call, so leaving that optional would undermine
+the record's own purpose), `verification_method` (free text, never
+parsed), and the service's own `observed_content_hash`/
+`observed_file_size` (captured independently of the human's claim - see
+point 2). The same migration adds `DedupExecution.recovery_claimed_at`
+for point 4.
+
+**2. `DedupReconciliationService`** (`app/dedup/reconciliation_
+service.py`) - `reconcile_action(audit_id, verified_result, verified_by,
+verification_method)`. Preconditions, `ValueError` on every failure, no
+row created: `verified_result` must be exactly `SUCCESS` or `FAILED`;
+the audit must exist and currently be `UNKNOWN`; no reconciliation may
+already exist for it. The corroboration step the design pass specified
+is real, not decorative: the service calls the same non-mutating
+`_observe_file` the executor and `recover_stale_execution` already use
+on the audit's own `source_path`, and requires that fresh observation
+to be CONSISTENT with the claim before recording anything - `SUCCESS`
+requires the source to currently not exist; `FAILED` requires it to
+exist with a hash/size still matching `audit.expected_content_hash`/
+`expected_file_size`, the plan's original pre-mutation values. A claim
+inconsistent with what the system can itself observe right now is
+refused outright. The observation's own hash/size - not anything parsed
+from `verification_method` - is what gets stored on the row. Not
+guarded by `SELECT ... FOR UPDATE`: reconciliation is a rare, single-
+human action, not a systemic concurrency surface, and a genuine race
+would surface as a raw `IntegrityError` from the `audit_id` unique
+constraint rather than a clean refusal - a known, documented residual,
+not silently unhandled, and out of this milestone's scope to close.
+
+**3. TOCTOU closure via inode/device identity pinning**
+(`app/dedup/executor.py`) - `_pin_and_hash(path)` opens the source with
+`os.open()`, captures `(st_dev, st_ino)` via `os.fstat()` on that
+descriptor, and hashes the content by reading through that SAME
+descriptor (never a second, separate `open()`) - replacing the prior
+second `_observe_file` re-observation in the per-action pipeline. The
+descriptor's own `fstat` mode is checked for `S_ISREG` at the tightest
+possible point, rather than trusting the earlier, separate path-based
+`is_file()` check from Step 7. The source/quarantine device check
+(Step 12) now uses this pinned identity's device rather than the
+earlier path-based `stat()`, the freshest information available at
+that point. After `os.rename()`, `os.stat(destination, follow_symlinks=
+False)` reads the destination's own identity (never following a
+symlink at the destination itself) and compares it against the pinned
+one - a match proves, independent of content, that the object moved is
+the exact inode pinned and hashed immediately before the call. This is
+added as its own independently-named post-move check, alongside the
+pre-existing destination-exists/regular-file/not-symlink/hash-match
+checks (see "Executor hardening," above) - any failure to establish or
+match identity is `UNKNOWN`, never folded silently into the hash/size
+check and never guessed as `SUCCESS`. The class docstring's TOCTOU
+section is rewritten to describe this as CLOSED, not merely minimized -
+the residual same-hash/same-size substitution case the earlier design
+explicitly accepted is now always caught by identity, proven for real
+(not merely reasoned about) by `test_execute_identity_substitution_
+with_identical_content_is_unknown`, which performs a genuine
+`os.replace()` substitution with byte-for-byte identical content inside
+the real race window and confirms the result is `UNKNOWN`.
+
+**4. `recover_stale_execution` locking parity**
+(`app/dedup/execution_service.py`) - a new `_claim_for_recovery` helper,
+structurally identical to the executor's own `_claim_execution`:
+`SELECT ... FOR UPDATE` on the `DedupExecution` row, refusing
+(`ValueError`, never a raw `IntegrityError`) if the execution is not
+`RUNNING` or if `recovery_claimed_at` is already set, otherwise setting
+it and committing. Deliberately a SEPARATE field from `claimed_at`: an
+execution eligible for recovery may never have been claimed for
+execution at all (it can crash between `start_execution` and the
+executor's first `_claim_execution` call), so gating recovery on
+`claimed_at` would wrongly block recovering that case. Documented
+residual, unchanged from the design pass: this protects against two
+concurrent `recover_stale_execution` calls, not against a "stale"
+execution whose original executor is actually still alive and calling
+`record_action_result` directly outside this method - that remaining
+race is bounded only by the audit table's own unique constraint, and
+fully closing it would require restructuring `record_action_result`'s
+per-call commit behavior, out of scope here.
+
+**5. Tests** - 18 new: 4 direct unit tests of `_pin_and_hash` itself
+(hash/identity correctness, missing-file and directory rejection, two
+files with identical content proven to have different inodes); 3
+full-pipeline adversarial/edge-case tests in the executor suite (the
+genuine substitution attack described above; destination identity
+becoming entirely unstat-able after a real rename, proven to still
+report `UNKNOWN` with identity named among the reasons even though
+every other destination-based check fails for the same underlying
+reason - pathlib's own `is_symlink()`/`is_file()` share the identical
+`os.stat` call this identity check uses, so true isolation of "only
+identity fails" is not a representable real scenario; and the source
+vanishing immediately before `_pin_and_hash` itself, correctly
+producing `PRECONDITION_FAILED` rather than an uncaught exception); 10
+new `DedupReconciliationService` integration tests (both happy paths,
+missing/non-`UNKNOWN`/duplicate audit rejection, `verified_result`
+restricted to `SUCCESS`/`FAILED`, and - the corroboration requirement's
+actual teeth - both contradictory-claim directions refused: `SUCCESS`
+claimed while the source still exists, and `FAILED` claimed while the
+source is gone OR has changed content); 1 new concurrent-recovery test
+in the audit suite, structurally identical to the executor's own
+concurrency test (two real threads, two separate database sessions, a
+`threading.Barrier`, a slowed commit to force genuine contention),
+proving exactly one of two simultaneous `recover_stale_execution` calls
+on the same execution wins the claim and the other refuses cleanly.
+Full suite: 547 tests (up from 529), run three times consecutively with
+zero flakiness; the new concurrent-recovery and identity-substitution
+tests additionally run five times each in isolation with zero
+flakiness. `aibrain_test`'s dedup-related tables, including the new
+`dedup_execution_action_reconciliations`, confirmed empty after the
+final run. **No test in this suite references, reads, or could reach
+the real personal corpus** - every mutation happened inside disposable
+`tmp_path` pairs.
+
+**Deliberately not built this milestone**: any API endpoint or router
+wiring for reconciliation or the executor; any default or configured
+production root; permanent deletion; `SELECT ... FOR UPDATE` locking
+for reconciliation itself (documented residual, see point 2); any
+frontend. **The real corpus was not read, mutated, or referenced by any
+code or test added in this milestone.**
+
 ## Provenance chain
 The schema already links every derived fact back toward a source file
 via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,
