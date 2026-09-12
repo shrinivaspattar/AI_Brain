@@ -2296,6 +2296,30 @@ system invents. Inode-pinning needs no other actor's cooperation at
 all - it is a verification the executor performs entirely on its own
 after the fact.
 
+**Refinement to this primitive, made explicit before any
+implementation**: the security-relevant invariant is that the object
+the eventual `os.rename()` actually operates on is *proven* to be the
+identical filesystem object last observed and hashed through the
+pinned descriptor - not merely that some earlier `open()` succeeded.
+Having a valid fd and fstat result at hash-time says nothing on its own
+about what `os.rename()` moves later; the proof only exists once the
+*destination's* post-rename identity is compared against that pinned
+`(st_dev, st_ino)` and found to match. Equally important is the
+negative case, which must be defined now rather than left implicit:
+if that identity cannot be established at all - `fstat` on the pinned
+fd fails, `os.rename()` itself raises, or `os.stat()` on the
+destination fails or cannot be performed - or if the identities are
+established but do not match, the result is always `UNKNOWN`
+(`filesystem_mutation_occurred=None`), never a guessed `SUCCESS` and
+never silently treated as equivalent to today's hash/size verification
+alone. This is not a new result category - it is the identical
+post-move-verification semantics the hardening milestone already
+established (see "Executor hardening," above), with identity added as
+one more independently-named condition alongside "destination exists,"
+"destination is a regular file," "destination is not a symlink," and
+"hash/size match" - a failure here must be reported as its own named
+condition, not folded silently into the hash/size check.
+
 **3. How `UNKNOWN` reconciles without mutating historical audit
 rows: the existing designed shape, unchanged, finalized here.**
 `DedupExecutionActionReconciliation` (proposed in the earlier

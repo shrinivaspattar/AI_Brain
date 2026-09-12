@@ -785,7 +785,17 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       inode last observed, independent of content, with no advisory
       locking needed since the actors capable of racing this window
       (the user, an editor, a backup job) have no reason to cooperate
-      with a lock this system invents. **Reconciliation**: finalizes
+      with a lock this system invents. **Refined before implementation**:
+      the invariant is that the object the eventual `os.rename()`
+      operates on is *proven* identical to what was pinned and hashed —
+      a successful earlier `open()`/`fstat()` proves nothing by itself
+      until the destination's post-rename identity is compared against
+      it; if that identity cannot be established at all, or is
+      established but does not match, the result is always `UNKNOWN`,
+      reported as its own independently-named condition alongside the
+      existing hash/size/symlink/existence checks, never folded
+      silently into one of those or guessed as `SUCCESS`.
+      **Reconciliation**: finalizes
       the `DedupExecutionActionReconciliation` shape first proposed in
       the Executor Safety & Recovery Design milestone (audit-scoped,
       unique per audit, `verified_result` restricted to SUCCESS/FAILED,
