@@ -15,6 +15,16 @@ for the current module-by-module status this roadmap tracks against.
 - [x] Document persistence (`Document` model + `DocumentService`)
 - [x] Import job lifecycle with enforced state transitions (`ImportJobService`)
 - [x] REST API for documents and import jobs
+- [x] Import job execute error handling: `POST /import-jobs/{id}/execute`
+      returns a clean `422` (`detail` = the same message stored in the
+      job's `error_message`) for an expected execution failure — a
+      missing or invalid source path — instead of a bare 500. Found
+      while building the Import Job Monitoring frontend view; fixed as
+      its own follow-up commit rather than bundled into that one. The
+      job row itself was always correctly persisted as `FAILED` either
+      way; only the HTTP response to the `/execute` caller was wrong.
+      `ValueError`-based state-conflict (409) and not-found (404)
+      responses, and the success path, are unchanged.
 - [x] Provenance: `Document.import_job_id` FK back to the import job
 - [ ] Docker Compose for Postgres, Redis, Ollama (currently empty)
 
@@ -275,13 +285,14 @@ machine.
       polling loop is genuinely live, not just present in the code.
       Also confirmed chat (including citations and reload-persistence)
       is unaffected by this addition.
-      **Found, not fixed** (out of scope for a read-only monitor that
-      never calls it): `POST /import-jobs/{id}/execute` returns a bare
-      500 to its caller when the source path doesn't exist, because the
-      handler only catches `ValueError`, not the `FileNotFoundError` the
-      service actually raises for that case — even though the job row
-      itself is correctly persisted as `FAILED` with the right
-      `error_message` regardless. Worth a small, separate fix later.
+      A bug was found during this verification and fixed as a separate
+      follow-up commit: `POST /import-jobs/{id}/execute` used to return
+      a bare 500 when the source path didn't exist or wasn't a
+      directory, because the handler only caught `ValueError`, not the
+      `FileNotFoundError`/`NotADirectoryError` the service actually
+      raises for those cases. It now returns a clean `422` with
+      `detail` matching the job's own `error_message` — see "Import job
+      execute error handling," below.
 - [ ] Memory review queue, dedup review — not started; each remains its
       own later frontend slice, not bundled into this one.
 - [ ] No conversation list/switcher yet — only ever one active

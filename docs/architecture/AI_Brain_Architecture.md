@@ -491,16 +491,14 @@ view and only resumed on switching back. Also reconfirmed chat
 (including citations and reload-persistence) is unaffected by this
 addition.
 
-**A real, pre-existing bug found during verification, deliberately left
-unfixed as out of scope**: `POST /import-jobs/{id}/execute` returns a
-bare HTTP 500 to its caller when the source path doesn't exist - the
-API handler's `_raise_for_value_error` only catches `ValueError`, but
-`ImportJobService.execute_job` lets the underlying `FileNotFoundError`
-propagate straight through after recording the failure. The job row
-itself ends up correctly `FAILED` with the right `error_message`
+A real bug was found during this verification: `POST
+/import-jobs/{id}/execute` returned a bare HTTP 500 when the source
+path didn't exist, since the job row was always correctly `FAILED`
 regardless (confirmed via `GET /import-jobs/{id}` immediately after),
-so this doesn't affect the read-only monitor at all - it never calls
-`/execute`. Worth a small, separate fix later.
+so it never actually affected this read-only monitor - it never calls
+`/execute`. Fixed as its own follow-up commit rather than folded into
+this one; see "Import job execute error handling," under Import job
+lifecycle, below.
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
@@ -580,6 +578,30 @@ PENDING ──execute_job──▶ RUNNING ──mark_completed──▶ COMPLET
 only accepts jobs in `RUNNING`. `execute_job` refuses jobs already `RUNNING`,
 `PAUSED`, `COMPLETED`, or `CANCELLED`. Invalid transitions raise `ValueError`
 and are surfaced as 409 Conflict at the API layer.
+
+### Import job execute error handling
+`ImportJobService.execute_job` wraps the actual ingestion attempt in a
+broad `except Exception`: on any failure it persists the job as
+`FAILED` with `error_message = str(exc)` and `finished_at` set, then
+re-raises the *original* exception (not a `ValueError`) so a caller
+using the service directly (e.g. a future background worker) sees the
+real exception type and can log or retry appropriately.
+
+The `POST /import-jobs/{id}/execute` API handler (`app/api/import_jobs.py`)
+used to only catch `ValueError` (mapped to 404/409 via
+`_raise_for_value_error`), so any other exception - most commonly
+`FileNotFoundError`/`NotADirectoryError` from `SourceScanner` for a
+missing or invalid `source_path` - fell through as a bare, unhandled
+HTTP 500, even though the job row was already correctly `FAILED` in
+the database by that point. A missing source path is an expected
+outcome of attempting to execute a job, not an unexpected server
+error, so the handler now also catches the general `Exception` case
+(after the `ValueError` branch) and returns `422 Unprocessable
+Content` with `detail=str(exc)` - the exact same string already stored
+in the job's `error_message`, so the two are always consistent and
+nothing beyond that message (no traceback, no internals) is exposed.
+`ValueError`-based 404/409 responses and the 200 success path are
+unchanged.
 
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a

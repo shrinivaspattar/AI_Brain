@@ -111,7 +111,11 @@ def complete_import_job(
 @router.post(
     "/{job_id}/execute",
     response_model=ImportJobResponse,
-    responses={404: {"description": "Import job not found"}},
+    responses={
+        404: {"description": "Import job not found"},
+        409: {"description": "Import job cannot be executed in its current state"},
+        422: {"description": "Import job execution failed (e.g. invalid source path)"},
+    },
 )
 def execute_import_job(
     job_id: int,
@@ -124,3 +128,16 @@ def execute_import_job(
 
     except ValueError as e:
         _raise_for_value_error(e)
+
+    except Exception as exc:
+        # By the time execute_job() re-raises, it has already persisted
+        # the job as FAILED with a descriptive error_message (see
+        # ImportJobService.execute_job) - a missing/invalid source path,
+        # a permission error, or any other ingestion failure is an
+        # expected outcome of attempting to execute a job, not an
+        # unexpected server error. Report it as a clean 4xx instead of
+        # letting it fall through as a bare, traceback-bearing 500.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        )

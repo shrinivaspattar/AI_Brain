@@ -265,6 +265,56 @@ def test_execute_import_job_returns_not_found() -> None:
         app.dependency_overrides.clear()
 
 
+def test_execute_import_job_returns_422_for_missing_source_path() -> None:
+    """Regression test: a nonexistent source path is an expected import
+    failure (already recorded as FAILED with error_message by the
+    service by the time this exception is raised), not an unhandled
+    server error - it must not become a bare 500."""
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.execute_job.side_effect = FileNotFoundError(
+                "/documents/does-not-exist"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/execute")
+
+            assert response.status_code == 422
+            body = response.json()
+            assert body["detail"] == "/documents/does-not-exist"
+            assert "Traceback" not in body["detail"]
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_execute_import_job_returns_422_for_source_not_a_directory() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.import_jobs.ImportJobService") as service_class:
+            service_class.return_value.execute_job.side_effect = NotADirectoryError(
+                "/documents/a-file.txt"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/import-jobs/42/execute")
+
+            assert response.status_code == 422
+            assert response.json() == {"detail": "/documents/a-file.txt"}
+
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_start_import_job_returns_conflict_for_invalid_state() -> None:
     db = MagicMock()
 
