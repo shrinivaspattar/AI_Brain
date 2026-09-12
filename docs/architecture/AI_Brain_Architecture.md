@@ -63,8 +63,9 @@ master backup / source files (read-only)
    only   [implemented]
         │
         ▼
-   browser (frontend/, served at "/") ↔ POST /chat, GET /chat/{id} —
-   chat-only UI, no build step   [implemented]
+   browser (frontend/, served at "/") ↔ POST /chat, GET /chat/{id},
+   GET /import-jobs — chat view + read-only import job monitor, no
+   build step   [implemented]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -84,7 +85,7 @@ master backup / source files (read-only)
 | `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
 | `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
-| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat only) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. |
+| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Two views toggled client-side: Chat and Import Jobs (read-only, polls `GET /import-jobs`). |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -416,9 +417,12 @@ writing any frontend code: a single-user, offline-first, one-process
 personal tool doesn't need a second toolchain or a second port for its
 UI.
 
-The first slice is deliberately chat-only - no import job monitoring,
-memory review, or dedup review pages yet, each being its own later
-slice rather than bundled in:
+Two views live in the same single page, toggled client-side by
+`showChatView()`/`showImportJobsView()` (no client-side router, no
+separate HTML files) - Chat, and a read-only Import Jobs monitor.
+Memory review and dedup review remain unbuilt, each its own later slice.
+
+### Chat
 
 - `app.js` posts to `POST /chat` and renders `GET /chat/{id}` history
   through the same `MessageResponse` shape the API already returns
@@ -446,6 +450,57 @@ citation matched the ingested content end to end. Also exercised
 directly in the browser: reload-persistence, "New conversation" reset,
 submitting an empty message being a no-op, and recovery from a stale
 `localStorage` conversation id.
+
+### Import job monitoring
+
+Read-only monitoring over the existing `GET /import-jobs` endpoint -
+no new backend endpoint was added, and no `ImportJob` business logic
+(status transitions, progress calculation) is duplicated in
+JavaScript; every field a job card shows (name, source path/type,
+status, progress, files discovered/processed, error message, all four
+timestamps) is exactly what the API already returns, via the existing
+`ImportJobResponse` schema. Each of the six `ImportStatus` values gets
+its own colored badge (`.status-badge.status-<lowercase-status>`); a
+`FAILED` job's `error_message` renders in a dedicated block.
+
+Deliberately no create/start/execute/retry controls in the UI - this
+is a monitor, not a management console. Creating and running import
+jobs remains API/curl-only, consistent with the "monitoring must
+remain read-only" scoping decision made before writing any code for
+this slice.
+
+Polling (`fetchImportJobs`): refetches every `IMPORT_JOBS_POLL_INTERVAL_MS`
+(5s) only while at least one returned job is non-terminal
+(`TERMINAL_IMPORT_STATUSES = {COMPLETED, FAILED, CANCELLED}`), and only
+while the Import Jobs view is the one currently visible - switching to
+Chat calls `stopImportJobsPolling()` immediately, and a fetch that
+resolves after the user has already switched away checks
+`importJobsViewEl.hidden` before scheduling its next tick, so a
+poll in flight at the moment of switching can't leak into a background
+loop. A manual "Refresh" button works regardless of polling state (it
+cancels any pending timer and re-fetches immediately).
+
+Verified end-to-end in a real browser against the real database: created
+real jobs in PENDING, COMPLETED, and FAILED states and confirmed each
+rendered correctly (including the FAILED job's error text); executed the
+PENDING job via a separate `curl` call (simulating an external actor,
+the way a background worker eventually would) and watched the UI update
+itself on its next poll tick with no manual action - confirmed via the
+browser's network log that request volume stayed flat while on the Chat
+view and only resumed on switching back. Also reconfirmed chat
+(including citations and reload-persistence) is unaffected by this
+addition.
+
+**A real, pre-existing bug found during verification, deliberately left
+unfixed as out of scope**: `POST /import-jobs/{id}/execute` returns a
+bare HTTP 500 to its caller when the source path doesn't exist - the
+API handler's `_raise_for_value_error` only catches `ValueError`, but
+`ImportJobService.execute_job` lets the underlying `FileNotFoundError`
+propagate straight through after recording the failure. The job row
+itself ends up correctly `FAILED` with the right `error_message`
+regardless (confirmed via `GET /import-jobs/{id}` immediately after),
+so this doesn't affect the read-only monitor at all - it never calls
+`/execute`. Worth a small, separate fix later.
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
@@ -541,8 +596,10 @@ and are surfaced as 409 Conflict at the API layer.
   `document_chunks` migration are applied on this host, but neither step
   is automated yet — a fresh machine needs both done manually before
   `EmbeddingService` will work.
-- Frontend is chat-only (see Frontend, above) — no import job monitoring,
-  memory review, or dedup review UI yet; those remain API/curl-only.
+- Frontend covers chat and read-only import job monitoring (see
+  Frontend, above) — no memory review or dedup review UI yet, and no
+  job-creation form (creating/running import jobs stays API/curl-only);
+  those remain future frontend slices.
 - See [`docs/backlog.md`](../backlog.md) for prioritized future work
   (provenance chain, dedup, audit log, etc.) and
   [`docs/roadmap/Roadmap.md`](../roadmap/Roadmap.md) for the phased plan.

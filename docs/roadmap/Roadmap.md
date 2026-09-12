@@ -248,12 +248,47 @@ machine.
       ingested content: reload-persistence, "New conversation" reset,
       the empty-submit no-op, and the stale-conversation-id recovery
       were all exercised directly in the browser, not just asserted.
-- [ ] Import job monitoring, memory review queue, dedup review — not
-      started; each is its own later frontend slice once chat-only is
-      proven out, not bundled into this first one.
+- [x] Import job monitoring: a second view (`nav-import-jobs-btn`) added
+      to the same single page, reusing the existing `GET /import-jobs`
+      endpoint verbatim — no new backend endpoints, no business logic
+      duplicated in JS (every field shown is exactly what the API
+      returned: name, source path/type, status, progress, files
+      discovered/processed, error message, all four timestamps).
+      Read-only by design: no create/start/execute/retry buttons exist
+      in the UI — those remain API/curl-only, matching the explicit
+      "monitoring must remain read-only" scoping constraint for this
+      slice. Status is shown as a colored badge for each of the six
+      `ImportStatus` values (PENDING/RUNNING/PAUSED/COMPLETED/FAILED/
+      CANCELLED); a FAILED job's `error_message` renders in a dedicated
+      error block. Polling: refetches every 5s only while at least one
+      listed job is non-terminal, and only while the Import Jobs view is
+      the one currently on screen — switching to Chat stops it
+      immediately (verified via the network log: request count stayed
+      flat for 8+ seconds after switching away), so a long-running
+      import can't interfere with the chat experience. A manual
+      "Refresh" button is always available regardless of polling state.
+      Verified end-to-end in a real browser against the real database:
+      created real PENDING/COMPLETED/FAILED jobs, confirmed each
+      rendered with correct badge/progress/error text, then executed the
+      PENDING job via a separate curl call and watched the UI update
+      itself on its next poll tick with no manual action — proving the
+      polling loop is genuinely live, not just present in the code.
+      Also confirmed chat (including citations and reload-persistence)
+      is unaffected by this addition.
+      **Found, not fixed** (out of scope for a read-only monitor that
+      never calls it): `POST /import-jobs/{id}/execute` returns a bare
+      500 to its caller when the source path doesn't exist, because the
+      handler only catches `ValueError`, not the `FileNotFoundError` the
+      service actually raises for that case — even though the job row
+      itself is correctly persisted as `FAILED` with the right
+      `error_message` regardless. Worth a small, separate fix later.
+- [ ] Memory review queue, dedup review — not started; each remains its
+      own later frontend slice, not bundled into this one.
 - [ ] No conversation list/switcher yet — only ever one active
       conversation per browser (`localStorage`), matching the
-      chat-only scope of this slice.
+      chat-only scope of the original slice.
+- [ ] No job-creation form in the UI — creating/executing an import job
+      remains API/curl-only, consistent with "monitoring, not management."
 
 ## Non-goals (for now)
 - No cloud LLM fallback — offline-first is a hard requirement, not a default.

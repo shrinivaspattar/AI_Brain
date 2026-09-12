@@ -1,5 +1,8 @@
+from unittest.mock import MagicMock
+
 from fastapi.testclient import TestClient
 
+from app.db.session import get_db
 from app.main import app
 
 
@@ -33,3 +36,32 @@ def test_static_mount_does_not_shadow_api_routes() -> None:
 
     assert response.status_code == 200
     assert response.json() != {}
+
+
+def test_root_index_includes_import_jobs_nav() -> None:
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert "Import Jobs" in response.text
+
+
+def test_chat_route_with_path_param_not_shadowed_by_static_mount() -> None:
+    """A path-param API route (/chat/{conversation_id}) must still reach
+    the real FastAPI handler and return its JSON error shape, not a
+    generic HTML 404 from the StaticFiles mount swallowing the path."""
+    db = MagicMock()
+    db.get.return_value = None
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        client = TestClient(app)
+        response = client.get("/chat/nonexistent-conversation-id")
+
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": "Conversation nonexistent-conversation-id not found"
+        }
+
+    finally:
+        app.dependency_overrides.clear()

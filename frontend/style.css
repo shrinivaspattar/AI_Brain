@@ -29,6 +29,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -71,6 +75,40 @@ body {
 #new-conversation-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+#view-nav {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.nav-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.nav-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.nav-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+#chat-view,
+#import-jobs-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 #messages {
@@ -178,4 +216,157 @@ body {
 #send-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+#import-jobs-view {
+  padding: 1.25rem;
+  overflow-y: auto;
+  gap: 1rem;
+}
+
+#import-jobs-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+#refresh-import-jobs-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+#refresh-import-jobs-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#refresh-import-jobs-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#import-jobs-status-line {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+#import-jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.import-job-card {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+}
+
+.import-job-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.import-job-name {
+  font-weight: 600;
+}
+
+.status-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.status-badge.status-pending {
+  background: #e5e7eb;
+  color: #374151;
+}
+
+.status-badge.status-running {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.status-badge.status-paused {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-badge.status-completed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-badge.status-failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.status-badge.status-cancelled {
+  background: #e5e7eb;
+  color: #6b7280;
+}
+
+.import-job-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+
+.import-job-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.import-job-progress-label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+
+.import-job-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.3rem 1rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-top: 0.7rem;
+}
+
+.import-job-details dt {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.import-job-details dd {
+  margin: 0 0 0.4rem;
+  word-break: break-all;
+}
+
+.import-job-error {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.7rem;
+  background: var(--error-bg);
+  color: var(--error-text);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

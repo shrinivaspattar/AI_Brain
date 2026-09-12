@@ -10,20 +10,34 @@
   <div id="app">
     <header id="header">
       <h1>AI_Brain</h1>
+      <nav id="view-nav">
+        <button id="nav-chat-btn" class="nav-btn" type="button" aria-pressed="true">Chat</button>
+        <button id="nav-import-jobs-btn" class="nav-btn" type="button" aria-pressed="false">Import Jobs</button>
+      </nav>
       <button id="new-conversation-btn" type="button" title="Start a new conversation">New conversation</button>
     </header>
 
-    <main id="messages" aria-live="polite"></main>
+    <section id="chat-view">
+      <main id="messages" aria-live="polite"></main>
 
-    <form id="composer">
-      <textarea
-        id="message-input"
-        placeholder="Ask AI_Brain something..."
-        rows="2"
-        autofocus
-      ></textarea>
-      <button id="send-btn" type="submit">Send</button>
-    </form>
+      <form id="composer">
+        <textarea
+          id="message-input"
+          placeholder="Ask AI_Brain something..."
+          rows="2"
+          autofocus
+        ></textarea>
+        <button id="send-btn" type="submit">Send</button>
+      </form>
+    </section>
+
+    <section id="import-jobs-view" hidden>
+      <div id="import-jobs-toolbar">
+        <button id="refresh-import-jobs-btn" type="button">Refresh</button>
+        <span id="import-jobs-status-line"></span>
+      </div>
+      <div id="import-jobs-list" aria-live="polite"></div>
+    </section>
   </div>
 
   <script src="app.js"></script>
