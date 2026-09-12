@@ -223,8 +223,37 @@ arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time
 machine.
 
-## Phase 6 — Frontend
-- [ ] Not yet started. Chat UI + import job monitoring once Phases 1–2 are usable.
+## Phase 6 — Frontend (started)
+- [x] Stack decision, made explicitly before writing any code: plain
+      HTML/CSS/vanilla JS served directly by FastAPI (`app.mount("/",
+      StaticFiles(directory=BASE_DIR / "frontend", html=True))`) — no
+      Node/npm toolchain, no build step, no second process/port. First
+      slice scoped to chat only; import job monitoring, memory review,
+      and dedup review are deliberately deferred to later slices rather
+      than bundled in.
+- [x] Chat UI (`frontend/index.html`/`style.css`/`app.js`): single page,
+      message history, citations rendered under each assistant reply,
+      light/dark theme via `prefers-color-scheme`. Conversation
+      continuity across a page reload via `localStorage` (stores
+      `conversation_id`, replays history through the existing
+      `GET /chat/{id}`) — a stale/deleted conversation id is detected
+      (404) and cleared automatically rather than getting stuck. A "New
+      conversation" button clears it explicitly. Message content is
+      rendered via `textContent`, never `innerHTML`, so a message
+      containing markup (from the model or pasted by the user) can't
+      inject into the page.
+      Verified in a real browser against the real backend and a real
+      `qwen3:8b` call: ingested a real file, asked a question through
+      the UI, confirmed the rendered answer and citation matched the
+      ingested content: reload-persistence, "New conversation" reset,
+      the empty-submit no-op, and the stale-conversation-id recovery
+      were all exercised directly in the browser, not just asserted.
+- [ ] Import job monitoring, memory review queue, dedup review — not
+      started; each is its own later frontend slice once chat-only is
+      proven out, not bundled into this first one.
+- [ ] No conversation list/switcher yet — only ever one active
+      conversation per browser (`localStorage`), matching the
+      chat-only scope of this slice.
 
 ## Non-goals (for now)
 - No cloud LLM fallback — offline-first is a hard requirement, not a default.

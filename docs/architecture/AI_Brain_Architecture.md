@@ -14,7 +14,7 @@ foundational data-handling decisions.
 - LLM runtime: Ollama, running local chat models (`qwen3:8b`, `qwen2.5-coder:14b`, ...) and `nomic-embed-text` for embeddings
 - Vector store: pgvector (Postgres extension) — vectors live alongside `documents`/`document_chunks`, no separate vector service
 - Cache/queue: Redis
-- Frontend: not yet built
+- Frontend: plain HTML/CSS/vanilla JS, no build step, served directly by FastAPI (`frontend/`)
 
 Everything runs locally; no data or requests leave the machine.
 
@@ -61,6 +61,10 @@ master backup / source files (read-only)
    provenance trace (app/provenance, GET /documents/{id}/provenance) —
    walks ImportJob → Document → DocumentChunk → citing Message(s), read
    only   [implemented]
+        │
+        ▼
+   browser (frontend/, served at "/") ↔ POST /chat, GET /chat/{id} —
+   chat-only UI, no build step   [implemented]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -80,6 +84,7 @@ master backup / source files (read-only)
 | `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
 | `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
+| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat only) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -398,6 +403,50 @@ citation list, asked the real model a question it could only answer by
 citing that document, and confirmed the same trace then included the
 real message and conversation that cited it.
 
+## Frontend
+`frontend/` (`index.html`, `style.css`, `app.js`) is plain HTML/CSS/
+vanilla JS — no framework, no build step, no Node/npm toolchain. FastAPI
+serves it directly: `app.mount("/", StaticFiles(directory=BASE_DIR /
+"frontend", html=True))` in `app/main.py`, registered *after* every
+`app.include_router(...)` call so it never shadows an API route (a
+`Mount` only gets a chance to match once every earlier, more specific
+route has already missed - this was verified with a dedicated test,
+not just assumed). This was an explicit stack decision made before
+writing any frontend code: a single-user, offline-first, one-process
+personal tool doesn't need a second toolchain or a second port for its
+UI.
+
+The first slice is deliberately chat-only - no import job monitoring,
+memory review, or dedup review pages yet, each being its own later
+slice rather than bundled in:
+
+- `app.js` posts to `POST /chat` and renders `GET /chat/{id}` history
+  through the same `MessageResponse` shape the API already returns
+  (role, content, citations) - no separate frontend-facing schema.
+- Conversation continuity across a reload lives in `localStorage`
+  (`ai_brain_conversation_id`) - a page load with a stored id replays
+  history via `GET /chat/{id}`; a 404 (deleted/invalid conversation) is
+  treated as "start fresh," clearing the stored id automatically rather
+  than getting stuck in an error state. A "New conversation" button
+  clears it explicitly.
+- Message content is rendered via `textContent`, never `innerHTML` -
+  a message containing markup (from the model, or something a user
+  pasted) can't inject into the page. Verified directly: rendering a
+  `<img src=x onerror=...>` payload produces literal escaped text and
+  no `<img>` element, let alone an executed handler.
+- No message-send timeout is imposed client-side; a "Thinking..." state
+  disables the composer until the response (or an error) arrives,
+  since a real `qwen3:8b` turn with tool calls has taken over a minute
+  in practice.
+
+Verified in a real browser against the real backend and a real
+`qwen3:8b` call (not just unit-tested): ingested a real file, asked a
+question through the UI, and confirmed the rendered answer and its
+citation matched the ingested content end to end. Also exercised
+directly in the browser: reload-persistence, "New conversation" reset,
+submitting an empty message being a no-op, and recovery from a stale
+`localStorage` conversation id.
+
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
 optional `confidence` (0–1), `status` (`pending`/`approved`/`rejected`,
@@ -492,7 +541,8 @@ and are surfaced as 409 Conflict at the API layer.
   `document_chunks` migration are applied on this host, but neither step
   is automated yet — a fresh machine needs both done manually before
   `EmbeddingService` will work.
-- No frontend yet; the backend is API-only.
+- Frontend is chat-only (see Frontend, above) — no import job monitoring,
+  memory review, or dedup review UI yet; those remain API/curl-only.
 - See [`docs/backlog.md`](../backlog.md) for prioritized future work
   (provenance chain, dedup, audit log, etc.) and
   [`docs/roadmap/Roadmap.md`](../roadmap/Roadmap.md) for the phased plan.

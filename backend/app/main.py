@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from app.api.chat import router as chat_router
 from app.api.database import router as database_router
 from app.api.dedup import router as dedup_router
@@ -8,7 +9,7 @@ from app.api.memory import router as memory_router
 from app.api.rag import router as rag_router
 from app.api.tools import router as tools_router
 from app.api.version import router as version_router
-from app.core.config import settings
+from app.core.config import BASE_DIR, settings
 from app.api.import_jobs import router as import_jobs_router
 
 app = FastAPI(
@@ -16,11 +17,6 @@ app = FastAPI(
     description="Personal AI Knowledge System",
     version=settings.VERSION,
 )
-
-
-@app.get("/")
-async def root():
-    return {"message": f"Welcome to {settings.PROJECT_NAME}"}
 
 
 app.include_router(health_router)
@@ -33,3 +29,12 @@ app.include_router(chat_router)
 app.include_router(memory_router)
 app.include_router(tools_router)
 app.include_router(dedup_router)
+
+# Mounted last so it never shadows an API route above: Starlette checks
+# routes in registration order, and a Mount at "/" only gets a chance to
+# match once every earlier, more specific route has already missed.
+app.mount(
+    "/",
+    StaticFiles(directory=BASE_DIR / "frontend", html=True),
+    name="frontend",
+)
