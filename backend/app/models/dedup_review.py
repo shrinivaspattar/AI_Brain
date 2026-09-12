@@ -35,16 +35,25 @@ class DuplicateReviewStatus(str, Enum):
 
 
 class DuplicateReviewMemberRole(str, Enum):
-    # The system's proposed best copy to keep. Only ever assigned for
-    # EXACT reviews, where byte-equality makes "which copy" an arbitrary
-    # but safe choice (oldest ingested). NEVER assigned for NEAR reviews
-    # - similarity alone is not evidence of which copy is more complete,
-    # correct, or current, so no canonical is proposed; a review with no
-    # PROPOSED_CANONICAL member is the explicit "ambiguous, needs human
-    # judgment" case, not a missing/broken recommendation.
-    PROPOSED_CANONICAL = "proposed_canonical"
+    # The system's RECOMMENDED best copy to keep - a suggestion only,
+    # never a decision. Only ever assigned for EXACT reviews, where
+    # byte-equality makes "which copy" an arbitrary but safe choice
+    # (oldest ingested). NEVER assigned for NEAR reviews - similarity
+    # alone is not evidence of which copy is more complete, correct, or
+    # current, so no canonical is recommended; a review with no
+    # RECOMMENDED_CANONICAL member is the explicit "ambiguous, needs
+    # human judgment" case, not a missing/broken recommendation.
+    #
+    # This is deliberately a *different* concept from
+    # DuplicateReview.human_selected_canonical_document_id, which is
+    # never set by the system - only by an explicit human decision at
+    # approval time (see DedupReviewService.approve_review). A
+    # RECOMMENDED_CANONICAL member existing does NOT mean a canonical
+    # has been decided; only human_selected_canonical_document_id being
+    # non-null means that.
+    RECOMMENDED_CANONICAL = "recommended_canonical"
     # Every other document in this finding - the copy/copies being
-    # evaluated against the (possibly absent) proposed canonical.
+    # evaluated against the (possibly absent) recommended canonical.
     DUPLICATE = "duplicate"
 
 
@@ -62,6 +71,16 @@ class DuplicateReview(Base):
     review never touches a file. There is currently no code path
     anywhere that turns a review's outcome into a filesystem action -
     that is a deliberately separate, not-yet-built later stage.
+
+    Recommended vs. approved canonical - kept explicitly distinct, never
+    conflated: a `RECOMMENDED_CANONICAL` member (see
+    DuplicateReviewMemberRole) is only ever the system's suggestion,
+    computed once at review-creation time. `human_selected_canonical_document_id`
+    is the only field that represents an actual decision, and it is set
+    by nothing but an explicit human choice passed into
+    `DedupReviewService.approve_review` - the system never copies its
+    own recommendation into it automatically, even when a human simply
+    agrees with the recommendation.
     """
 
     __tablename__ = "duplicate_reviews"
@@ -140,6 +159,18 @@ class DuplicateReview(Base):
 
     reviewed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # The human-approved canonical - set ONLY by an explicit choice
+    # passed to approve_review(), never inferred from
+    # RECOMMENDED_CANONICAL or any other heuristic. Null whenever a
+    # review is PENDING, REJECTED, or was APPROVED without a canonical
+    # being chosen (a valid, deliberate outcome for a NEAR review - see
+    # DedupReviewService.approve_review).
+    human_selected_canonical_document_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("documents.id"),
         nullable=True,
     )
 

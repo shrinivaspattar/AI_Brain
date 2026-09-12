@@ -96,7 +96,7 @@ def test_create_review_from_exact_group_persists_against_real_database() -> None
             canonical = next(
                 m
                 for m in members
-                if m.role == DuplicateReviewMemberRole.PROPOSED_CANONICAL
+                if m.role == DuplicateReviewMemberRole.RECOMMENDED_CANONICAL
             )
             assert canonical.document_id == older.id
 
@@ -171,10 +171,10 @@ def test_create_review_from_near_pair_persists_with_no_canonical() -> None:
                 m.role == DuplicateReviewMemberRole.DUPLICATE for m in members
             )
             # The ambiguous-candidate property, proven against real
-            # persisted rows: no PROPOSED_CANONICAL exists anywhere for
-            # a near-duplicate review.
+            # persisted rows: no RECOMMENDED_CANONICAL exists anywhere
+            # for a near-duplicate review.
             assert not any(
-                m.role == DuplicateReviewMemberRole.PROPOSED_CANONICAL
+                m.role == DuplicateReviewMemberRole.RECOMMENDED_CANONICAL
                 for m in members
             )
 
@@ -219,10 +219,18 @@ def test_approve_and_reject_against_real_database_preserve_source_data() -> None
 
         try:
             approved = service.approve_review(
-                review.id, reviewer_decision="Confirmed identical, safe to keep older."
+                review.id,
+                canonical_document_id=doc_a.id,
+                reviewer_decision="Confirmed identical, safe to keep older.",
             )
             assert approved.status == DuplicateReviewStatus.APPROVED
             assert approved.reviewed_at is not None
+            assert approved.human_selected_canonical_document_id == doc_a.id
+
+            # The human-approved canonical really is a valid FK to a
+            # real Document row, round-tripped through Postgres.
+            refetched = db.get(DuplicateReview, review.id)
+            assert refetched.human_selected_canonical_document_id == doc_a.id
 
             # Safety: approving never touches the referenced documents.
             db.refresh(doc_a)
@@ -232,15 +240,23 @@ def test_approve_and_reject_against_real_database_preserve_source_data() -> None
             assert db.get(Document, doc_a.id) is not None
             assert db.get(Document, doc_b.id) is not None
 
-            # Reviewing again (reject after approve) is permitted -
-            # documented last-write-wins behavior - and still touches
-            # nothing but the review row.
-            rejected = service.reject_review(
-                review.id, reviewer_decision="Changed my mind on reflection."
-            )
-            assert rejected.status == DuplicateReviewStatus.REJECTED
+            # Reviewing an already-approved review is rejected outright
+            # (deliberately stricter than Memory's permissive precedent)
+            # - and still touches nothing but attempting the call.
+            try:
+                service.reject_review(
+                    review.id, reviewer_decision="Changed my mind on reflection."
+                )
+                raise AssertionError(
+                    "Expected ValueError for reviewing an already-decided review"
+                )
+            except ValueError as exc:
+                assert "already been reviewed" in str(exc)
+
             db.refresh(doc_a)
             assert doc_a.content_hash == original_doc_a_hash
+            db.refresh(review)
+            assert review.status == DuplicateReviewStatus.APPROVED
 
         finally:
             db.query(DuplicateReviewMember).filter(
@@ -296,13 +312,162 @@ def test_list_reviews_filters_by_status_against_real_database() -> None:
             pending = service.list_reviews(status=DuplicateReviewStatus.PENDING)
             assert any(r.id == review.id for r in pending)
 
-            service.approve_review(review.id)
+            service.approve_review(review.id, canonical_document_id=doc_a.id)
 
             pending_after = service.list_reviews(status=DuplicateReviewStatus.PENDING)
             assert not any(r.id == review.id for r in pending_after)
 
             approved = service.list_reviews(status=DuplicateReviewStatus.APPROVED)
             assert any(r.id == review.id for r in approved)
+
+        finally:
+            db.query(DuplicateReviewMember).filter(
+                DuplicateReviewMember.review_id == review.id
+            ).delete(synchronize_session=False)
+            db.query(DuplicateReview).filter(
+                DuplicateReview.id == review.id
+            ).delete(synchronize_session=False)
+            db.query(Document).filter(
+                Document.id.in_([doc_a.id, doc_b.id])
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_approve_near_review_without_canonical_against_real_database() -> None:
+    """Approving a near-duplicate review without picking a canonical is
+    a valid decision - and the column stays NULL in Postgres, not
+    silently filled in by anything."""
+    engine = _engine()
+
+    with Session(engine) as db:
+        document_service = DocumentService(db)
+        doc_a = document_service.create_document(
+            DocumentCreate(
+                title="v1.txt", source="/dedup-review-test/v1.txt", source_type="txt"
+            )
+        )
+        doc_b = document_service.create_document(
+            DocumentCreate(
+                title="v2.txt", source="/dedup-review-test/v2.txt", source_type="txt"
+            )
+        )
+
+        service = DedupReviewService(db)
+        pair = NearDuplicatePair(document_a=doc_a, document_b=doc_b, similarity=0.9)
+        review = service.create_review_from_near_pair(pair)
+
+        try:
+            approved = service.approve_review(
+                review.id, reviewer_decision="Confirmed related, no clear winner."
+            )
+            assert approved.status == DuplicateReviewStatus.APPROVED
+            assert approved.human_selected_canonical_document_id is None
+
+            refetched = db.get(DuplicateReview, review.id)
+            assert refetched.human_selected_canonical_document_id is None
+
+        finally:
+            db.query(DuplicateReviewMember).filter(
+                DuplicateReviewMember.review_id == review.id
+            ).delete(synchronize_session=False)
+            db.query(DuplicateReview).filter(
+                DuplicateReview.id == review.id
+            ).delete(synchronize_session=False)
+            db.query(Document).filter(
+                Document.id.in_([doc_a.id, doc_b.id])
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_approve_review_rejects_invalid_canonical_against_real_database() -> None:
+    engine = _engine()
+
+    with Session(engine) as db:
+        document_service = DocumentService(db)
+        doc_a = document_service.create_document(
+            DocumentCreate(
+                title="y.txt", source="/dedup-review-test/y.txt",
+                source_type="txt", content_hash="review-test-hash-4",
+            )
+        )
+        doc_b = document_service.create_document(
+            DocumentCreate(
+                title="y-copy.txt", source="/dedup-review-test/y-copy.txt",
+                source_type="txt", content_hash="review-test-hash-4",
+            )
+        )
+        unrelated = document_service.create_document(
+            DocumentCreate(
+                title="unrelated.txt", source="/dedup-review-test/unrelated.txt",
+                source_type="txt",
+            )
+        )
+
+        service = DedupReviewService(db)
+        group = ExactDuplicateGroup(
+            content_hash="review-test-hash-4", documents=[doc_a, doc_b]
+        )
+        review = service.create_review_from_exact_group(group)
+
+        try:
+            try:
+                service.approve_review(
+                    review.id, canonical_document_id=unrelated.id
+                )
+                raise AssertionError(
+                    "Expected ValueError for a canonical that isn't a member"
+                )
+            except ValueError as exc:
+                assert "is not a member" in str(exc)
+
+            # Still PENDING - the invalid attempt changed nothing.
+            db.refresh(review)
+            assert review.status == DuplicateReviewStatus.PENDING
+            assert review.human_selected_canonical_document_id is None
+
+        finally:
+            db.query(DuplicateReviewMember).filter(
+                DuplicateReviewMember.review_id == review.id
+            ).delete(synchronize_session=False)
+            db.query(DuplicateReview).filter(
+                DuplicateReview.id == review.id
+            ).delete(synchronize_session=False)
+            db.query(Document).filter(
+                Document.id.in_([doc_a.id, doc_b.id, unrelated.id])
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_get_review_members_with_documents_against_real_database() -> None:
+    engine = _engine()
+
+    with Session(engine) as db:
+        document_service = DocumentService(db)
+        doc_a = document_service.create_document(
+            DocumentCreate(
+                title="z.txt", source="/dedup-review-test/z.txt",
+                source_type="txt", content_hash="review-test-hash-5",
+            )
+        )
+        doc_b = document_service.create_document(
+            DocumentCreate(
+                title="z-copy.txt", source="/dedup-review-test/z-copy.txt",
+                source_type="txt", content_hash="review-test-hash-5",
+            )
+        )
+
+        service = DedupReviewService(db)
+        group = ExactDuplicateGroup(
+            content_hash="review-test-hash-5", documents=[doc_a, doc_b]
+        )
+        review = service.create_review_from_exact_group(group)
+
+        try:
+            pairs = service.get_review_members_with_documents(review.id)
+
+            assert len(pairs) == 2
+            titles = {document.title for _member, document in pairs}
+            assert titles == {"z.txt", "z-copy.txt"}
 
         finally:
             db.query(DuplicateReviewMember).filter(

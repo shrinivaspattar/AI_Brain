@@ -21,7 +21,16 @@ const navMemoryBtn = document.getElementById("nav-memory-btn");
 const refreshMemoryBtn = document.getElementById("refresh-memory-btn");
 const memoryListEl = document.getElementById("memory-list");
 const memoryStatusLineEl = document.getElementById("memory-status-line");
-const memoryFilterTabs = document.querySelectorAll(".filter-tab");
+const memoryFilterTabs = document.querySelectorAll("#memory-filter-tabs .filter-tab");
+
+const dedupReviewViewEl = document.getElementById("dedup-review-view");
+const navDedupReviewBtn = document.getElementById("nav-dedup-review-btn");
+const refreshDedupReviewBtn = document.getElementById("refresh-dedup-review-btn");
+const dedupReviewListEl = document.getElementById("dedup-review-list");
+const dedupReviewStatusLineEl = document.getElementById("dedup-review-status-line");
+const dedupReviewFilterTabs = document.querySelectorAll(
+  "#dedup-review-filter-tabs .filter-tab"
+);
 
 const MEMORY_EMPTY_MESSAGES = {
   pending: "No pending memories to review.",
@@ -29,7 +38,15 @@ const MEMORY_EMPTY_MESSAGES = {
   rejected: "No rejected memories.",
   "": "No memories yet.",
 };
+const DEDUP_REVIEW_EMPTY_MESSAGES = {
+  pending: "No pending duplicate findings to review.",
+  approved: "No approved findings yet.",
+  rejected: "No rejected findings.",
+  "": "No duplicate findings yet.",
+};
 const SOURCE_SNIPPET_MAX_LENGTH = 300;
+
+let currentDedupReviewFilter = "pending";
 
 let conversationId = localStorage.getItem(CONVERSATION_ID_KEY);
 let importJobsPollTimer = null;
@@ -352,6 +369,7 @@ const VIEWS = {
   chat: { section: chatViewEl, navBtn: navChatBtn },
   importJobs: { section: importJobsViewEl, navBtn: navImportJobsBtn },
   memory: { section: memoryViewEl, navBtn: navMemoryBtn },
+  dedupReview: { section: dedupReviewViewEl, navBtn: navDedupReviewBtn },
 };
 
 function showView(name) {
@@ -380,9 +398,15 @@ function showMemoryView() {
   fetchMemories(currentMemoryFilter);
 }
 
+function showDedupReviewView() {
+  showView("dedupReview");
+  fetchDedupReviews(currentDedupReviewFilter);
+}
+
 navChatBtn.addEventListener("click", showChatView);
 navImportJobsBtn.addEventListener("click", showImportJobsView);
 navMemoryBtn.addEventListener("click", showMemoryView);
+navDedupReviewBtn.addEventListener("click", showDedupReviewView);
 refreshImportJobsBtn.addEventListener("click", fetchImportJobs);
 
 // --- Memory Review view --------------------------------------------------
@@ -697,6 +721,374 @@ memoryFilterTabs.forEach((tab) => {
 });
 
 refreshMemoryBtn.addEventListener("click", () => fetchMemories(currentMemoryFilter));
+
+// --- Dedup Review view -----------------------------------------------
+// Human review queue for KRM duplicate findings (DuplicateReview rows).
+// Reuses GET /dedup/reviews, POST /dedup/reviews/{id}/approve, and
+// POST /dedup/reviews/{id}/reject verbatim - no dedup decision logic
+// (canonical arbitration, confidence scoring) lives here, only display
+// and the explicit approve/reject action itself. Reviewing a finding
+// never touches a file: there is no delete/move/quarantine action
+// anywhere in this view, and none exists anywhere in the backend either.
+
+function dedupMatchTypeBadgeClass(matchType) {
+  return `match-type-badge match-type-${matchType}`;
+}
+
+function buildDedupMemberRow(member) {
+  const row = document.createElement("div");
+  row.className = "dedup-member-row";
+
+  const title = document.createElement("span");
+  title.className = "dedup-member-title";
+  title.textContent = member.document.title;
+  row.appendChild(title);
+
+  const source = document.createElement("span");
+  source.className = "dedup-member-source";
+  source.textContent = member.document.source;
+  row.appendChild(source);
+
+  if (member.role === "recommended_canonical") {
+    const badge = document.createElement("span");
+    badge.className = "dedup-role-badge";
+    badge.textContent = "System-recommended canonical";
+    row.appendChild(badge);
+  }
+
+  if (member.document.import_job_id !== null && member.document.import_job_id !== undefined) {
+    const provenance = document.createElement("span");
+    provenance.className = "dedup-member-provenance";
+    provenance.textContent = `Import job #${member.document.import_job_id}`;
+    row.appendChild(provenance);
+  }
+
+  return row;
+}
+
+function buildCanonicalChoiceForm(review) {
+  const container = document.createElement("div");
+  container.className = "dedup-canonical-choice";
+
+  const label = document.createElement("div");
+  label.className = "dedup-canonical-choice-label";
+  label.textContent =
+    review.match_type === "exact"
+      ? "Select the canonical copy to keep (required to approve):"
+      : "Optionally select a canonical copy, or confirm with none chosen:";
+  container.appendChild(label);
+
+  const radioName = `canonical-choice-${review.id}`;
+  const radios = [];
+
+  if (review.match_type === "near") {
+    const noneOption = document.createElement("label");
+    noneOption.className = "dedup-canonical-option";
+    const noneRadio = document.createElement("input");
+    noneRadio.type = "radio";
+    noneRadio.name = radioName;
+    noneRadio.value = "";
+    noneRadio.checked = true;
+    noneOption.appendChild(noneRadio);
+    noneOption.appendChild(document.createTextNode(" No canonical (undecided)"));
+    container.appendChild(noneOption);
+    radios.push(noneRadio);
+  }
+
+  review.members.forEach((member) => {
+    const option = document.createElement("label");
+    option.className = "dedup-canonical-option";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = radioName;
+    radio.value = member.document_id;
+    option.appendChild(radio);
+    option.appendChild(document.createTextNode(` ${member.document.title}`));
+    container.appendChild(option);
+    radios.push(radio);
+  });
+
+  return { container, radios };
+}
+
+function renderDedupReviewCard(review) {
+  const card = document.createElement("div");
+  card.className = "dedup-review-card";
+
+  const header = document.createElement("div");
+  header.className = "dedup-review-card-header";
+
+  const matchBadge = document.createElement("span");
+  matchBadge.className = dedupMatchTypeBadgeClass(review.match_type);
+  matchBadge.textContent =
+    review.match_type === "exact" ? "EXACT DUPLICATE" : "NEAR DUPLICATE";
+  header.appendChild(matchBadge);
+
+  const statusBadgeEl = document.createElement("span");
+  statusBadgeEl.className = statusBadgeClass(review.status);
+  statusBadgeEl.textContent = review.status;
+  header.appendChild(statusBadgeEl);
+
+  card.appendChild(header);
+
+  const reason = document.createElement("div");
+  reason.className = "dedup-recommendation-reason";
+  reason.textContent = review.recommendation_reason;
+  card.appendChild(reason);
+
+  const meta = document.createElement("div");
+  meta.className = "dedup-review-meta";
+  const confidenceText = `${Math.round(review.confidence * 100)}% confidence this is a genuine match`;
+  const similarityText =
+    review.similarity !== null && review.similarity !== undefined
+      ? ` — ${Math.round(review.similarity * 100)}% content similarity (similarity is not equivalence)`
+      : "";
+  meta.textContent = `${confidenceText}${similarityText} — found ${formatTimestamp(review.created_at)}`;
+  card.appendChild(meta);
+
+  const canonicalSummary = document.createElement("dl");
+  canonicalSummary.className = "dedup-canonical-summary";
+
+  const recommendedDt = document.createElement("dt");
+  recommendedDt.textContent = "System recommendation";
+  const recommendedDd = document.createElement("dd");
+  if (review.recommended_canonical_document_id) {
+    const recommendedMember = review.members.find(
+      (m) => m.document_id === review.recommended_canonical_document_id
+    );
+    recommendedDd.textContent = recommendedMember
+      ? `${recommendedMember.document.title} — a suggestion only, not a decision`
+      : "Recommended, but document details unavailable.";
+  } else {
+    recommendedDd.textContent =
+      "None. Near-duplicates never get an automatic recommendation - a human must decide.";
+  }
+  canonicalSummary.appendChild(recommendedDt);
+  canonicalSummary.appendChild(recommendedDd);
+
+  const approvedDt = document.createElement("dt");
+  approvedDt.textContent = "Human-approved canonical";
+  const approvedDd = document.createElement("dd");
+  if (review.human_selected_canonical_document_id) {
+    const approvedMember = review.members.find(
+      (m) => m.document_id === review.human_selected_canonical_document_id
+    );
+    approvedDd.textContent = approvedMember
+      ? approvedMember.document.title
+      : review.human_selected_canonical_document_id;
+  } else {
+    approvedDd.textContent =
+      review.status === "pending" ? "Not yet decided." : "None chosen.";
+  }
+  canonicalSummary.appendChild(approvedDt);
+  canonicalSummary.appendChild(approvedDd);
+  card.appendChild(canonicalSummary);
+
+  const membersSection = document.createElement("div");
+  membersSection.className = "dedup-members-list";
+  const membersLabel = document.createElement("div");
+  membersLabel.className = "dedup-members-label";
+  membersLabel.textContent = "Participating documents:";
+  membersSection.appendChild(membersLabel);
+  review.members.forEach((member) =>
+    membersSection.appendChild(buildDedupMemberRow(member))
+  );
+  card.appendChild(membersSection);
+
+  if (review.status !== "pending") {
+    const decisionInfo = document.createElement("div");
+    decisionInfo.className = "dedup-review-decision-info";
+    decisionInfo.textContent =
+      `Reviewed ${formatTimestamp(review.reviewed_at)}` +
+      (review.reviewer_decision ? ` — "${review.reviewer_decision}"` : "");
+    card.appendChild(decisionInfo);
+  }
+
+  if (review.status === "pending") {
+    const { container: canonicalChoice, radios } = buildCanonicalChoiceForm(review);
+    card.appendChild(canonicalChoice);
+
+    const noteInput = document.createElement("textarea");
+    noteInput.className = "dedup-reviewer-note";
+    noteInput.placeholder = "Optional note explaining your decision...";
+    noteInput.rows = 2;
+    card.appendChild(noteInput);
+
+    const actions = document.createElement("div");
+    actions.className = "memory-actions";
+
+    const approveBtn = createConfirmableActionButton(
+      "Approve",
+      "memory-approve-btn",
+      () => {
+        const selected = radios.find((radio) => radio.checked);
+        const canonicalDocumentId = selected && selected.value ? selected.value : null;
+        approveDedupReview(
+          review.id,
+          canonicalDocumentId,
+          noteInput.value.trim() || null,
+          card
+        );
+      }
+    );
+
+    if (review.match_type === "exact") {
+      approveBtn.disabled = true;
+      radios.forEach((radio) => {
+        radio.addEventListener("change", () => {
+          approveBtn.disabled = !radios.some((r) => r.checked && r.value);
+        });
+      });
+    }
+
+    const rejectBtn = createConfirmableActionButton(
+      "Reject",
+      "memory-reject-btn",
+      () => {
+        rejectDedupReview(review.id, noteInput.value.trim() || null, card);
+      }
+    );
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(rejectBtn);
+    card.appendChild(actions);
+  }
+
+  return card;
+}
+
+function renderDedupReviewEmptyState() {
+  dedupReviewListEl.innerHTML = "";
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  empty.textContent =
+    DEDUP_REVIEW_EMPTY_MESSAGES[currentDedupReviewFilter] ?? "No duplicate findings found.";
+  dedupReviewListEl.appendChild(empty);
+}
+
+function renderDedupReviews(reviews) {
+  dedupReviewListEl.innerHTML = "";
+
+  if (reviews.length === 0) {
+    renderDedupReviewEmptyState();
+    return;
+  }
+
+  reviews.forEach((review) =>
+    dedupReviewListEl.appendChild(renderDedupReviewCard(review))
+  );
+}
+
+function showDedupReviewError(cardEl, message) {
+  let errorEl = cardEl.querySelector(".memory-review-error");
+  if (!errorEl) {
+    errorEl = document.createElement("div");
+    errorEl.className = "memory-review-error";
+    cardEl.appendChild(errorEl);
+  }
+  errorEl.textContent = message;
+}
+
+async function approveDedupReview(reviewId, canonicalDocumentId, reviewerDecision, cardEl) {
+  const buttons = cardEl.querySelectorAll(".memory-approve-btn, .memory-reject-btn");
+  buttons.forEach((btn) => (btn.disabled = true));
+
+  try {
+    const response = await fetch(`/dedup/reviews/${reviewId}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        canonical_document_id: canonicalDocumentId,
+        reviewer_decision: reviewerDecision,
+      }),
+    });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = body && body.detail ? body.detail : `HTTP ${response.status}`;
+      throw new Error(detail);
+    }
+
+    cardEl.remove();
+    if (dedupReviewListEl.children.length === 0) {
+      renderDedupReviewEmptyState();
+    }
+  } catch (err) {
+    buttons.forEach((btn) => (btn.disabled = false));
+    showDedupReviewError(cardEl, `Could not approve finding: ${err.message}`);
+  }
+}
+
+async function rejectDedupReview(reviewId, reviewerDecision, cardEl) {
+  const buttons = cardEl.querySelectorAll(".memory-approve-btn, .memory-reject-btn");
+  buttons.forEach((btn) => (btn.disabled = true));
+
+  try {
+    const response = await fetch(`/dedup/reviews/${reviewId}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer_decision: reviewerDecision }),
+    });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = body && body.detail ? body.detail : `HTTP ${response.status}`;
+      throw new Error(detail);
+    }
+
+    cardEl.remove();
+    if (dedupReviewListEl.children.length === 0) {
+      renderDedupReviewEmptyState();
+    }
+  } catch (err) {
+    buttons.forEach((btn) => (btn.disabled = false));
+    showDedupReviewError(cardEl, `Could not reject finding: ${err.message}`);
+  }
+}
+
+async function fetchDedupReviews(filter) {
+  refreshDedupReviewBtn.disabled = true;
+
+  try {
+    const url = filter
+      ? `/dedup/reviews?status=${encodeURIComponent(filter)}`
+      : "/dedup/reviews";
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const reviews = await response.json();
+    renderDedupReviews(reviews);
+    dedupReviewStatusLineEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    dedupReviewListEl.innerHTML = "";
+    const error = document.createElement("div");
+    error.className = "message error";
+    error.textContent = `Could not load duplicate findings: ${err.message}`;
+    dedupReviewListEl.appendChild(error);
+    dedupReviewStatusLineEl.textContent = "";
+  } finally {
+    refreshDedupReviewBtn.disabled = false;
+  }
+}
+
+dedupReviewFilterTabs.forEach((tab) => {
+  if (tab.dataset.status === currentDedupReviewFilter) {
+    tab.classList.add("active");
+  }
+
+  tab.addEventListener("click", () => {
+    currentDedupReviewFilter = tab.dataset.status;
+    dedupReviewFilterTabs.forEach((t) => t.classList.toggle("active", t === tab));
+    fetchDedupReviews(currentDedupReviewFilter);
+  });
+});
+
+refreshDedupReviewBtn.addEventListener("click", () =>
+  fetchDedupReviews(currentDedupReviewFilter)
+);
 
 showChatView();
 

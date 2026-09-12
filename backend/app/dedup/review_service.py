@@ -106,7 +106,7 @@ class DedupReviewService:
             DuplicateReviewMember(
                 review_id=review.id,
                 document_id=canonical.id,
-                role=DuplicateReviewMemberRole.PROPOSED_CANONICAL,
+                role=DuplicateReviewMemberRole.RECOMMENDED_CANONICAL,
             )
         )
         for document in duplicates:
@@ -137,8 +137,8 @@ class DedupReviewService:
         evidence of which copy is more complete, correct, or current.
         Guessing based on size, recency, or ingestion order would be
         exactly the unsafe assumption this design explicitly avoids -
-        so no `PROPOSED_CANONICAL` member is ever created here. Every
-        near-duplicate review is, by construction, the "ambiguous"
+        so no `RECOMMENDED_CANONICAL` member is ever created here.
+        Every near-duplicate review is, by construction, the "ambiguous"
         case: a human must decide whether these are really duplicates
         at all, and if so, which (if either) to prefer.
 
@@ -201,6 +201,43 @@ class DedupReviewService:
     def get_review(self, review_id: int) -> DuplicateReview | None:
         return self.db.get(DuplicateReview, review_id)
 
+    def get_review_members_with_documents(
+        self,
+        review_id: int,
+    ) -> list[tuple[DuplicateReviewMember, Document]]:
+        """Each member of a review paired with its live Document row.
+
+        A separate query rather than an ORM relationship traversal,
+        matching this codebase's existing convention (see
+        ProvenanceService.trace_document) of joining explicitly in the
+        service layer instead of relying on relationship() for anything
+        beyond DuplicateReview's own parent/child link.
+        """
+        members = list(
+            self.db.scalars(
+                select(DuplicateReviewMember).where(
+                    DuplicateReviewMember.review_id == review_id
+                )
+            )
+        )
+
+        if not members:
+            return []
+
+        document_ids = {member.document_id for member in members}
+        documents = {
+            document.id: document
+            for document in self.db.scalars(
+                select(Document).where(Document.id.in_(document_ids))
+            )
+        }
+
+        return [
+            (member, documents[member.document_id])
+            for member in members
+            if member.document_id in documents
+        ]
+
     def list_reviews(
         self,
         status: DuplicateReviewStatus | None = None,
@@ -220,15 +257,47 @@ class DedupReviewService:
     def approve_review(
         self,
         review_id: int,
+        canonical_document_id: str | None = None,
         reviewer_decision: str | None = None,
     ) -> DuplicateReview:
         """Record a human's approval. This has no effect beyond the
         review row itself - no file is touched, and no execution is
-        triggered, because no execution mechanism exists yet."""
+        triggered, because no execution mechanism exists yet.
+
+        `canonical_document_id` is the human's explicit decision - it is
+        never inferred from the review's RECOMMENDED_CANONICAL member,
+        even when they happen to agree. Required for an EXACT review
+        (approving an exact-duplicate finding without saying which copy
+        to keep isn't a complete decision); optional for a NEAR review,
+        where "confirmed as related, no canonical chosen" is itself a
+        valid, deliberate outcome - never filled in automatically.
+
+        Raises ValueError (mapped to 409 Conflict at the API layer) if
+        the review has already been decided: unlike Memory's review
+        gate, which permits re-deciding an already-reviewed row,
+        dedup review deliberately enforces a one-way PENDING -> decided
+        transition, since this is the stage that will eventually gate a
+        real filesystem action and "do not silently allow inconsistent
+        decisions" was an explicit design requirement here.
+        """
         review = self._get_review_or_raise(review_id)
+        self._require_pending(review)
+
+        member_document_ids = self._require_members(review)
+
+        if canonical_document_id is not None:
+            self._validate_canonical_membership(
+                review_id, canonical_document_id, member_document_ids
+            )
+        elif review.match_type == DuplicateMatchType.EXACT:
+            raise ValueError(
+                f"Duplicate review {review_id} is an exact-duplicate finding "
+                "and requires an explicit canonical_document_id to approve"
+            )
 
         try:
             review.status = DuplicateReviewStatus.APPROVED
+            review.human_selected_canonical_document_id = canonical_document_id
             review.reviewer_decision = reviewer_decision
             review.reviewed_at = datetime.now(UTC)
             self.db.commit()
@@ -243,7 +312,11 @@ class DedupReviewService:
         review_id: int,
         reviewer_decision: str | None = None,
     ) -> DuplicateReview:
+        """Record a human's rejection - these are not duplicates that
+        should be acted on. Raises ValueError (409) if the review has
+        already been decided, same as approve_review."""
         review = self._get_review_or_raise(review_id)
+        self._require_pending(review)
 
         try:
             review.status = DuplicateReviewStatus.REJECTED
@@ -263,3 +336,40 @@ class DedupReviewService:
             raise ValueError(f"Duplicate review {review_id} not found")
 
         return review
+
+    def _require_pending(self, review: DuplicateReview) -> None:
+        if review.status != DuplicateReviewStatus.PENDING:
+            raise ValueError(
+                f"Duplicate review {review.id} has already been reviewed "
+                f"(status={review.status.value}) - it cannot be reviewed again"
+            )
+
+    def _require_members(self, review: DuplicateReview) -> set[str]:
+        member_document_ids = {
+            member.document_id
+            for member in self.db.scalars(
+                select(DuplicateReviewMember).where(
+                    DuplicateReviewMember.review_id == review.id
+                )
+            )
+        }
+
+        if not member_document_ids:
+            raise ValueError(
+                f"Duplicate review {review.id} has no members and cannot be "
+                "reviewed"
+            )
+
+        return member_document_ids
+
+    def _validate_canonical_membership(
+        self,
+        review_id: int,
+        canonical_document_id: str,
+        member_document_ids: set[str],
+    ) -> None:
+        if canonical_document_id not in member_document_ids:
+            raise ValueError(
+                f"'{canonical_document_id}' is not a member of duplicate "
+                f"review {review_id} - cannot select it as the canonical copy"
+            )

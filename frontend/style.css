@@ -105,7 +105,8 @@ body {
 
 #chat-view,
 #import-jobs-view,
-#memory-view {
+#memory-view,
+#dedup-review-view {
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -556,4 +557,216 @@ body {
   color: var(--error-text);
   border-radius: 6px;
   font-size: 0.82rem;
+}
+
+#dedup-review-view {
+  padding: 1.25rem;
+  overflow-y: auto;
+  gap: 1rem;
+}
+
+#dedup-review-safety-banner {
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+#dedup-review-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+#refresh-dedup-review-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+#refresh-dedup-review-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#refresh-dedup-review-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#dedup-review-status-line {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+#dedup-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.dedup-review-card {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+.dedup-review-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+
+.match-type-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.match-type-badge.match-type-exact {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+
+.match-type-badge.match-type-near {
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+.dedup-recommendation-reason {
+  font-size: 0.9rem;
+  line-height: 1.45;
+  margin-bottom: 0.5rem;
+}
+
+.dedup-review-meta {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.7rem;
+}
+
+.dedup-canonical-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.3rem 1.2rem;
+  font-size: 0.85rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.7rem;
+}
+
+.dedup-canonical-summary dt {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.dedup-canonical-summary dd {
+  margin: 0 0 0.5rem;
+  color: var(--muted);
+}
+
+.dedup-members-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.dedup-members-list {
+  margin-bottom: 0.7rem;
+}
+
+.dedup-member-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.dedup-member-row:last-child {
+  border-bottom: none;
+}
+
+.dedup-member-title {
+  font-weight: 600;
+}
+
+.dedup-member-source {
+  color: var(--muted);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.dedup-role-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: #ede9fe;
+  color: #5b21b6;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+}
+
+.dedup-member-provenance {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.dedup-review-decision-info {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+  font-style: italic;
+}
+
+.dedup-canonical-choice {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.dedup-canonical-choice-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+
+.dedup-canonical-option {
+  display: block;
+  font-size: 0.85rem;
+  padding: 0.15rem 0;
+  cursor: pointer;
+}
+
+.dedup-reviewer-note {
+  width: 100%;
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  resize: vertical;
 }

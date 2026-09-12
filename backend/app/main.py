@@ -3,6 +3,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.chat import router as chat_router
 from app.api.database import router as database_router
 from app.api.dedup import router as dedup_router
+from app.api.dedup_reviews import router as dedup_reviews_router
 from app.api.documents import router as documents_router
 from app.api.health import router as health_router
 from app.api.memory import router as memory_router
@@ -29,6 +30,7 @@ app.include_router(chat_router)
 app.include_router(memory_router)
 app.include_router(tools_router)
 app.include_router(dedup_router)
+app.include_router(dedup_reviews_router)
 
 # Mounted last so it never shadows an API route above: Starlette checks
 # routes in registration order, and a Mount at "/" only gets a chance to

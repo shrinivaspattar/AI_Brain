@@ -8,6 +8,7 @@ from app.dedup.service import ExactDuplicateGroup, NearDuplicatePair
 from app.models.dedup_review import (
     DuplicateMatchType,
     DuplicateReview,
+    DuplicateReviewMember,
     DuplicateReviewMemberRole,
     DuplicateReviewStatus,
 )
@@ -32,10 +33,33 @@ def _document(
     )
 
 
+def _member(
+    review_id: int, document_id: str, role: DuplicateReviewMemberRole
+) -> DuplicateReviewMember:
+    return DuplicateReviewMember(
+        review_id=review_id, document_id=document_id, role=role
+    )
+
+
+def _pending_review(
+    review_id: int = 1,
+    match_type: DuplicateMatchType = DuplicateMatchType.EXACT,
+    confidence: float = 1.0,
+) -> DuplicateReview:
+    return DuplicateReview(
+        id=review_id,
+        match_type=match_type,
+        confidence=confidence,
+        recommendation_reason="test",
+        evidence={},
+        status=DuplicateReviewStatus.PENDING,
+    )
+
+
 # --- exact duplicate candidate -------------------------------------------
 
 
-def test_create_review_from_exact_group_proposes_oldest_as_canonical() -> None:
+def test_create_review_from_exact_group_recommends_oldest_as_canonical() -> None:
     db = MagicMock()
     service = DedupReviewService(db)
 
@@ -55,6 +79,7 @@ def test_create_review_from_exact_group_proposes_oldest_as_canonical() -> None:
     assert review.similarity is None
     assert review.confidence == 1.0
     assert review.status == DuplicateReviewStatus.PENDING
+    assert review.human_selected_canonical_document_id is None
     assert "a.txt" in review.recommendation_reason
 
     added_members = [
@@ -62,14 +87,16 @@ def test_create_review_from_exact_group_proposes_oldest_as_canonical() -> None:
         for call in db.add.call_args_list
         if hasattr(call.args[0], "role")
     ]
-    canonical_members = [
-        m for m in added_members if m.role == DuplicateReviewMemberRole.PROPOSED_CANONICAL
+    recommended = [
+        m
+        for m in added_members
+        if m.role == DuplicateReviewMemberRole.RECOMMENDED_CANONICAL
     ]
     duplicate_members = [
         m for m in added_members if m.role == DuplicateReviewMemberRole.DUPLICATE
     ]
-    assert len(canonical_members) == 1
-    assert canonical_members[0].document_id == "doc-1"
+    assert len(recommended) == 1
+    assert recommended[0].document_id == "doc-1"
     assert len(duplicate_members) == 1
     assert duplicate_members[0].document_id == "doc-2"
 
@@ -95,6 +122,8 @@ def test_create_review_from_exact_group_evidence_snapshots_member_metadata() -> 
     )
     assert doc_a_evidence["import_job_id"] == 7
     assert doc_a_evidence["title"] == "a.txt"
+    # No full document content anywhere in the snapshot - metadata only.
+    assert "content" not in doc_a_evidence
 
 
 def test_create_review_from_exact_group_rejects_degenerate_group() -> None:
@@ -114,9 +143,9 @@ def test_create_review_from_exact_group_rejects_degenerate_group() -> None:
 # --- near duplicate candidate / ambiguous candidate ----------------------
 
 
-def test_create_review_from_near_pair_proposes_no_canonical() -> None:
+def test_create_review_from_near_pair_recommends_no_canonical() -> None:
     """The 'ambiguous candidate' case: a near-duplicate review is always
-    created without a PROPOSED_CANONICAL member, by design."""
+    created without a RECOMMENDED_CANONICAL member, by design."""
     db = MagicMock()
     service = DedupReviewService(db)
 
@@ -130,6 +159,7 @@ def test_create_review_from_near_pair_proposes_no_canonical() -> None:
     assert review.content_hash is None
     assert review.similarity == 0.97
     assert review.confidence == 0.97
+    assert review.human_selected_canonical_document_id is None
     assert "No canonical copy is proposed" in review.recommendation_reason
 
     added_members = [
@@ -139,6 +169,10 @@ def test_create_review_from_near_pair_proposes_no_canonical() -> None:
     ]
     assert all(
         m.role == DuplicateReviewMemberRole.DUPLICATE for m in added_members
+    )
+    assert not any(
+        m.role == DuplicateReviewMemberRole.RECOMMENDED_CANONICAL
+        for m in added_members
     )
     assert len(added_members) == 2
 
@@ -183,39 +217,165 @@ def test_list_reviews_filters_by_status() -> None:
     assert "duplicate_reviews.status" in compiled
 
 
-# --- already-reviewed / conflicting review attempts -----------------------
-
-
-def test_approve_review_sets_status_and_timestamp() -> None:
+def test_get_review_members_with_documents_pairs_members_and_documents() -> None:
     db = MagicMock()
-    review = DuplicateReview(
-        id=1,
-        match_type=DuplicateMatchType.EXACT,
-        confidence=1.0,
-        recommendation_reason="test",
-        evidence={},
-        status=DuplicateReviewStatus.PENDING,
-    )
+    service = DedupReviewService(db)
+
+    member_a = _member(1, "doc-1", DuplicateReviewMemberRole.RECOMMENDED_CANONICAL)
+    member_b = _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE)
+    doc_a = _document("doc-1", "a.txt")
+    doc_b = _document("doc-2", "a-copy.txt")
+
+    db.scalars.side_effect = [[member_a, member_b], [doc_a, doc_b]]
+
+    pairs = service.get_review_members_with_documents(1)
+
+    assert len(pairs) == 2
+    result_map = {member.document_id: document for member, document in pairs}
+    assert result_map["doc-1"] is doc_a
+    assert result_map["doc-2"] is doc_b
+
+
+def test_get_review_members_with_documents_returns_empty_for_no_members() -> None:
+    db = MagicMock()
+    service = DedupReviewService(db)
+
+    db.scalars.return_value = []
+
+    assert service.get_review_members_with_documents(1) == []
+
+
+# --- approve: exact requires an explicit canonical -----------------------
+
+
+def test_approve_exact_review_requires_explicit_canonical() -> None:
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.EXACT)
     db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.RECOMMENDED_CANONICAL),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
 
     service = DedupReviewService(db)
-    result = service.approve_review(1, reviewer_decision="Looks right.")
+
+    with pytest.raises(ValueError, match="requires an explicit canonical_document_id"):
+        service.approve_review(1)
+
+
+def test_approve_exact_review_with_explicit_canonical_succeeds() -> None:
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.EXACT)
+    db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.RECOMMENDED_CANONICAL),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
+
+    service = DedupReviewService(db)
+    result = service.approve_review(
+        1, canonical_document_id="doc-1", reviewer_decision="Agreed with recommendation."
+    )
 
     assert result.status == DuplicateReviewStatus.APPROVED
-    assert result.reviewer_decision == "Looks right."
+    assert result.human_selected_canonical_document_id == "doc-1"
+    assert result.reviewer_decision == "Agreed with recommendation."
     assert result.reviewed_at is not None
+
+
+def test_approve_exact_review_rejects_canonical_not_a_member() -> None:
+    """Invalid canonical selection: a document not part of this review."""
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.EXACT)
+    db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.RECOMMENDED_CANONICAL),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
+
+    service = DedupReviewService(db)
+
+    with pytest.raises(ValueError, match="is not a member"):
+        service.approve_review(1, canonical_document_id="doc-999")
+
+
+def test_approve_review_raises_when_no_members_exist() -> None:
+    """Defensive: a review record should never have zero members in
+    practice (the service always creates them atomically), but approval
+    must not silently proceed if it somehow does."""
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.EXACT)
+    db.get.return_value = review
+    db.scalars.return_value = []
+
+    service = DedupReviewService(db)
+
+    with pytest.raises(ValueError, match="has no members"):
+        service.approve_review(1, canonical_document_id="doc-1")
+
+
+# --- approve: near duplicates never get an automatic canonical -----------
+
+
+def test_approve_near_review_without_canonical_succeeds() -> None:
+    """Approving a near-duplicate review without picking a canonical is
+    a valid, deliberate outcome - 'confirmed as related, no canonical
+    chosen' - and must never be filled in automatically."""
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.NEAR, confidence=0.9)
+    db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.DUPLICATE),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
+
+    service = DedupReviewService(db)
+    result = service.approve_review(1, reviewer_decision="Confirmed related.")
+
+    assert result.status == DuplicateReviewStatus.APPROVED
+    assert result.human_selected_canonical_document_id is None
+
+
+def test_approve_near_review_with_explicit_human_canonical_succeeds() -> None:
+    """A human MAY explicitly choose a canonical for a near-duplicate
+    review - that's a real human decision, not an automatic one, and is
+    allowed as long as it references an actual member."""
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.NEAR, confidence=0.9)
+    db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.DUPLICATE),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
+
+    service = DedupReviewService(db)
+    result = service.approve_review(1, canonical_document_id="doc-1")
+
+    assert result.status == DuplicateReviewStatus.APPROVED
+    assert result.human_selected_canonical_document_id == "doc-1"
+
+
+def test_approve_near_review_rejects_canonical_not_a_member() -> None:
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.NEAR, confidence=0.9)
+    db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.DUPLICATE),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
+
+    service = DedupReviewService(db)
+
+    with pytest.raises(ValueError, match="is not a member"):
+        service.approve_review(1, canonical_document_id="doc-999")
+
+
+# --- reject --------------------------------------------------------------
 
 
 def test_reject_review_sets_status_and_timestamp() -> None:
     db = MagicMock()
-    review = DuplicateReview(
-        id=1,
-        match_type=DuplicateMatchType.NEAR,
-        confidence=0.9,
-        recommendation_reason="test",
-        evidence={},
-        status=DuplicateReviewStatus.PENDING,
-    )
+    review = _pending_review(match_type=DuplicateMatchType.NEAR, confidence=0.9)
     db.get.return_value = review
 
     service = DedupReviewService(db)
@@ -224,57 +384,78 @@ def test_reject_review_sets_status_and_timestamp() -> None:
     assert result.status == DuplicateReviewStatus.REJECTED
     assert result.reviewer_decision == "Not actually related."
     assert result.reviewed_at is not None
+    assert result.human_selected_canonical_document_id is None
 
 
-def test_approve_review_on_already_rejected_review_overwrites_status() -> None:
-    """Documents current, deliberate behavior (matching MemoryService's
-    approve_memory/reject_memory precedent): no guard against reviewing
-    an already-decided review. The frontend (not built in this
-    milestone) would only ever show actions for a PENDING review, but
-    the service itself places no restriction on it."""
+# --- already-reviewed / conflicting review attempts -----------------------
+
+
+def test_approve_review_raises_for_already_approved_review() -> None:
     db = MagicMock()
-    review = DuplicateReview(
-        id=1,
-        match_type=DuplicateMatchType.EXACT,
-        confidence=1.0,
-        recommendation_reason="test",
-        evidence={},
-        status=DuplicateReviewStatus.REJECTED,
-    )
+    review = _pending_review(match_type=DuplicateMatchType.EXACT)
+    review.status = DuplicateReviewStatus.APPROVED
     db.get.return_value = review
 
     service = DedupReviewService(db)
-    result = service.approve_review(1)
 
-    assert result.status == DuplicateReviewStatus.APPROVED
+    with pytest.raises(ValueError, match="already been reviewed"):
+        service.approve_review(1, canonical_document_id="doc-1")
 
 
-def test_conflicting_sequential_review_calls_last_write_wins() -> None:
-    """No optimistic-locking/version column exists on DuplicateReview,
-    so two conflicting review requests processed one after another (as
-    real concurrent HTTP requests would be, serialized by the database)
-    both succeed without raising - whichever is applied last determines
-    the final status."""
+def test_approve_review_raises_for_already_rejected_review() -> None:
+    """Deliberate divergence from MemoryService's permissive precedent:
+    dedup review enforces a one-way PENDING -> decided transition, since
+    this is the stage that will eventually gate a real filesystem
+    action and 'do not silently allow inconsistent decisions' was an
+    explicit requirement for this milestone specifically."""
     db = MagicMock()
-    review = DuplicateReview(
-        id=1,
-        match_type=DuplicateMatchType.EXACT,
-        confidence=1.0,
-        recommendation_reason="test",
-        evidence={},
-        status=DuplicateReviewStatus.PENDING,
-    )
+    review = _pending_review(match_type=DuplicateMatchType.EXACT)
+    review.status = DuplicateReviewStatus.REJECTED
     db.get.return_value = review
+
+    service = DedupReviewService(db)
+
+    with pytest.raises(ValueError, match="already been reviewed"):
+        service.approve_review(1, canonical_document_id="doc-1")
+
+
+def test_reject_review_raises_for_already_approved_review() -> None:
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.NEAR, confidence=0.9)
+    review.status = DuplicateReviewStatus.APPROVED
+    db.get.return_value = review
+
+    service = DedupReviewService(db)
+
+    with pytest.raises(ValueError, match="already been reviewed"):
+        service.reject_review(1)
+
+
+def test_conflicting_sequential_review_calls_second_call_is_rejected() -> None:
+    """Real concurrent HTTP requests are serialized by the database, so
+    this is the realistic shape of a 'conflicting review attempt': the
+    first call succeeds, and the second - whichever it is - is rejected
+    with a clear error rather than silently overwriting the first
+    reviewer's decision."""
+    db = MagicMock()
+    review = _pending_review(match_type=DuplicateMatchType.NEAR, confidence=0.9)
+    db.get.return_value = review
+    db.scalars.return_value = [
+        _member(1, "doc-1", DuplicateReviewMemberRole.DUPLICATE),
+        _member(1, "doc-2", DuplicateReviewMemberRole.DUPLICATE),
+    ]
 
     service = DedupReviewService(db)
 
     approved = service.approve_review(1, reviewer_decision="First reviewer")
     assert approved.status == DuplicateReviewStatus.APPROVED
 
-    rejected = service.reject_review(1, reviewer_decision="Second reviewer disagrees")
-    assert rejected.status == DuplicateReviewStatus.REJECTED
-    assert rejected.reviewer_decision == "Second reviewer disagrees"
-    assert rejected is approved  # same row, mutated in place
+    with pytest.raises(ValueError, match="already been reviewed"):
+        service.reject_review(1, reviewer_decision="Second reviewer disagrees")
+
+    # The first decision stands, untouched by the rejected second attempt.
+    assert review.status == DuplicateReviewStatus.APPROVED
+    assert review.reviewer_decision == "First reviewer"
 
 
 # --- invalid candidate ------------------------------------------------

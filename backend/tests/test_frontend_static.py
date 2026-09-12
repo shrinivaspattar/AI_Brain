@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -54,6 +54,15 @@ def test_root_index_includes_memory_review_nav() -> None:
     assert "Memory Review" in response.text
 
 
+def test_root_index_includes_dedup_review_nav_and_safety_banner() -> None:
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert "Dedup Review" in response.text
+    assert "does not modify your files" in response.text
+
+
 def test_chat_route_with_path_param_not_shadowed_by_static_mount() -> None:
     """A path-param API route (/chat/{conversation_id}) must still reach
     the real FastAPI handler and return its JSON error shape, not a
@@ -70,6 +79,24 @@ def test_chat_route_with_path_param_not_shadowed_by_static_mount() -> None:
         assert response.json() == {
             "detail": "Conversation nonexistent-conversation-id not found"
         }
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_dedup_reviews_route_not_shadowed_by_static_mount() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_reviews.DedupReviewService") as service_class:
+            service_class.return_value.list_reviews.return_value = []
+
+            client = TestClient(app)
+            response = client.get("/dedup/reviews")
+
+            assert response.status_code == 200
+            assert response.json() == []
 
     finally:
         app.dependency_overrides.clear()

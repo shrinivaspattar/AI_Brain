@@ -64,8 +64,9 @@ master backup / source files (read-only)
         │
         ▼
    browser (frontend/, served at "/") ↔ POST /chat, GET /chat/{id},
-   GET /import-jobs, GET /memory + approve|reject — chat, read-only
-   import job monitor, and human memory review queue, no build step
+   GET /import-jobs, GET /memory + approve|reject, GET /dedup/reviews +
+   approve|reject — chat, read-only import job monitor, human memory
+   review queue, and human dedup review queue, no build step
    [implemented]
 ```
 
@@ -84,9 +85,9 @@ master backup / source files (read-only)
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store + `status` (pending/approved/rejected), no type taxonomy. `POST /memory`, `GET /memory?status=`, `POST /memory/{id}/approve`\|`/reject`, `DELETE /memory/{id}`. Review-gated write hook (`remember` tool) + read hook (approved-only) into `ChatService` — see Memory, below. |
 | `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup`, `read_file_content` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No write/move/delete or external-network tools exist. |
 | `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
-| `dedup/` | Implemented (detection + dry-run plan); review model implemented, not yet exposed via API | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. `review_service.DedupReviewService`: persists a detected finding as a `DuplicateReview` (see Deduplication, below, for the full design) and records human approve/reject decisions — no API endpoint yet. |
+| `dedup/` | Implemented (detection + dry-run plan + review decision layer, with API and frontend) | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. `review_service.DedupReviewService`: persists a detected finding as a `DuplicateReview` (see Deduplication, below, for the full design) and records human approve/reject decisions. Exposed via `GET /dedup/reviews`\|`/{id}` and `POST /dedup/reviews/{id}/approve`\|`/reject` (`app/api/dedup_reviews.py`), and the Dedup Review frontend view. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
-| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor + memory review) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Three views toggled client-side: Chat, Import Jobs (read-only, polls `GET /import-jobs`), and Memory Review (human approve/reject queue over `GET /memory?status=`). |
+| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor + memory review + dedup review) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Four views toggled client-side: Chat, Import Jobs (read-only, polls `GET /import-jobs`), Memory Review (human approve/reject queue over `GET /memory?status=`), and Dedup Review (human approve/reject queue over `GET /dedup/reviews?status=`). |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -358,10 +359,10 @@ unbuilt milestone.
 
 ### Dedup review decision model
 
-A design-and-model milestone, stopped deliberately before any API or
-frontend work: KRM deduplication is split into three explicitly
-separate stages, and until now only the first existed as anything more
-than an in-memory computation.
+KRM deduplication is split into three explicitly separate stages.
+Detection existed before this pair of milestones as a stateless
+computation; these two milestones added the DECISION stage (data model
+first, then its API and frontend) - EXECUTION still does not exist.
 
 ```
 Detection            DeduplicationService.find_exact_duplicates /
@@ -370,10 +371,12 @@ Detection            DeduplicationService.find_exact_duplicates /
      │
      ▼
 Decision              DuplicateReview + DuplicateReviewMember
-(this milestone)      (app/models/dedup_review.py, migration
-                      a7ad86ac80d3) + DedupReviewService
-                      (app/dedup/review_service.py) - persisted,
-                      human-reviewable findings. PENDING by default.
+(these milestones)    (app/models/dedup_review.py, migrations
+                      a7ad86ac80d3 + 6af80a472ca2) + DedupReviewService
+                      (app/dedup/review_service.py) + GET/POST
+                      /dedup/reviews... + the Dedup Review frontend view.
+                      PENDING by default; a human decides via the API
+                      or UI.
      │
      ▼
 Execution             Does not exist. No code path anywhere in
@@ -414,55 +417,128 @@ finding **is** a genuine match, not confidence in a canonical choice),
 title/source/source_type/content_hash/import_job_id/created_at, plus
 the arbitration rule or lack thereof; snapshotted like
 `Message.citations` so a review still explains itself even if a member
-`Document` is later changed), `status` (`pending`/`approved`/
+`Document` is later changed - deliberately metadata only, never the
+document's actual content, so a review stays auditable without
+duplicating source text unnecessarily), `status` (`pending`/`approved`/
 `rejected`, mirroring `MemoryStatus`), `reviewer_decision` (optional
 free-text human note, distinct from the system's own
-`recommendation_reason`), `reviewed_at`, timestamps.
+`recommendation_reason`), `human_selected_canonical_document_id`
+(FK to `documents`, nullable - see below), `reviewed_at`, timestamps.
 
 **`DuplicateReviewMember`** (`duplicate_review_members`): a child table
 rather than fixed `document_a_id`/`document_b_id` columns, because an
 exact-duplicate group is genuinely N-way (`find_exact_duplicates`
 already supports more than two documents sharing a hash) - fixed
 columns would silently truncate a real 3+-way group to a pair. Each row
-is one `Document`'s `role` in a finding: `proposed_canonical` (0 or 1
-per review) or `duplicate` (1 or more).
+is one `Document`'s `role` in a finding: `recommended_canonical` (0 or
+1 per review; renamed from `proposed_canonical` via migration
+`6af80a472ca2` for clarity - a Postgres enum-label rename, not a new
+column, via `ALTER TYPE ... RENAME VALUE`) or `duplicate` (1 or more).
 
 **The ambiguous-candidate guarantee**: `DedupReviewService.
-create_review_from_exact_group` proposes a canonical using the same
+create_review_from_exact_group` recommends a canonical using the same
 safe, deterministic rule as `plan_exact_duplicate_cleanup` (oldest
 `created_at`, tie-broken by `id`) - safe because byte-equality already
 proves the match; only the *choice of which byte-identical copy to
-keep* is a heuristic, always presented as an overridable proposal.
-`create_review_from_near_pair` **never** creates a `proposed_canonical`
+keep* is a heuristic, always presented as an overridable recommendation.
+`create_review_from_near_pair` **never** creates a `recommended_canonical`
 member, structurally, not as a fallback - similarity is evidence these
 documents are related, not evidence of which one is more complete,
 correct, or current, and guessing from recency/size/ingestion-order
 would be exactly the unsafe assumption this design exists to avoid. A
-near-duplicate review with no proposed canonical is not a missing
+near-duplicate review with no recommended canonical is not a missing
 recommendation; it **is** the recommendation - "a human needs to look
 at this."
 
-**Review decisions are permissive, matching `MemoryService`**:
-`approve_review`/`reject_review` place no guard on a review's current
-`status` - either can be called from any state, and the last call wins
-(no optimistic-locking/version column, same as `Memory`). Nothing
-before this needed a stricter rule, and the same future frontend
-constraint applies as for Memory: action buttons would only ever be
-shown for a `pending` review, so this path isn't reachable through a
-UI even though the service permits it.
+**Recommended canonical vs. human-approved canonical - kept explicit
+everywhere, never conflated**: a `RECOMMENDED_CANONICAL` member is only
+ever the system's suggestion, computed once at review-creation time and
+never updated afterward.
+`DuplicateReview.human_selected_canonical_document_id` is the *only*
+field representing an actual decision, and `approve_review` never
+copies the recommendation into it automatically - not even when a
+human simply agrees. For an EXACT review, `canonical_document_id` is a
+**required** argument to `approve_review` (validated as an actual
+member of the review, or rejected with a clear error); omitting it
+raises rather than silently defaulting to the recommendation. For a
+NEAR review it's **optional** - a human may explicitly name a canonical
+(still validated against membership), or approve with none at all,
+which is itself a valid, deliberate outcome ("confirmed as related, no
+canonical chosen") rather than an incomplete one. The API surfaces both
+concepts side by side as `recommended_canonical_document_id` and
+`human_selected_canonical_document_id` on every `DuplicateReviewResponse`,
+so the distinction is visible in the data itself, not just in code
+comments.
 
-**Safety, verified against real Postgres, not just asserted**: creating
-a review and approving/rejecting one were both confirmed, via direct
-query immediately after, to leave every referenced `Document` and
-`ImportJob` row completely unmodified - content_hash, status, all
-fields byte-for-byte unchanged. No filesystem operation of any kind
-runs anywhere in `DedupReviewService`.
+**Review decisions are stricter than `MemoryService`'s precedent, on
+purpose**: `approve_review`/`reject_review` require the review to be
+`PENDING` - reviewing an already-decided review raises `ValueError`
+("...has already been reviewed..."), mapped to `409 Conflict` at the
+API layer, rather than silently overwriting the prior decision the way
+`Memory.status` permits. This is a deliberate divergence: Memory's
+permissive last-write-wins design was fine because nothing downstream
+depends on a single, stable, non-overwritable decision, but dedup
+review is the stage that will eventually gate a real filesystem
+action, and "do not silently allow inconsistent decisions" was an
+explicit requirement here. `approve_review` also validates that the
+review actually has members before proceeding (defensive - the service
+always creates them atomically, so this should be unreachable in
+practice, but a review can never be "approved" into an inconsistent
+state either way).
 
-**Deliberately not built this milestone**: any API endpoint (`app/api/`
-has no new router), any frontend view, and - as with the exact-only
-dry-run plan before it - any execution mechanism. This was a design
-checkpoint: the model and service exist and are tested, but nothing
-exposes them to a client yet, pending review of the design itself.
+**API** (`app/api/dedup_reviews.py`, prefix `/dedup/reviews`):
+`GET /dedup/reviews` (optional `?status=`, same enum-typed query-param
+pattern as `GET /memory`), `GET /dedup/reviews/{id}`, `POST
+/dedup/reviews/{id}/approve` (body: optional `canonical_document_id`,
+optional `reviewer_decision`), `POST /dedup/reviews/{id}/reject` (body:
+optional `reviewer_decision`). Every response embeds each member's full
+`Document` via `DedupReviewService.get_review_members_with_documents` -
+a separate explicit query joining `DuplicateReviewMember` to `Document`
+(matching this codebase's established convention of joining in the
+service layer, as `ProvenanceService.trace_document` already does,
+rather than relying on an ORM relationship for that join). Error
+mapping extends the existing "not found → 404, else → 409" convention
+(`app/api/import_jobs.py`, `app/api/memory.py`) with a third case:
+an invalid or missing canonical selection is a client input problem,
+not a state conflict, so it gets `422` instead of `409`. No create/sync
+endpoint exists - a review only ever comes from
+`DedupReviewService.create_review_from_exact_group`/
+`create_review_from_near_pair` being called directly (e.g. from a
+future scheduled detection pass); the API only ever lists, views, and
+records decisions on reviews that already exist.
+
+**Frontend** (`nav-dedup-review-btn`, the fourth view alongside Chat,
+Import Jobs, and Memory Review): same filter-tab/card pattern as Memory
+Review (`Pending`/`Approved`/`Rejected`/`All` mapped straight to the
+`status` query param), plus a persistent safety banner - "Reviewing
+this finding does not modify your files" - and no delete/move/
+quarantine control anywhere in the view or the API it calls. EXACT and
+NEAR findings are visually distinguished by a colored match-type badge
+(`.match-type-exact` purple, `.match-type-near` orange) in addition to
+the differing recommendation text. Approve/Reject use the same in-page
+two-click confirmation pattern introduced for Memory Review
+(`createConfirmableActionButton`). A canonical-choice radio group is
+built per review: for EXACT it has no default selection and the
+Approve button starts disabled, only enabling once a real member is
+chosen (mirroring the backend's required-canonical validation exactly
+in the UI); for NEAR it defaults to a pre-selected "No canonical
+(undecided)" option, since approving without one is the expected,
+common case for an ambiguous finding.
+
+**Safety, verified against real Postgres and a real browser, not just
+asserted**: creating a review, and both approving (with an explicit
+canonical) and rejecting one, were confirmed via direct query
+immediately after to leave every referenced `Document` and `ImportJob`
+row completely unmodified - content_hash, status, all fields
+byte-for-byte unchanged. The same was reconfirmed in a live browser
+session against controlled synthetic findings. No filesystem operation
+of any kind runs anywhere in `DedupReviewService` or
+`app/api/dedup_reviews.py`.
+
+**Still deliberately not built**: any execution mechanism. There is
+still no code path anywhere in AI_Brain that deletes, moves, renames,
+quarantines, or overwrites a file - approving a review only ever
+records that a human made a decision.
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file
@@ -526,10 +602,10 @@ writing any frontend code: a single-user, offline-first, one-process
 personal tool doesn't need a second toolchain or a second port for its
 UI.
 
-Two views live in the same single page, toggled client-side by
-`showChatView()`/`showImportJobsView()` (no client-side router, no
-separate HTML files) - Chat, and a read-only Import Jobs monitor.
-Memory review and dedup review remain unbuilt, each its own later slice.
+Four views live in the same single page, toggled client-side via a
+shared `showView(name)` helper and a `VIEWS` registry (no client-side
+router, no separate HTML files) - Chat, a read-only Import Jobs
+monitor, a Memory Review queue, and a Dedup Review queue.
 
 ### Chat
 
@@ -728,6 +804,53 @@ derived from were completely unmodified by either action, and
 reconfirmed Chat (with citations) and Import Job Monitoring both still
 work unaffected by this addition.
 
+### Dedup Review view (frontend)
+The fourth view (`nav-dedup-review-btn`), added alongside the backend
+API in the same milestone as the `DuplicateReview` decision model's API
+(see "Dedup review decision model," under Deduplication). Reuses
+`GET /dedup/reviews?status=`, `POST /dedup/reviews/{id}/approve`, and
+`POST /dedup/reviews/{id}/reject` verbatim - no dedup arbitration logic
+lives in JavaScript, only display and the explicit approve/reject
+action.
+
+Same filter-tab/card pattern as Memory Review, plus two things unique
+to this view: a persistent safety banner ("Reviewing this finding does
+not modify your files") always visible at the top, and no delete/move/
+quarantine control anywhere - matching that no such capability exists
+in the API either. EXACT and NEAR findings get a distinct match-type
+badge (`.match-type-exact` purple, `.match-type-near` orange) in
+addition to differing recommendation text, so the two are visually
+unmistakable at a glance, not just distinguishable by reading the card.
+
+The canonical-choice UI is built to mirror the backend's validation
+exactly, not just describe it: a radio group lists every member
+document by name; for an EXACT review there is no default selection
+and the Approve button starts `disabled`, only enabling once a real
+member is chosen (`change` listeners on the radios toggle it); for a
+NEAR review a "No canonical (undecided)" option is pre-selected by
+default, since approving without one is the expected, common outcome
+for an ambiguous finding, not an edge case to route around. The
+"System recommendation" and "Human-approved canonical" fields are
+rendered as two separate `<dt>/<dd>` rows side by side, always both
+visible, so a reviewer can never mistake one for the other - text like
+"a suggestion only, not a decision" is attached directly to the
+recommendation, not left implicit.
+
+Approve/Reject use the same in-page two-click confirmation
+(`createConfirmableActionButton`) introduced for Memory Review - see
+that section for why a native `window.confirm()` was rejected.
+
+Verified end-to-end in a real browser: created a controlled synthetic
+EXACT pair and NEAR pair directly via `DedupReviewService` (not the
+real 720GB corpus), confirmed both rendered with the correct badges,
+recommendation text, and canonical-choice defaults; confirmed the EXACT
+review's Approve button was disabled until a canonical was picked;
+approved the EXACT review with an explicit canonical and rejected the
+NEAR review; confirmed both moved to the correct filter tab and that
+the underlying `Document`/`ImportJob` rows were completely unmodified
+afterward; and reconfirmed Chat, Import Job Monitoring, and Memory
+Review all still work unaffected by this addition.
+
 ## Import job lifecycle
 `ImportJob.status` is a state machine (`app/models/import_job.py`):
 
@@ -783,10 +906,11 @@ unchanged.
   `document_chunks` migration are applied on this host, but neither step
   is automated yet — a fresh machine needs both done manually before
   `EmbeddingService` will work.
-- Frontend covers chat, read-only import job monitoring, and memory
-  review (see Frontend, above) — no dedup review UI yet, and no
-  job-creation form (creating/running import jobs stays API/curl-only);
-  those remain future frontend slices.
+- Frontend covers chat, read-only import job monitoring, memory review,
+  and dedup review (see Frontend, above) — no job-creation form
+  (creating/running import jobs stays API/curl-only), no conversation
+  list/switcher, and no dedup execution mechanism of any kind (still no
+  code path anywhere that deletes, moves, or modifies a file).
 - See [`docs/backlog.md`](../backlog.md) for prioritized future work
   (provenance chain, dedup, audit log, etc.) and
   [`docs/roadmap/Roadmap.md`](../roadmap/Roadmap.md) for the phased plan.

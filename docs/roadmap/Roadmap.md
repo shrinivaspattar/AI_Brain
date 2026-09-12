@@ -227,31 +227,54 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       `POST /memory/{id}/approve`/`/reject`, Phase 3); now also covered
       for dedup — see below — via the same status-enum pattern, not a
       shared/generic mechanism between the two (each has its own model).
-- [x] Human-review decision model for dedup, designed and built (no
-      frontend/API yet — see Architecture's "Dedup review decision
-      model" for the full design): `DuplicateReview` +
-      `DuplicateReviewMember` (migration `a7ad86ac80d3`),
-      `DedupReviewService` (`app/dedup/review_service.py`). This is the
+- [x] Human-review decision model for dedup, now with an API and a
+      frontend view (see Architecture's "Dedup review decision model"
+      for the full design): `DuplicateReview` + `DuplicateReviewMember`
+      (migrations `a7ad86ac80d3`, `6af80a472ca2`), `DedupReviewService`
+      (`app/dedup/review_service.py`), `GET /dedup/reviews`\|`/{id}`,
+      `POST /dedup/reviews/{id}/approve`\|`/reject`. This is the
       DECISION stage inserted between existing DETECTION
       (`DeduplicationService`, stateless) and the still-nonexistent
-      EXECUTION stage: `create_review_from_exact_group`/
-      `create_review_from_near_pair` persist a detected finding as a
-      reviewable record (evidence snapshot, confidence, a human-readable
-      recommendation reason, PENDING status); `approve_review`/
-      `reject_review` record a human decision. Neither creating nor
-      reviewing a record touches a file, a `Document` row, or an
-      `ImportJob` row — confirmed via real-database tests. Exact
-      reviews get a proposed canonical (the existing, safe "oldest
-      ingested" heuristic); near-duplicate reviews **always** propose no
-      canonical at all — similarity is evidence that two documents are
-      related, not evidence of which one is better, so the ambiguous
-      case is a first-class, structurally-guaranteed outcome rather than
-      a fallback. 18 new tests (unit + real-database), covering exact,
-      near/ambiguous, already-reviewed, invalid-id, provenance
-      preservation, and conflicting sequential review calls. Deliberately
-      **not** built this milestone: any API endpoint, any frontend, and
-      any execution mechanism — this was a design-and-model-only
-      milestone, stopped for review before proceeding.
+      EXECUTION stage. Neither creating nor reviewing a record touches a
+      file, a `Document` row, or an `ImportJob` row — confirmed via
+      real-database tests and, now, via a real browser session too.
+      Design refinements added after the initial model was reviewed:
+      the system's suggestion (`RECOMMENDED_CANONICAL` member role,
+      renamed from `PROPOSED_CANONICAL` for clarity) and an actual human
+      decision (`human_selected_canonical_document_id`) are two
+      explicitly separate fields, never conflated — approving an EXACT
+      review requires the caller to pass a real `canonical_document_id`
+      even when it matches the recommendation; nothing is ever promoted
+      automatically. Near-duplicate reviews can optionally record a
+      human-chosen canonical too (explicit only, never inferred), or
+      none at all — "confirmed as related, no canonical chosen" is a
+      first-class, valid outcome. `approve_review`/`reject_review` also
+      became stricter than `MemoryService`'s permissive precedent: a
+      review that's already been decided cannot be reviewed again
+      (409 Conflict) — a deliberate divergence, since this stage will
+      eventually gate a real filesystem action and silent inconsistent
+      decisions are exactly what this design exists to prevent.
+      Frontend: a fourth view (`nav-dedup-review-btn`) with the same
+      filter-tab/card pattern as Memory Review, a persistent "Reviewing
+      this finding does not modify your files" banner, and no delete/
+      move/quarantine control anywhere. EXACT and NEAR findings are
+      visually distinct (a purple vs. orange match-type badge) and a
+      canonical-choice radio group only lets an EXACT review's Approve
+      button enable once a real member is selected.
+      33 new tests total across both milestones (unit, API, real-database
+      integration, frontend-serving), covering exact, near/ambiguous,
+      already-reviewed (now a 409 rejection, not a silent overwrite),
+      invalid/missing canonical selection, missing members, provenance
+      preservation, and conflicting sequential review attempts.
+      Verified end-to-end in a real browser: created controlled synthetic
+      exact and near findings, approved the exact one after selecting
+      its canonical, rejected the near one, confirmed both moved to the
+      correct filter tab and their source Document/ImportJob rows were
+      completely unmodified, and reconfirmed Chat, Import Job
+      Monitoring, and Memory Review are all unaffected.
+      Still deliberately **not** built: any execution mechanism — there
+      is still no code path anywhere in AI_Brain that deletes, moves,
+      renames, quarantines, or overwrites a file.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
@@ -365,9 +388,8 @@ machine.
       itself permits it; documented and tested (both service- and
       HTTP-level), not fixed, since nothing in this milestone's scope
       needed it changed.
-- [ ] Dedup review — frontend/API not started; its own later slice, now
-      unblocked by the KRM `DuplicateReview` decision model above (see
-      Phase 5).
+- [x] Dedup review — frontend/API done, see Phase 5's `DuplicateReview`
+      entry above for the full design.
 - [ ] No conversation list/switcher yet — only ever one active
       conversation per browser (`localStorage`), matching the
       chat-only scope of the original slice.

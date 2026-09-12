@@ -14,6 +14,7 @@
         <button id="nav-chat-btn" class="nav-btn" type="button" aria-pressed="true">Chat</button>
         <button id="nav-import-jobs-btn" class="nav-btn" type="button" aria-pressed="false">Import Jobs</button>
         <button id="nav-memory-btn" class="nav-btn" type="button" aria-pressed="false">Memory Review</button>
+        <button id="nav-dedup-review-btn" class="nav-btn" type="button" aria-pressed="false">Dedup Review</button>
       </nav>
       <button id="new-conversation-btn" type="button" title="Start a new conversation">New conversation</button>
     </header>
@@ -52,6 +53,23 @@
         <span id="memory-status-line"></span>
       </div>
       <div id="memory-list" aria-live="polite"></div>
+    </section>
+
+    <section id="dedup-review-view" hidden>
+      <div id="dedup-review-safety-banner">
+        Reviewing this finding does not modify your files. There is no delete, move, or quarantine action anywhere in this view.
+      </div>
+      <div id="dedup-review-toolbar">
+        <div id="dedup-review-filter-tabs">
+          <button class="filter-tab" data-status="pending" type="button">Pending</button>
+          <button class="filter-tab" data-status="approved" type="button">Approved</button>
+          <button class="filter-tab" data-status="rejected" type="button">Rejected</button>
+          <button class="filter-tab" data-status="" type="button">All</button>
+        </div>
+        <button id="refresh-dedup-review-btn" type="button">Refresh</button>
+        <span id="dedup-review-status-line"></span>
+      </div>
+      <div id="dedup-review-list" aria-live="polite"></div>
     </section>
   </div>
 
