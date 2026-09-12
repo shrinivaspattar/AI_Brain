@@ -875,8 +875,13 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       authorization, no permanent deletion — the real corpus was not
       read, mutated, or referenced by any code or test in this
       milestone.**
-- [x] execute() vs recover_stale_execution() race — closed, not
-      deferred. Follow-up review of the milestone above's own
+- [x] execute() vs recover_stale_execution() race — safe convergence,
+      not mutual exclusion. **Invariant, stated precisely**: at most one
+      action-result audit is ever persisted per plan action, and any
+      concurrent loser converges to the existing terminal state without
+      leaking a raw database exception — not "execution and recovery
+      can never overlap" (they still can; only the consequence changed).
+      Follow-up review of the milestone above's own
       documented residual asked the sharper question directly:
       `_claim_execution` and `_claim_for_recovery` check/set
       independent columns (`claimed_at` vs `recovery_claimed_at`), so

@@ -2566,7 +2566,16 @@ for reconciliation itself (documented residual, see point 2); any
 frontend. **The real corpus was not read, mutated, or referenced by any
 code or test added in this milestone.**
 
-### execute() vs recover_stale_execution() race - closed, not merely deferred
+### execute() vs recover_stale_execution() race - safe convergence, not mutual exclusion
+
+**The invariant this fix establishes, stated precisely (get this
+wording right, since it matters for future architecture reviews): at
+most one action-result audit is ever persisted for a given plan action,
+and any concurrent loser converges to the existing terminal state
+without leaking a raw database exception. This is NOT the same claim
+as "execution and recovery can never overlap" - they still can, and
+this fix does not change that. What changed is what happens next when
+they do.**
 
 Immediately after the reconciliation/TOCTOU milestone above, review of
 its own documented residual ("`recover_stale_execution` does not itself
@@ -2578,7 +2587,9 @@ its own row lock, but **nothing checks the other column** - so a
 genuinely still-running `execute()` call and a `recover_stale_
 execution()` call can both be legitimately granted their claim for the
 SAME still-`RUNNING` execution, and both can then reach `record_
-action_result` for the SAME unresolved plan action.
+action_result` for the SAME unresolved plan action. That overlap
+itself is NOT prevented by anything below - only its consequence is
+made safe.
 
 **Proven, not just reasoned about**: a synchronized two-thread probe
 (both callers' `record_action_result` calls gated behind a shared
