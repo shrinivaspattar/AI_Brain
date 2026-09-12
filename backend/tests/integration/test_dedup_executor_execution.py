@@ -13,8 +13,12 @@ nothing in this file passes it anything but a synthetic `tmp_path`
 subdirectory.
 """
 
+import errno
 import inspect
 import os
+import socket
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -1325,3 +1329,782 @@ def test_execute_raises_for_nonexistent_execution(tmp_path) -> None:
 
         with pytest.raises(ValueError, match="not found"):
             executor.execute(999999999, confirm=True)
+
+
+# --- root symlink rejection (Executor Hardening) --------------------------
+
+
+def test_executor_rejects_allowed_root_as_symlink(tmp_path) -> None:
+    real_dir = tmp_path / "real_corpus"
+    real_dir.mkdir()
+    symlinked_root = tmp_path / "corpus_link"
+    symlinked_root.symlink_to(real_dir)
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        DedupFilesystemExecutor(db=None, allowed_root=symlinked_root, quarantine_root=quarantine)
+
+
+def test_executor_rejects_quarantine_root_as_symlink(tmp_path) -> None:
+    allowed = tmp_path / "corpus"
+    allowed.mkdir()
+    real_quarantine = tmp_path / "real_quarantine"
+    real_quarantine.mkdir()
+    symlinked_quarantine = tmp_path / "quarantine_link"
+    symlinked_quarantine.symlink_to(real_quarantine)
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        DedupFilesystemExecutor(db=None, allowed_root=allowed, quarantine_root=symlinked_quarantine)
+
+
+# --- additional filesystem security tests (Executor Hardening) ------------
+
+
+def test_execute_directory_source_is_excluded_at_plan_generation(tmp_path) -> None:
+    """A Document.source that points at a directory can never even
+    reach the executor: `_observe_file` (shared by plan generation,
+    `check_plan_validity`, AND the executor's own explicit `is_file()`
+    check) treats anything that isn't `Path.is_file()` as non-existent
+    - so `generate_plan_for_review`'s existing exclusion logic (see
+    "Execution Recovery & Partial-Replanning Design") drops a
+    directory member before a plan is even created. This is the REAL,
+    reachable rejection point for this input - not the executor's own
+    `is_file()` check, which is real defense-in-depth but is
+    unreachable through the normal pipeline today, since every earlier
+    layer already keys off the identical `_observe_file` primitive.
+    """
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        canonical_file = allowed_root / "canonical.txt"
+        canonical_file.write_bytes(b"hello world")
+        dup_dir = allowed_root / "dup_directory"
+        dup_dir.mkdir()
+
+        document_service = DocumentService(db)
+        canonical_doc = document_service.create_document(
+            DocumentCreate(
+                title="canonical.txt",
+                source=str(canonical_file),
+                source_type="txt",
+                content_hash="exec-directory-hash",
+            )
+        )
+        dup_doc = document_service.create_document(
+            DocumentCreate(
+                title="dup_directory",
+                source=str(dup_dir),
+                source_type="txt",
+                content_hash="exec-directory-hash",
+            )
+        )
+        dup_doc.created_at = canonical_doc.created_at + timedelta(seconds=1)
+        db.commit()
+
+        review_service = DedupReviewService(db)
+        group = ExactDuplicateGroup(
+            content_hash="exec-directory-hash", documents=[dup_doc, canonical_doc]
+        )
+        review = review_service.create_review_from_exact_group(group)
+        review_service.approve_review(review.id, canonical_document_id=canonical_doc.id)
+
+        plan_service = DedupExecutionPlanService(db)
+        try:
+            plan_service.generate_plan_for_review(review.id)
+            raise AssertionError(
+                "Expected no plannable work - the only duplicate is a "
+                "directory, which _observe_file treats as non-existent"
+            )
+        except ValueError as exc:
+            assert "no plannable work left" in str(exc)
+
+        assert dup_dir.is_dir()
+        _cleanup(db, review.id, [canonical_doc.id, dup_doc.id])
+
+
+def test_execute_fifo_source_is_excluded_at_plan_generation(tmp_path) -> None:
+    """Same reasoning as the directory case: a FIFO is not
+    `Path.is_file()`, so it is excluded before a plan can even be
+    generated."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        canonical_file = allowed_root / "canonical.txt"
+        canonical_file.write_bytes(b"hello world")
+        fifo_path = allowed_root / "dup_fifo"
+        os.mkfifo(fifo_path)
+
+        document_service = DocumentService(db)
+        canonical_doc = document_service.create_document(
+            DocumentCreate(
+                title="canonical.txt",
+                source=str(canonical_file),
+                source_type="txt",
+                content_hash="exec-fifo-hash",
+            )
+        )
+        dup_doc = document_service.create_document(
+            DocumentCreate(
+                title="dup_fifo",
+                source=str(fifo_path),
+                source_type="txt",
+                content_hash="exec-fifo-hash",
+            )
+        )
+        dup_doc.created_at = canonical_doc.created_at + timedelta(seconds=1)
+        db.commit()
+
+        review_service = DedupReviewService(db)
+        group = ExactDuplicateGroup(
+            content_hash="exec-fifo-hash", documents=[dup_doc, canonical_doc]
+        )
+        review = review_service.create_review_from_exact_group(group)
+        review_service.approve_review(review.id, canonical_document_id=canonical_doc.id)
+
+        plan_service = DedupExecutionPlanService(db)
+        try:
+            plan_service.generate_plan_for_review(review.id)
+            raise AssertionError(
+                "Expected no plannable work - the only duplicate is a "
+                "FIFO, which _observe_file treats as non-existent"
+            )
+        except ValueError as exc:
+            assert "no plannable work left" in str(exc)
+
+        assert fifo_path.exists()
+        _cleanup(db, review.id, [canonical_doc.id, dup_doc.id])
+
+
+def test_execute_socket_source_is_excluded_at_plan_generation(tmp_path) -> None:
+    """Same reasoning again: a Unix domain socket is not
+    `Path.is_file()`, so it is excluded before a plan can even be
+    generated."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        canonical_file = allowed_root / "canonical.txt"
+        canonical_file.write_bytes(b"hello world")
+        socket_path = allowed_root / "dup.sock"
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(socket_path))
+
+            document_service = DocumentService(db)
+            canonical_doc = document_service.create_document(
+                DocumentCreate(
+                    title="canonical.txt",
+                    source=str(canonical_file),
+                    source_type="txt",
+                    content_hash="exec-socket-hash",
+                )
+            )
+            dup_doc = document_service.create_document(
+                DocumentCreate(
+                    title="dup.sock",
+                    source=str(socket_path),
+                    source_type="txt",
+                    content_hash="exec-socket-hash",
+                )
+            )
+            dup_doc.created_at = canonical_doc.created_at + timedelta(seconds=1)
+            db.commit()
+
+            review_service = DedupReviewService(db)
+            group = ExactDuplicateGroup(
+                content_hash="exec-socket-hash", documents=[dup_doc, canonical_doc]
+            )
+            review = review_service.create_review_from_exact_group(group)
+            review_service.approve_review(
+                review.id, canonical_document_id=canonical_doc.id
+            )
+
+            plan_service = DedupExecutionPlanService(db)
+            try:
+                plan_service.generate_plan_for_review(review.id)
+                raise AssertionError(
+                    "Expected no plannable work - the only duplicate is a "
+                    "socket, which _observe_file treats as non-existent"
+                )
+            except ValueError as exc:
+                assert "no plannable work left" in str(exc)
+
+            _cleanup(db, review.id, [canonical_doc.id, dup_doc.id])
+        finally:
+            sock.close()
+
+
+def test_execute_own_regular_file_check_independently_rejects_a_directory(
+    tmp_path,
+) -> None:
+    """Defense-in-depth proof for the executor's OWN `is_file()` check
+    (distinct from the plan-generation-level exclusion proven above):
+    even if a plan action somehow existed against a non-regular-file
+    target with `check_plan_validity` reporting it valid (never
+    reachable through the real pipeline today, since that check uses
+    the identical `_observe_file` primitive - simulated here by
+    patching `check_currency` to bypass it), the executor's own
+    explicit `source_path.is_file()` check still independently
+    refuses. This proves the redundancy is real protection, not dead
+    code that merely happens to agree with an earlier check."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        import dataclasses
+
+        from app.dedup.execution_plan_service import DedupExecutionPlanService as _PlanSvc
+
+        real_check_plan_validity = _PlanSvc.check_plan_validity
+
+        def bypassed_check_plan_validity(self, plan_id):
+            # `_attempt_action` derives actionability directly from
+            # `validity.canonical_valid`/`action_validity.is_valid`,
+            # NOT from check_currency's own summary boolean - so the
+            # bypass has to happen here, at the actual validity
+            # dataclass, to reach the executor's own is_file() check.
+            real_validity = real_check_plan_validity(self, plan_id)
+            patched_actions = [
+                dataclasses.replace(a, exists_now=True, is_valid=True)
+                for a in real_validity.actions
+            ]
+            return dataclasses.replace(real_validity, actions=patched_actions)
+
+        try:
+            # start_execution runs its OWN, unpatched check_plan_validity
+            # - it must happen while the file is still a normal, valid
+            # regular file, or this whole setup would be refused before
+            # ever reaching the executor.
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            # ONLY NOW replace the duplicate's file with a directory -
+            # after authorization/start_execution's own (unpatched)
+            # validity checks have already passed against a real file.
+            dup_files[0].unlink()
+            dup_files[0].mkdir()
+
+            with patch.object(
+                _PlanSvc, "check_plan_validity", bypassed_check_plan_validity
+            ):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.FAILED
+            audits = execution_service.get_action_audits(execution.id)
+            assert audits[0].result == DedupExecutionActionResult.PRECONDITION_FAILED
+            assert "not a regular file" in audits[0].error_message
+            assert dup_files[0].is_dir()
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_symlinked_intermediate_directory_escape_is_precondition_failed(
+    tmp_path,
+) -> None:
+    """A source path that stays lexically "inside" allowed_root but
+    traverses through a symlinked intermediate DIRECTORY pointing
+    outside it must be refused - the containment check is required to
+    run on the fully resolved path for exactly this reason."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        canonical_file = allowed_root / "canonical.txt"
+        canonical_file.write_bytes(b"hello world")
+
+        escape_target = outside_dir / "escape_target.txt"
+        escape_target.write_bytes(b"hello world")
+        escape_link = allowed_root / "escape_link"
+        escape_link.symlink_to(outside_dir)
+        # This path is lexically under allowed_root, but escape_link
+        # is a symlink to a directory OUTSIDE it.
+        source_via_symlinked_dir = escape_link / "escape_target.txt"
+
+        document_service = DocumentService(db)
+        canonical_doc = document_service.create_document(
+            DocumentCreate(
+                title="canonical.txt",
+                source=str(canonical_file),
+                source_type="txt",
+                content_hash="exec-escape-hash",
+            )
+        )
+        dup_doc = document_service.create_document(
+            DocumentCreate(
+                title="escape_target.txt",
+                source=str(source_via_symlinked_dir),
+                source_type="txt",
+                content_hash="exec-escape-hash",
+            )
+        )
+        dup_doc.created_at = canonical_doc.created_at + timedelta(seconds=1)
+        db.commit()
+
+        review_service = DedupReviewService(db)
+        group = ExactDuplicateGroup(
+            content_hash="exec-escape-hash", documents=[dup_doc, canonical_doc]
+        )
+        review = review_service.create_review_from_exact_group(group)
+        review_service.approve_review(review.id, canonical_document_id=canonical_doc.id)
+
+        plan_service = DedupExecutionPlanService(db)
+        plan = plan_service.generate_plan_for_review(review.id)
+        auth_service = DedupPlanAuthorizationService(db)
+        authorization = auth_service.authorize_plan(plan.id)
+
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.FAILED
+            audits = execution_service.get_action_audits(execution.id)
+            assert audits[0].result == DedupExecutionActionResult.PRECONDITION_FAILED
+            assert "outside the allowed mutation root" in audits[0].error_message
+            assert escape_target.exists()
+            assert escape_target.read_bytes() == b"hello world"
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, dup_doc.id],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_dotdot_traversal_in_source_path_is_precondition_failed(
+    tmp_path,
+) -> None:
+    """A raw `..`-containing path string, lexically starting under
+    allowed_root but resolving to a location outside it, must be
+    refused - proving `resolve()`'s normalization plus the containment
+    check actually defeats literal `..` segments, not merely paths
+    that are already-clean absolute strings pointing elsewhere."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    sub_dir = allowed_root / "sub"
+    sub_dir.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+    outside_dir = tmp_path / "outside_via_dotdot"
+    outside_dir.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        canonical_file = allowed_root / "canonical.txt"
+        canonical_file.write_bytes(b"hello world")
+
+        real_target = outside_dir / "target.txt"
+        real_target.write_bytes(b"hello world")
+        # Literal ".." segments in the raw string - lexically "under"
+        # allowed_root/sub, but resolves to outside_dir/target.txt.
+        traversal_path = str(sub_dir / ".." / ".." / "outside_via_dotdot" / "target.txt")
+        assert ".." in traversal_path
+
+        document_service = DocumentService(db)
+        canonical_doc = document_service.create_document(
+            DocumentCreate(
+                title="canonical.txt",
+                source=str(canonical_file),
+                source_type="txt",
+                content_hash="exec-dotdot-hash",
+            )
+        )
+        dup_doc = document_service.create_document(
+            DocumentCreate(
+                title="target.txt",
+                source=traversal_path,
+                source_type="txt",
+                content_hash="exec-dotdot-hash",
+            )
+        )
+        dup_doc.created_at = canonical_doc.created_at + timedelta(seconds=1)
+        db.commit()
+
+        review_service = DedupReviewService(db)
+        group = ExactDuplicateGroup(
+            content_hash="exec-dotdot-hash", documents=[dup_doc, canonical_doc]
+        )
+        review = review_service.create_review_from_exact_group(group)
+        review_service.approve_review(review.id, canonical_document_id=canonical_doc.id)
+
+        plan_service = DedupExecutionPlanService(db)
+        plan = plan_service.generate_plan_for_review(review.id)
+        auth_service = DedupPlanAuthorizationService(db)
+        authorization = auth_service.authorize_plan(plan.id)
+
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.FAILED
+            audits = execution_service.get_action_audits(execution.id)
+            assert audits[0].result == DedupExecutionActionResult.PRECONDITION_FAILED
+            assert "outside the allowed mutation root" in audits[0].error_message
+            assert real_target.exists()
+            assert real_target.read_bytes() == b"hello world"
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, dup_doc.id],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_exdev_on_rename_is_failed(tmp_path) -> None:
+    """EXDEV raised by the actual os.rename() mutation path (as
+    opposed to the constructor's own device pre-check) must fall into
+    the same FAILED/mutation=False bucket as any other rename failure
+    - never a copy+delete fallback, never anything else."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        def fake_rename(src, dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            with patch("app.dedup.executor.os.rename", side_effect=fake_rename):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.FAILED
+            audits = execution_service.get_action_audits(execution.id)
+            assert audits[0].result == DedupExecutionActionResult.FAILED
+            assert audits[0].filesystem_mutation_occurred is False
+            assert "Invalid cross-device link" in audits[0].error_message
+            # No copy+delete fallback occurred - the source is exactly
+            # where it started, and no file exists in quarantine.
+            assert dup_files[0].exists()
+            assert dup_files[0].read_bytes() == b"hello world"
+            assert list(quarantine_root.rglob("*")) == [] or all(
+                not p.is_file() for p in quarantine_root.rglob("*")
+            )
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_destination_parent_wrong_device_is_failed(tmp_path) -> None:
+    """Defense in depth: even though the constructor already confirmed
+    allowed_root and quarantine_root share a device, the destination
+    PARENT's own device is independently re-verified immediately
+    before the rename - simulated here via a patched device lookup
+    distinguishing the destination path from the roots."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        real_device = executor._quarantine_device
+
+        def fake_device_of(path):
+            if str(quarantine_root) in str(path) and str(path) != str(quarantine_root):
+                return real_device + 1  # simulate a mismatched destination parent
+            return real_device
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            with patch("app.dedup.executor._device_of", side_effect=fake_device_of):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.FAILED
+            audits = execution_service.get_action_audits(execution.id)
+            assert audits[0].result == DedupExecutionActionResult.FAILED
+            assert audits[0].filesystem_mutation_occurred is False
+            assert "quarantine filesystem device" in audits[0].error_message
+            assert dup_files[0].exists()
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+# --- concurrency exclusivity (Executor Hardening) --------------------------
+
+
+def test_concurrent_execute_calls_only_one_claims_and_mutates(tmp_path) -> None:
+    """The central hardening property: two genuinely concurrent
+    `execute()` calls on the SAME execution_id, from two SEPARATE
+    database sessions/connections (simulating two separate executor
+    processes), must never both enter the mutation loop. Exactly one
+    must win the SELECT ... FOR UPDATE claim; the other must fail
+    cleanly and deterministically, never with a raw IntegrityError and
+    never by falling through to an uncaught exception from
+    complete_execution."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as setup_db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(setup_db, allowed_root)
+        )
+        execution = DedupExecutionService(setup_db).start_execution(authorization.id)
+        execution_id = execution.id
+        # Captured as plain values now, before this `with` block closes
+        # `setup_db` - accessing ORM attributes on a detached instance
+        # afterward raises DetachedInstanceError.
+        review_id = review.id
+        canonical_doc_id = canonical_doc.id
+        dup_doc_ids = [d.id for d in dup_docs]
+        plan_id = plan.id
+        authorization_id = authorization.id
+
+    db_a = Session(engine)
+    db_b = Session(engine)
+
+    # Slow down thread A's commits so thread B has a real window to
+    # contend for the SAME row lock, rather than finding it already
+    # released by the time it tries. This does not change correctness
+    # - it only makes genuine contention deterministic in a fast,
+    # single-action synthetic test instead of leaving it to luck.
+    real_commit_a = db_a.commit
+
+    def slow_commit():
+        time.sleep(0.3)
+        real_commit_a()
+
+    db_a.commit = slow_commit
+
+    executor_a = DedupFilesystemExecutor(db_a, allowed_root, quarantine_root)
+    executor_b = DedupFilesystemExecutor(db_b, allowed_root, quarantine_root)
+
+    results = {}
+    errors = {}
+    barrier = threading.Barrier(2)
+
+    def run(name, executor):
+        barrier.wait()
+        try:
+            results[name] = executor.execute(execution_id, confirm=True)
+        except Exception as exc:  # noqa: BLE001 - capturing for assertion below
+            errors[name] = exc
+
+    thread_a = threading.Thread(target=run, args=("A", executor_a))
+    thread_b = threading.Thread(target=run, args=("B", executor_b))
+
+    try:
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+
+        assert not thread_a.is_alive() and not thread_b.is_alive(), (
+            "a thread did not finish - possible deadlock"
+        )
+
+        # Exactly one caller succeeded, exactly one failed.
+        assert len(results) == 1, f"expected exactly one success, got {results}"
+        assert len(errors) == 1, f"expected exactly one failure, got {errors}"
+
+        (loser_exc,) = errors.values()
+        # A clean, well-typed refusal - never a raw IntegrityError, and
+        # never an uncaught exception surfacing from complete_execution.
+        assert isinstance(loser_exc, ValueError)
+        assert "IntegrityError" not in type(loser_exc).__name__
+        assert (
+            "claimed" in str(loser_exc)
+            or "not RUNNING" in str(loser_exc)
+            or "already has" in str(loser_exc)
+        )
+
+        # The filesystem was mutated exactly once.
+        with Session(engine) as verify_db:
+            audits = DedupExecutionService(verify_db).get_action_audits(execution_id)
+            success_audits = [
+                a for a in audits if a.result == DedupExecutionActionResult.SUCCESS
+            ]
+            assert len(success_audits) == 1
+
+        assert not dup_files[0].exists()
+        moved_files = [p for p in quarantine_root.rglob("*") if p.is_file()]
+        assert len(moved_files) == 1
+        assert moved_files[0].read_bytes() == b"hello world"
+
+    finally:
+        db_a.close()
+        db_b.close()
+        with Session(engine) as cleanup_db:
+            _cleanup(
+                cleanup_db,
+                review_id,
+                [canonical_doc_id, *dup_doc_ids],
+                plan_ids=[plan_id],
+                authorization_ids=[authorization_id],
+                execution_ids=[execution_id],
+            )
+
+
+# --- authorization freshness (Executor Hardening) --------------------------
+
+
+def test_authorization_revoked_from_another_session_is_observed_even_with_expire_on_commit_disabled(
+    tmp_path,
+) -> None:
+    """Regression test for the explicit freshness mechanism
+    (`self.db.expire_all()` at the top of `_attempt_action`): proves
+    the executor observes an authorization revoked by a SEPARATE
+    session even when THIS test deliberately disables
+    `expire_on_commit` on the executor's own session - i.e. even when
+    the SQLAlchemy default this property used to silently depend on is
+    turned off, freshness still holds, because the mechanism is now
+    explicit rather than incidental."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    # expire_on_commit=False deliberately: if freshness depended on
+    # that default (as the security review flagged it might), this
+    # session configuration would cause a stale read and this test
+    # would fail. It does not, because expire_all() is now explicit.
+    executor_db = Session(engine, expire_on_commit=False)
+
+    review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+        _setup_authorized_plan(executor_db, allowed_root, dup_count=2)
+    )
+    execution = DedupExecutionService(executor_db).start_execution(authorization.id)
+    execution_ids = [execution.id]
+
+    # Captured as plain values now, before executor_db is closed in the
+    # `finally` block below - accessing ORM attributes on a detached,
+    # expired instance after close() raises DetachedInstanceError.
+    review_id = review.id
+    canonical_doc_id = canonical_doc.id
+    dup_doc_ids = [d.id for d in dup_docs]
+    plan_id = plan.id
+    authorization_id = authorization.id
+
+    executor = DedupFilesystemExecutor(executor_db, allowed_root, quarantine_root)
+
+    try:
+        # Revoke from a COMPLETELY SEPARATE session/connection, after
+        # the executor's own session has already loaded (and, with
+        # expire_on_commit=False, would otherwise keep caching) the
+        # authorization object.
+        with Session(engine) as other_db:
+            DedupPlanAuthorizationService(other_db).revoke_authorization(
+                authorization.id, reason="revoked from another session mid-run"
+            )
+
+        finalized = executor.execute(execution.id, confirm=True)
+
+        assert finalized.status == DedupExecutionStatus.FAILED
+        audits = DedupExecutionService(executor_db).get_action_audits(execution.id)
+        assert audits[0].result == DedupExecutionActionResult.PRECONDITION_FAILED
+        assert "AUTHORIZED" in audits[0].error_message
+        # Nothing was mutated - the revocation was observed before any
+        # action was attempted.
+        for f in dup_files:
+            assert f.exists()
+
+    finally:
+        executor_db.close()
+        with Session(engine) as cleanup_db:
+            _cleanup(
+                cleanup_db,
+                review_id,
+                [canonical_doc_id, *dup_doc_ids],
+                plan_ids=[plan_id],
+                authorization_ids=[authorization_id],
+                execution_ids=execution_ids,
+            )

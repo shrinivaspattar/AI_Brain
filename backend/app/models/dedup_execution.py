@@ -236,6 +236,22 @@ class DedupExecution(Base):
     # action audit trail actually shows. Null for COMPLETED executions.
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Set exactly once, by DedupFilesystemExecutor._claim_execution,
+    # under a SELECT ... FOR UPDATE lock on this row - the exclusivity
+    # mechanism that makes "exactly one executor may own this
+    # execution" a real, database-enforced guarantee rather than an
+    # assumption about process topology. Never cleared or reused: a
+    # claimed execution stays claimed even if the claiming process
+    # then crashes, exactly like a terminal execution stays terminal -
+    # a second attempt requires DedupExecutionService.
+    # recover_stale_execution, never a second claim on the same row.
+    # Deliberately separate from `status`, which stays RUNNING for the
+    # entire loop and cannot itself distinguish "not yet started" from
+    # "in progress" the way this field does.
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

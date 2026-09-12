@@ -2083,6 +2083,171 @@ execution`'s job); `DedupExecutionActionReconciliation` (still
 deferred); any frontend. **The real corpus was not read, mutated, or
 referenced by any code or test added in this milestone.**
 
+### Executor hardening: concurrency, freshness, symlink roots, and destination-device checks
+
+A hostile code-level security review of the executor above (adversarial,
+no behavior changes) surfaced findings that this milestone closes, one
+at a time, exactly as the review scoped them.
+
+**Concurrency exclusivity, made real rather than assumed**: a new
+`DedupExecution.claimed_at` column (nullable `DateTime`, migration
+`02467162321c`) is set exactly once, by a new `_claim_execution`
+method, under `SELECT ... FOR UPDATE` on the target execution row -
+Postgres blocks a second concurrent transaction's own `FOR UPDATE` on
+that same row until the first commits or rolls back, so two callers for
+the same `execution_id` can never both enter the action loop. The
+second caller does not see a raw `IntegrityError` or an uncaught
+`ValueError` from `complete_execution` as its "normal" concurrency
+outcome - it blocks until the first transaction finishes, then finds
+`claimed_at` already set (or the status no longer `RUNNING`) and raises
+a clean, deliberate `ValueError` naming the prior claim. `execute()` now
+calls `_claim_execution` in place of the old inline
+get-and-check-status block; nothing about the existing one-execution-
+per-authorization semantics changed. Proven under genuine contention -
+not merely reasoned about - by `test_concurrent_execute_calls_only_
+one_claims_and_mutates`, which drives two real threads against two
+separate `Session`/connection objects on real Postgres, synchronized
+with a `threading.Barrier` so both attempt `execute()` as close to
+simultaneously as possible; run 5 times in isolation with zero
+flakiness in addition to its place in the full suite.
+
+**Authorization/plan freshness, made explicit rather than inherited
+from a framework default**: `_attempt_action` now opens with
+`self.db.expire_all()`, an explicit statement that every action must
+observe current authorization and plan state, independent of whatever
+`expire_on_commit` happens to default to. `test_authorization_revoked_
+from_another_session_is_observed_even_with_expire_on_commit_disabled`
+proves the property doesn't secretly depend on that default at all: it
+opens the executor's own session with `expire_on_commit=False` -
+deliberately disabling the framework behavior this safety property used
+to lean on - revokes the authorization from a second, independent
+session mid-run, and confirms the next action still refuses.
+
+**Quarantine-root and allowed-root symlinks now rejected, not silently
+resolved**: the constructor checks `Path(...).is_symlink()` on both
+roots *before* any `resolve()` call runs (`resolve()` would otherwise
+follow the link transparently), raising `ValueError` for either root.
+Threat model: a symlinked root is a single point where "the directory
+you asked for" and "the directory actually used" can silently diverge
+between calls, and unlike an intermediate path component inside a
+plan action (already defeated by resolving the full path and checking
+containment), a symlinked *root itself* has nothing above it to contain
+it against. Fail-closed was chosen deliberately for the production-
+facing design over silent resolution. Covered by
+`test_executor_rejects_allowed_root_as_symlink` and `test_executor_
+rejects_quarantine_root_as_symlink`.
+
+**Directory/FIFO/socket sources - confirmed rejected two layers above
+the executor, with the executor's own check proven independently
+correct anyway**: all three source types share `Path.is_file()` via
+`_observe_file`, the exact primitive used by `generate_plan_for_review`'s
+existing exclusion logic (see "Execution Recovery & Partial-Replanning
+Design"), by `check_plan_validity`, and by the executor's own explicit
+`is_file()` guard. Tracing the real code path shows a directory, FIFO,
+or socket source is excluded from the plan *before a plan can even be
+generated* - `generate_plan_for_review` raises "no plannable work left"
+long before the executor is reached, making the executor's own
+`is_file()` check unreachable through the normal pipeline today.
+`test_execute_directory_source_is_excluded_at_plan_generation`,
+`test_execute_fifo_source_is_excluded_at_plan_generation`, and
+`test_execute_socket_source_is_excluded_at_plan_generation` assert the
+real, reachable rejection point directly. Because "unreachable today"
+is not the same as "provably correct on its own,"
+`test_execute_own_regular_file_check_independently_rejects_a_directory`
+uses `dataclasses.replace` to construct a doctored `PlanValidity` that
+forces `check_plan_validity`'s upstream verdict to say "still valid,"
+bypassing that layer specifically so the executor's own redundant
+`is_file()` check can be exercised and confirmed correct in genuine
+isolation - real defense-in-depth, not two checks that merely happen to
+agree because they share one primitive.
+
+**`'..'` traversal and a symlinked intermediate source directory -
+confirmed already defeated, no code change required**:
+`test_execute_dotdot_traversal_in_source_path_is_precondition_failed`
+and `test_execute_symlinked_intermediate_directory_escape_is_
+precondition_failed` prove the existing `resolve(strict=True)` +
+containment check (already part of the reviewed design) correctly
+rejects both, since resolving the full path both normalizes `..`
+segments and follows every symlink in the chain, not just a symlinked
+final component.
+
+**`EXDEV` on the real `os.rename()` call - confirmed to land in the
+existing generic failure bucket, no copy-fallback added**:
+`test_execute_exdev_on_rename_is_failed` mocks `os.rename` to raise
+`OSError(errno.EXDEV, ...)` and confirms it is recorded exactly like
+any other same-device rename failure: `FAILED`,
+`filesystem_mutation_occurred=False`, run stopped. No fallback to a
+copy-then-delete was added - the constructor's own same-device check
+between `allowed_root` and `quarantine_root` should make a legitimate
+`EXDEV` here unreachable in normal operation, but the handling exists
+for the case it somehow still fires (e.g. a destination-parent
+subdirectory unexpectedly on a different device).
+
+**New destination-parent device check**: after creating the per-
+execution quarantine subdirectory and before calling `os.rename()`, the
+executor now separately verifies the destination's *parent directory*
+is on the same device as the quarantine root (`_device_of(destination.
+parent) != self._quarantine_device`), refusing with `FAILED`/
+`PRECONDITION_FAILED` if not. This was previously only an assumption;
+it is now an explicit, tested check
+(`test_execute_destination_parent_wrong_device_is_failed`, via a mocked
+`_device_of`).
+
+**TOCTOU: explicitly not eliminated, and stated as a future gate before
+real-corpus use.** The class docstring now documents, in full: the
+exact window between the last `_observe_file` re-check and the
+`os.rename()` call; what an attacker could substitute into that window
+(a different file with the same name at the source path); why post-move
+verification prevents that substitution from ever being reported as a
+false `SUCCESS` (the verification re-hashes the *destination* against
+the *plan's expected hash*, so a substituted file with different
+content is caught and recorded `UNKNOWN`, never `SUCCESS`); the one
+residual case verification cannot catch - a substituted file with the
+identical hash and size to the original - which is accepted as
+out-of-scope for a same-content substitution; and an explicit statement
+that no advisory locking or file-descriptor pinning was implemented for
+this milestone, because the existing architecture does not yet require
+it and none of section 5's instructions asked for it - but that a
+stronger primitive (fd-pinning across the check-then-rename step, or an
+OS-level lock) is a **required gate before this executor may ever run
+against the real corpus**, not an optional future nicety.
+
+**Verify-failure semantics, restated as an explicit table** (unchanged
+behavior, now made non-ambiguous in the docstring):
+
+| Condition | Result | `filesystem_mutation_occurred` |
+|---|---|---|
+| Precondition failure (symlink, hard link, containment, wrong device, missing/changed source, etc.) | `FAILED` / `PRECONDITION_FAILED` | `False` |
+| Rename failure, including `EXDEV` | `FAILED` | `False` |
+| Post-move verification failure (hash/size mismatch, destination is a symlink, destination missing) | `UNKNOWN` | `None` |
+| Any other ambiguous filesystem outcome | `UNKNOWN` | `None` |
+| Successful, fully-verified rename | `SUCCESS` | `True` |
+| Any action after the run has stopped | `NOT_ATTEMPTED` | (unset) |
+
+A known mutation is never reported as `FAILED`/`mutation=False` - that
+combination is reserved exclusively for failures that occurred strictly
+*before* `os.rename()` was ever called.
+
+**No production exposure added**, exactly as scoped: no API execution
+endpoint, no UI execution control, no automatic execution, no default
+root discovery, no real-corpus execution, no permanent deletion, no
+`PURGE`, no quarantine implementation reachable outside this synthetic
+test boundary.
+
+**Tests**: 12 new tests in `test_dedup_executor_execution.py` (30 → 42),
+for a full-suite total of 529 (up from 517). Full suite run 3 times
+consecutively with zero flakiness (529 passed each time); the new
+concurrency test additionally run 5 times in isolation with zero
+flakiness. `aibrain_test`'s dedup-related tables confirmed empty after
+the final run.
+
+**Deliberately not built this milestone**: fd-pinning or advisory
+locking to close the TOCTOU window (explicitly deferred as a required
+gate, not implemented here); any API/UI exposure; any change to the
+quarantine-vs-permanent-delete semantics. **The real corpus was not
+read, mutated, or referenced by any code or test added in this
+milestone.**
+
 ## Provenance chain
 The schema already links every derived fact back toward a source file
 via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,

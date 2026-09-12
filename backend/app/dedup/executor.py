@@ -22,6 +22,7 @@ roots, is explicitly out of scope for this milestone.
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import select
@@ -62,6 +63,49 @@ class DedupFilesystemExecutor:
     only method that can mutate anything, and only ever within
     `allowed_root`, and only ever by moving a file into
     `quarantine_root`.
+
+    TOCTOU DECISION (explicit, re-affirmed after a hostile security
+    review - not silently assumed away): a race window exists between
+    this method's final source re-validation and the `os.rename()`
+    call that follows it. This window is MINIMIZED, not eliminated -
+    no file descriptor pinning, no advisory locking, is used, by
+    deliberate choice, because AI_Brain does not own the files it
+    quarantines and holding a lock on a file another process might
+    reasonably touch is not a burden this design accepts.
+
+    What that window can and cannot produce, traced precisely:
+    - The source can be deleted in the window: `os.rename()` then
+      raises `OSError` -> `FAILED`, `mutation=False`. Safe.
+    - The source can be replaced by a symlink: POSIX `rename()` moves
+      the symlink object itself (never follows it); the post-move
+      check's explicit `is_symlink()` test catches this ->
+      `UNKNOWN`, never `SUCCESS`.
+    - The source can be replaced by a DIFFERENT regular file: the
+      rename succeeds on whatever now occupies that path, but
+      post-move verification compares the DESTINATION's hash/size
+      against `plan_action.observed_content_hash`/`file_size` - the
+      original, plan-time expected values, not a value re-derived
+      from whatever got moved. A content-different substitution is
+      therefore always caught -> `UNKNOWN`, never `SUCCESS`.
+    - RESIDUAL, ACCEPTED CASE: a substituted file with an IDENTICAL
+      SHA-256 and byte size to the expected content would pass
+      verification and be recorded `SUCCESS`. This is not a
+      meaningful attack - the moved bytes are indistinguishable from
+      the intended ones, so nothing different from the intended
+      operation actually occurred. Closing even this residual would
+      require pinning the file by descriptor before any check begins,
+      which this milestone deliberately does not implement.
+
+    This is judged ACCEPTABLE for the current synthetic-filesystem-
+    only executor, which never runs against real personal data and is
+    not reachable from any API. It is explicitly NOT judged acceptable
+    to carry forward unexamined into a real-corpus-facing milestone -
+    whoever designs that milestone must either re-affirm this
+    reasoning in that new context or implement a stronger primitive
+    (e.g. `openat`-then-`fstat`-then-`renameat` against a held file
+    descriptor) before this executor is ever pointed at real data.
+    Treat that decision as a required, explicit gate, not something
+    this milestone's acceptance implicitly resolves.
     """
 
     def __init__(self, db: Session, allowed_root: Path, quarantine_root: Path):
@@ -69,6 +113,33 @@ class DedupFilesystemExecutor:
         self.execution_service = DedupExecutionService(db)
         self.authorization_service = DedupPlanAuthorizationService(db)
         self.plan_service = DedupExecutionPlanService(db)
+
+        # Fail-closed threat-model decision (see AI_Brain_Architecture.md
+        # "Filesystem Executor Design" for the full writeup): a root
+        # argument that is ITSELF a symlink is rejected outright, never
+        # silently resolved through. allowed_root/quarantine_root are
+        # trusted, explicit, caller-supplied configuration, not
+        # attacker-influenced input - but "trusted" is not the same as
+        # "verified," and resolving through a symlinked root would mean
+        # this class's own safety boundary is only as good as whatever
+        # that symlink currently points to, which nothing here would
+        # ever notice changing. This check MUST run on the raw,
+        # unresolved argument, before resolve() below, since resolve()
+        # would otherwise silently follow exactly the thing being
+        # rejected. Deliberately scoped to the root argument itself,
+        # not every ancestor directory above it - an ancestor symlink
+        # would require the caller's own environment to already be
+        # compromised at a level outside this class's threat model.
+        if Path(allowed_root).is_symlink():
+            raise ValueError(
+                f"allowed_root {allowed_root} must not be a symlink - pass the "
+                "real directory directly, not a link to it"
+            )
+        if Path(quarantine_root).is_symlink():
+            raise ValueError(
+                f"quarantine_root {quarantine_root} must not be a symlink - pass "
+                "the real directory directly, not a link to it"
+            )
 
         # Non-strict resolve() here: an existence/directory check comes
         # right after, and should surface as this class's own
@@ -150,16 +221,7 @@ class DedupFilesystemExecutor:
                 "filesystem mutations within the configured allowed_root"
             )
 
-        execution = self.execution_service.get_execution(execution_id)
-        if execution is None:
-            raise ValueError(f"Dedup execution {execution_id} not found")
-
-        if execution.status != DedupExecutionStatus.RUNNING:
-            raise ValueError(
-                f"Execution {execution_id} is not RUNNING "
-                f"(status={execution.status.value}) - only a freshly-started, "
-                "RUNNING execution can be executed"
-            )
+        execution = self._claim_execution(execution_id)
 
         existing_audits = self.execution_service.get_action_audits(execution_id)
         if existing_audits:
@@ -218,6 +280,78 @@ class DedupFilesystemExecutor:
 
         return self.execution_service.complete_execution(execution_id)
 
+    def _claim_execution(self, execution_id: int) -> DedupExecution:
+        """Acquire exclusive ownership of this execution before any
+        action is attempted - the concurrency-exclusivity mechanism
+        identified as missing by the security review preceding this
+        method's introduction.
+
+        Mechanism, deliberately explicit and database-level rather
+        than relying on process topology: `SELECT ... FOR UPDATE`
+        locks the `DedupExecution` row for the duration of this
+        method's own transaction. A concurrent caller's own `SELECT
+        ... FOR UPDATE` on the SAME row blocks - genuinely waits at
+        the database level - until this transaction commits or rolls
+        back, then re-reads the row's current state under its own
+        lock. While holding that lock, this method checks and sets
+        `claimed_at`: if it is already non-null, another caller won
+        the race and this one refuses cleanly; otherwise, this caller
+        sets it and commits, releasing the lock with the claim now
+        durably recorded. `claimed_at` is never cleared or reused - a
+        claimed execution stays claimed permanently, exactly like a
+        terminal execution stays terminal; a second genuine attempt
+        after a crash goes through `DedupExecutionService.
+        recover_stale_execution`, never a second claim on this row.
+
+        This is the ONLY thing standing between two concurrent
+        `execute()` calls on the same `execution_id` and both entering
+        the filesystem-mutation loop. Every failure path here raises a
+        plain `ValueError` - never a raw `IntegrityError`, and never an
+        uncaught exception from deeper in the call stack - because the
+        losing caller is turned away at this single, explicit
+        checkpoint before it can reach anything that would race for
+        real (an `os.rename()` call or an `INSERT` against the
+        `(execution_id, plan_action_id)` unique constraint).
+        """
+        execution = self.db.execute(
+            select(DedupExecution)
+            .where(DedupExecution.id == execution_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if execution is None:
+            self.db.rollback()
+            raise ValueError(f"Dedup execution {execution_id} not found")
+
+        if execution.status != DedupExecutionStatus.RUNNING:
+            status_value = execution.status.value
+            self.db.rollback()
+            raise ValueError(
+                f"Execution {execution_id} is not RUNNING "
+                f"(status={status_value}) - only a freshly-started, RUNNING "
+                "execution can be executed"
+            )
+
+        if execution.claimed_at is not None:
+            claimed_at = execution.claimed_at
+            self.db.rollback()
+            raise ValueError(
+                f"Execution {execution_id} has already been claimed by another "
+                f"executor invocation at {claimed_at.isoformat()} - exactly one "
+                "caller may own an execution; this one refuses rather than "
+                "risk a concurrent filesystem mutation"
+            )
+
+        execution.claimed_at = datetime.now(UTC)
+
+        try:
+            self.db.commit()
+            self.db.refresh(execution)
+            return execution
+        except Exception:
+            self.db.rollback()
+            raise
+
     def _attempt_action(
         self, execution: DedupExecution, plan_action: DedupExecutionPlanAction
     ) -> _ActionOutcome:
@@ -228,6 +362,22 @@ class DedupFilesystemExecutor:
         failure genuinely outside its own anticipated control flow,
         handled by `execute`'s own safety net.
         """
+        # Authorization-freshness mechanism, made EXPLICIT rather than
+        # left dependent on SQLAlchemy's expire_on_commit default (as
+        # the security review flagged): every read below this line
+        # must reflect the database's current state, not whatever this
+        # Session happened to cache from an earlier query. expire_all()
+        # marks every object in the identity map as needing a reload,
+        # forcing the very next attribute access on `authorization`,
+        # `plan`, or any `Document` row (inside check_currency /
+        # check_plan_validity) to issue a fresh SELECT - regardless of
+        # this Session's expire_on_commit setting, and regardless of
+        # whether a commit happened since the last read. This is what
+        # actually guarantees "does not trust a previous action's
+        # validation," not an incidental side effect of some other
+        # method's commit elsewhere.
+        self.db.expire_all()
+
         plan = self.plan_service.get_plan(execution.plan_id)
         if plan is None or plan_action.document_id == plan.canonical_document_id:
             # Should be structurally impossible (a plan action is
@@ -365,6 +515,27 @@ class DedupFilesystemExecutor:
                 result=DedupExecutionActionResult.FAILED,
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
+
+        # Defense in depth, identified by the security review: the
+        # constructor's device check compares allowed_root/quarantine_root
+        # ONCE, and step 12 above compares the SOURCE's device against
+        # that same recorded quarantine_device - but neither had
+        # independently confirmed that THIS SPECIFIC destination's
+        # parent directory (freshly created just above) actually landed
+        # on that same device. In ordinary operation it always does,
+        # since destination.parent is always a subdirectory of
+        # quarantine_root created moments ago in this same call - this
+        # check exists purely to catch an exotic mismatch (e.g. an
+        # unusual filesystem boundary inside quarantine_root itself)
+        # rather than assume the ordinary case always holds.
+        if _device_of(destination.parent) != self._quarantine_device:
+            return self._refuse(
+                execution.id,
+                plan_action.id,
+                f"quarantine destination parent {destination.parent} is not on "
+                "the expected quarantine filesystem device",
+                result=DedupExecutionActionResult.FAILED,
+            )
 
         # Step 14: perform exactly one atomic same-filesystem rename.
         try:

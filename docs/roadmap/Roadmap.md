@@ -703,6 +703,73 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       configured production root, permanent deletion, resumption of a
       partially-run `execute()` call, `DedupExecutionActionReconciliation`
       (still deferred), and any frontend.
+- [x] Hostile security review of the executor (no code changes) —
+      adversarial, line-by-line audit of `executor.py` and its tests
+      covering mutation surface, path security, symlink/hard-link
+      safety, TOCTOU, same-filesystem guarantees, authorization
+      revalidation, concurrency, audit correctness, crash windows,
+      post-move verification, failure semantics, directory/special-file
+      safety, quarantine destination, real-corpus safety, DB/filesystem
+      atomicity, and test coverage. Delivered as a report only — zero
+      lines of `executor.py` or its tests changed by the review itself.
+- [x] Executor hardening: concurrency, freshness, symlink roots,
+      destination-device check — closes the review's findings one at a
+      time, no unrelated behavior changed. **Concurrency**: new
+      `DedupExecution.claimed_at` column (migration `02467162321c`) set
+      once under `SELECT ... FOR UPDATE` on the execution row via a new
+      `_claim_execution` method — Postgres blocks a second concurrent
+      `FOR UPDATE` on the same row until the first transaction commits
+      or rolls back, so two callers for one `execution_id` can never
+      both enter the action loop; the second caller gets a clean,
+      deliberate `ValueError`, never a raw `IntegrityError` or an
+      uncaught exception from `complete_execution`. Proven under real
+      contention, not just reasoned about:
+      `test_concurrent_execute_calls_only_one_claims_and_mutates` drives
+      two real threads against two separate database sessions on real
+      Postgres via a `threading.Barrier`, run 5× in isolation plus in
+      every full-suite run with zero flakiness. **Authorization
+      freshness**: `_attempt_action` now opens with an explicit
+      `self.db.expire_all()` rather than silently depending on
+      SQLAlchemy's `expire_on_commit=True` default; proven independent
+      of that default by a regression test that deliberately opens the
+      executor's session with `expire_on_commit=False` and confirms an
+      authorization revoked from another session mid-run is still
+      observed. **Symlinked roots**: `allowed_root`/`quarantine_root`
+      are now rejected outright if either is itself a symlink (checked
+      before `resolve()`, which would otherwise follow it silently) —
+      a documented fail-closed decision, not a silent behavior change,
+      since a symlinked root has nothing above it to contain it against
+      the way an intermediate path component inside a plan action does.
+      **Destination-parent device check**: a new explicit check before
+      `os.rename()` verifies the destination's parent directory is
+      genuinely on the quarantine device, previously only assumed.
+      **Confirmed, not changed**: directory/FIFO/socket sources are
+      excluded two layers above the executor (at plan generation, via
+      the shared `_observe_file`/`is_file()` primitive) — proven by
+      tracing the real code path, with a separate mocked test proving
+      the executor's own redundant `is_file()` check is independently
+      correct rather than merely agreeing by construction; `'..'`
+      traversal and a symlinked intermediate source directory were
+      already defeated by the existing resolve-then-contain check; a
+      real `os.rename()` `EXDEV` falls into the existing generic
+      same-device-failure bucket, no copy-fallback added. **TOCTOU**:
+      explicitly *not* eliminated this milestone — the exact
+      check-to-rename race window, the one residual case post-move
+      verification cannot catch (a same-hash/same-size substitution),
+      and the decision not to implement fd-pinning or advisory locking
+      here are all documented directly in the executor's class
+      docstring, with fd-pinning/locking stated as a **required gate
+      before any real-corpus use**, not an optional future nicety.
+      12 new tests (30 → 42 in the executor's own file; 517 → 529 full
+      suite), full suite run 3× consecutively with zero flakiness.
+      `aibrain_test`'s dedup tables confirmed empty after the final run
+      (a batch of stray rows from this milestone's own earlier, since-
+      fixed test-writing iterations was found and purged — never
+      produced by a passing test, only by draft attempts along the
+      way). **No API/UI exposure, no automatic execution, no default
+      root discovery, no real-corpus execution, and no permanent
+      deletion were added** — the real corpus was not read, mutated, or
+      referenced by any code or test in this milestone.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
