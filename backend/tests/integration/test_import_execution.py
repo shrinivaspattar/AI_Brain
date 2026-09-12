@@ -55,6 +55,34 @@ def _ollama_reachable() -> bool:
         return False
 
 
+def _cleanup_import_job(db: Session, job_id: int) -> None:
+    """Delete an import job and everything it created in aibrain_test.
+
+    aibrain_test has no per-test transaction isolation - rows accumulate
+    across runs unless a test cleans up after itself. Left unfixed, a
+    test's own documents/chunks stick around forever and can pollute any
+    later query that scans the whole table (e.g. dedup's near-duplicate
+    search silently losing its own pair past a result `limit` once
+    enough near-identical accumulated chunks outrank it by distance -
+    this actually happened, from these very tests' repeated content
+    producing repeated deterministic embeddings run after run).
+    """
+    document_ids = list(
+        db.scalars(select(Document.id).where(Document.import_job_id == job_id))
+    )
+    if document_ids:
+        db.query(DocumentChunk).filter(
+            DocumentChunk.document_id.in_(document_ids)
+        ).delete(synchronize_session=False)
+    db.query(Document).filter(Document.import_job_id == job_id).delete(
+        synchronize_session=False
+    )
+    db.query(ImportJob).filter(ImportJob.id == job_id).delete(
+        synchronize_session=False
+    )
+    db.commit()
+
+
 def test_import_job_executes_against_test_database(
     tmp_path: Path,
 ) -> None:
@@ -85,50 +113,55 @@ def test_import_job_executes_against_test_database(
             embedding_client=fake_embedding_client(),
         )
 
-        result = service.execute_job(job.id)
+        try:
+            result = service.execute_job(job.id)
 
-        assert result.status == ImportStatus.COMPLETED
-        assert result.progress == 100
-        assert result.files_discovered == 2
-        assert result.files_processed == 2
+            assert result.status == ImportStatus.COMPLETED
+            assert result.progress == 100
+            assert result.files_discovered == 2
+            assert result.files_processed == 2
 
-        documents = list(
-            db.scalars(
-                select(Document).where(
-                    Document.source.in_(
-                        [
-                            str(source / "notes.txt"),
-                            str(source / "readme.md"),
-                        ]
+            documents = list(
+                db.scalars(
+                    select(Document).where(
+                        Document.source.in_(
+                            [
+                                str(source / "notes.txt"),
+                                str(source / "readme.md"),
+                            ]
+                        )
                     )
                 )
             )
-        )
 
-        assert len(documents) == 2
+            assert len(documents) == 2
 
-        assert {document.title for document in documents} == {
-            "notes.txt",
-            "readme.md",
-        }
+            assert {document.title for document in documents} == {
+                "notes.txt",
+                "readme.md",
+            }
 
-        assert {document.import_job_id for document in documents} == {job.id}
+            assert {document.import_job_id for document in documents} == {job.id}
 
-        chunks = list(
-            db.scalars(
-                select(DocumentChunk).where(
-                    DocumentChunk.document_id.in_(
-                        [document.id for document in documents]
+            chunks = list(
+                db.scalars(
+                    select(DocumentChunk).where(
+                        DocumentChunk.document_id.in_(
+                            [document.id for document in documents]
+                        )
                     )
                 )
             )
-        )
 
-        assert len(chunks) == 2
-        assert all(chunk.embedding is not None for chunk in chunks)
-        assert all(
-            len(chunk.embedding) == settings.EMBEDDING_DIMENSIONS for chunk in chunks
-        )
+            assert len(chunks) == 2
+            assert all(chunk.embedding is not None for chunk in chunks)
+            assert all(
+                len(chunk.embedding) == settings.EMBEDDING_DIMENSIONS
+                for chunk in chunks
+            )
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_import_job_executes_zip_against_test_database(
@@ -165,22 +198,28 @@ def test_import_job_executes_zip_against_test_database(
             embedding_client=fake_embedding_client(),
         )
 
-        result = service.execute_job(job.id)
+        try:
+            result = service.execute_job(job.id)
 
-        assert result.status == ImportStatus.COMPLETED
-        assert result.progress == 100
-        assert result.files_discovered == 3
-        assert result.files_processed == 3
+            assert result.status == ImportStatus.COMPLETED
+            assert result.progress == 100
+            assert result.files_discovered == 3
+            assert result.files_processed == 3
 
-        documents = list(
-            db.scalars(select(Document).where(Document.source.like(f"%{job.id}%")))
-        )
+            documents = list(
+                db.scalars(
+                    select(Document).where(Document.source.like(f"%{job.id}%"))
+                )
+            )
 
-        assert len(documents) == 2
-        assert {document.title for document in documents} == {
-            "notes.txt",
-            "readme.md",
-        }
+            assert len(documents) == 2
+            assert {document.title for document in documents} == {
+                "notes.txt",
+                "readme.md",
+            }
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_import_job_fails_when_source_is_missing(
@@ -209,18 +248,22 @@ def test_import_job_fails_when_source_is_missing(
         )
 
         try:
-            service.execute_job(job.id)
-        except FileNotFoundError:
-            pass
-        else:
-            raise AssertionError("Expected FileNotFoundError")
+            try:
+                service.execute_job(job.id)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("Expected FileNotFoundError")
 
-        db.refresh(job)
+            db.refresh(job)
 
-        assert job.status == ImportStatus.FAILED
-        assert job.error_message
-        assert job.finished_at is not None
-        assert job.started_at is not None
+            assert job.status == ImportStatus.FAILED
+            assert job.error_message
+            assert job.finished_at is not None
+            assert job.started_at is not None
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_import_job_completes_when_source_is_empty(
@@ -249,15 +292,19 @@ def test_import_job_completes_when_source_is_empty(
             embedding_client=fake_embedding_client(),
         )
 
-        result = service.execute_job(job.id)
+        try:
+            result = service.execute_job(job.id)
 
-        assert result.status == ImportStatus.COMPLETED
-        assert result.progress == 100
-        assert result.files_discovered == 0
-        assert result.files_processed == 0
-        assert result.started_at is not None
-        assert result.finished_at is not None
-        assert result.error_message is None
+            assert result.status == ImportStatus.COMPLETED
+            assert result.progress == 100
+            assert result.files_discovered == 0
+            assert result.files_processed == 0
+            assert result.started_at is not None
+            assert result.finished_at is not None
+            assert result.error_message is None
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_import_job_records_successful_lifecycle(
@@ -287,12 +334,16 @@ def test_import_job_records_successful_lifecycle(
             embedding_client=fake_embedding_client(),
         )
 
-        result = service.execute_job(job.id)
+        try:
+            result = service.execute_job(job.id)
 
-        assert result.status == ImportStatus.COMPLETED
-        assert result.started_at is not None
-        assert result.finished_at is not None
-        assert result.started_at <= result.finished_at
+            assert result.status == ImportStatus.COMPLETED
+            assert result.started_at is not None
+            assert result.finished_at is not None
+            assert result.started_at <= result.finished_at
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_import_job_records_failed_lifecycle(
@@ -321,19 +372,23 @@ def test_import_job_records_failed_lifecycle(
         )
 
         try:
-            service.execute_job(job.id)
-        except FileNotFoundError:
-            pass
-        else:
-            raise AssertionError("Expected FileNotFoundError")
+            try:
+                service.execute_job(job.id)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("Expected FileNotFoundError")
 
-        db.refresh(job)
+            db.refresh(job)
 
-        assert job.status == ImportStatus.FAILED
-        assert job.started_at is not None
-        assert job.finished_at is not None
-        assert job.started_at <= job.finished_at
-        assert job.error_message
+            assert job.status == ImportStatus.FAILED
+            assert job.started_at is not None
+            assert job.finished_at is not None
+            assert job.started_at <= job.finished_at
+            assert job.error_message
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_completed_import_job_cannot_be_executed_again(
@@ -363,18 +418,22 @@ def test_completed_import_job_cannot_be_executed_again(
             embedding_client=fake_embedding_client(),
         )
 
-        result = service.execute_job(job.id)
-
-        assert result.status == ImportStatus.COMPLETED
-
         try:
-            service.execute_job(job.id)
-        except ValueError as exc:
-            assert str(exc) == f"Import job {job.id} cannot be executed"
-        else:
-            raise AssertionError(
-                "Expected completed import job execution to be rejected"
-            )
+            result = service.execute_job(job.id)
+
+            assert result.status == ImportStatus.COMPLETED
+
+            try:
+                service.execute_job(job.id)
+            except ValueError as exc:
+                assert str(exc) == f"Import job {job.id} cannot be executed"
+            else:
+                raise AssertionError(
+                    "Expected completed import job execution to be rejected"
+                )
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 def test_import_job_embeds_docx_source(
@@ -410,26 +469,30 @@ def test_import_job_embeds_docx_source(
             embedding_client=fake_embedding_client(),
         )
 
-        result = service.execute_job(job.id)
+        try:
+            result = service.execute_job(job.id)
 
-        assert result.status == ImportStatus.COMPLETED
+            assert result.status == ImportStatus.COMPLETED
 
-        created_document = db.scalars(
-            select(Document).where(
-                Document.source == str(source / "report.docx")
-            )
-        ).one()
+            created_document = db.scalars(
+                select(Document).where(
+                    Document.source == str(source / "report.docx")
+                )
+            ).one()
 
-        chunks = list(
-            db.scalars(
-                select(DocumentChunk).where(
-                    DocumentChunk.document_id == created_document.id
+            chunks = list(
+                db.scalars(
+                    select(DocumentChunk).where(
+                        DocumentChunk.document_id == created_document.id
+                    )
                 )
             )
-        )
 
-        assert len(chunks) == 1
-        assert chunks[0].content == "First paragraph.\nSecond paragraph."
+            assert len(chunks) == 1
+            assert chunks[0].content == "First paragraph.\nSecond paragraph."
+
+        finally:
+            _cleanup_import_job(db, job.id)
 
 
 @pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not running locally")
@@ -459,21 +522,25 @@ def test_import_job_execution_embeds_documents_via_real_ollama(
             ingestion_dir=tmp_path / "imports",
         )
 
-        result = service.execute_job(job.id)
+        try:
+            result = service.execute_job(job.id)
 
-        assert result.status == ImportStatus.COMPLETED
+            assert result.status == ImportStatus.COMPLETED
 
-        document = db.scalars(
-            select(Document).where(Document.source == str(source / "notes.txt"))
-        ).one()
+            document = db.scalars(
+                select(Document).where(Document.source == str(source / "notes.txt"))
+            ).one()
 
-        chunks = list(
-            db.scalars(
-                select(DocumentChunk).where(
-                    DocumentChunk.document_id == document.id
+            chunks = list(
+                db.scalars(
+                    select(DocumentChunk).where(
+                        DocumentChunk.document_id == document.id
+                    )
                 )
             )
-        )
 
-        assert len(chunks) == 1
-        assert len(chunks[0].embedding) == settings.EMBEDDING_DIMENSIONS
+            assert len(chunks) == 1
+            assert len(chunks[0].embedding) == settings.EMBEDDING_DIMENSIONS
+
+        finally:
+            _cleanup_import_job(db, job.id)

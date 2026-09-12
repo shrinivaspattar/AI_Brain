@@ -138,11 +138,37 @@ for the current module-by-module status this roadmap tracks against.
 ## Phase 5 — Repository health & knowledge management (KRM, started)
 Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
 `docs/architecture/KRM_Architecture.md` (currently empty). Must-have items:
-- [ ] Provenance chain (every derived fact traceable to a source file) —
-      largely already true in practice (`Document.import_job_id`,
-      `DocumentChunk.document_id`, `Message.conversation_id`,
-      `ToolCallRecord`/`Memory` → `message_id` all link back to source),
-      but never formalized/documented as one coherent "chain" end to end.
+- [x] Provenance chain (every derived fact traceable to a source file) —
+      formalized as an actual queryable trace, not just documented FKs:
+      `ProvenanceService.trace_document` (`app/provenance/service.py`)
+      walks `ImportJob` → `Document` (`import_job_id`) → `DocumentChunk`
+      (count) → every `Message` whose denormalized `citations` names the
+      document, exposed via `GET /documents/{id}/provenance`. Verified
+      end-to-end against the real database and the real model: ingested
+      a real file, confirmed the trace showed its import job and one
+      chunk with an empty citation list, asked the model a question it
+      answered by citing that document, then confirmed the same trace
+      now included the real message/conversation that cited it.
+      Scoped to `Document` as the trace root (the one entity everything
+      else ultimately derives from); doesn't yet expose a symmetric
+      trace starting from a `Memory` or `ToolCallRecord`, though both
+      already carry the FKs (`conversation_id`/`message_id`) needed to
+      walk in that direction if a future consumer needs it.
+      Writing the real-DB test for this surfaced two unrelated bugs,
+      both fixed in the same milestone: (1) a JSONB column storing
+      Python `None` round-trips as a JSON `null`, not a SQL `NULL`, so
+      `Message.citations.is_not(None)` doesn't reliably filter out
+      citation-less messages - the service now re-checks in Python
+      instead of trusting the query; (2) most integration tests in
+      `test_import_execution.py` had never cleaned up after themselves
+      against `aibrain_test` (only one, added for the dedup milestone,
+      did) - across many suite runs this session they'd piled up 160
+      import jobs' worth of documents/chunks with repeated deterministic
+      embeddings, which pushed a real pair out of dedup's near-duplicate
+      query past its result `limit` and made that test fail
+      deterministically. All eight now clean up via a shared
+      `_cleanup_import_job` helper; the accumulated pollution was
+      deleted once and the full suite reran clean 5x in a row.
 - [x] Perceptual deduplication — **detection only**, started:
       `DeduplicationService` (`app/dedup/service.py`) finds exact
       duplicates (`Document.content_hash`, SHA-256) and near-duplicate

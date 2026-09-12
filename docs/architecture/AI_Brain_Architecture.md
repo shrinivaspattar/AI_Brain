@@ -56,6 +56,11 @@ master backup / source files (read-only)
    Copy Arbitration over exact-duplicate groups (keep oldest, propose
    deleting the rest); returns a plan only, never deletes anything
    [implemented]
+        │
+        ▼
+   provenance trace (app/provenance, GET /documents/{id}/provenance) —
+   walks ImportJob → Document → DocumentChunk → citing Message(s), read
+   only   [implemented]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -73,6 +78,7 @@ master backup / source files (read-only)
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store + `status` (pending/approved/rejected), no type taxonomy. `POST /memory`, `GET /memory?status=`, `POST /memory/{id}/approve`\|`/reject`, `DELETE /memory/{id}`. Review-gated write hook (`remember` tool) + read hook (approved-only) into `ChatService` — see Memory, below. |
 | `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
 | `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
+| `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -298,6 +304,55 @@ anywhere that can actually delete a file, so "dry run" here means
 "compute and return a plan," not "simulate an execution that could
 otherwise happen." Executing a plan is a separate, deliberately
 unbuilt milestone.
+
+## Provenance chain
+The schema already links every derived fact back toward a source file
+via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,
+`Message.conversation_id`, `ToolCallRecord`/`Memory` → `message_id` - but
+until now that chain was only ever implicit, never something you could
+actually ask the system to walk. `ProvenanceService.trace_document`
+(`app/provenance/service.py`) formalizes it as one read-only query:
+
+- `import_job`: the `ImportJob` a `Document` came from, via
+  `import_job_id` (`None` for documents created directly via
+  `POST /documents`, which never had one).
+- `chunk_count`: how many `DocumentChunk` rows exist for the document.
+- `cited_in`: every `Message` whose denormalized `citations` (see Chat,
+  above) names this document - i.e. every reply the model has actually
+  given that was grounded in it.
+
+Exposed via `GET /documents/{id}/provenance` (404 if the document
+doesn't exist). Scoped to `Document` as the trace root, since it's the
+one entity everything else ultimately derives from; there's no symmetric
+`GET /memory/{id}/provenance` or similar yet, though `Memory` and
+`ToolCallRecord` already carry the `conversation_id`/`message_id` FKs
+a trace in that direction would need.
+
+Two real bugs surfaced while building and testing this against the real
+database (mocked unit tests never exercise either, since they hand-craft
+objects and skip the actual Postgres round-trip):
+- A JSONB column storing Python `None` serializes to a JSON `null`, not
+  a SQL `NULL` - so `Message.citations.is_not(None)` at the query level
+  doesn't reliably exclude citation-less messages. The service treats
+  that filter as a best-effort pre-filter only and re-checks
+  `message.citations` truthiness in Python before scanning it.
+- Most of `tests/integration/test_import_execution.py`'s tests had never
+  cleaned up after themselves against `aibrain_test` (only the one added
+  for the dedup milestone did). Across many suite runs this session that
+  silently piled up 160 import jobs' worth of documents and chunks with
+  repeated, deterministic embeddings (same input text → same fake
+  embedding), which pushed a real test pair out of dedup's near-duplicate
+  query past its result `limit` and made that test fail deterministically
+  - not the flaky, occasional kind of failure, but every single run,
+  until the pollution was cleaned up and the tests fixed. All eight
+  tests in that file now clean up via a shared `_cleanup_import_job`
+  helper.
+
+Verified end-to-end: ingested a real file via the real import pipeline,
+confirmed the trace showed its import job and one chunk with an empty
+citation list, asked the real model a question it could only answer by
+citing that document, and confirmed the same trace then included the
+real message and conversation that cited it.
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
