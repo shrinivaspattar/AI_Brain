@@ -224,9 +224,34 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       code path anywhere that deletes, moves, or modifies a file).
 - [x] Confidence review queue — substantially covered for memory
       specifically (`Memory.status: pending/approved/rejected`,
-      `POST /memory/{id}/approve`/`/reject`, Phase 3); not yet a
-      general-purpose mechanism other subsystems (e.g. dedup arbitration)
-      could reuse.
+      `POST /memory/{id}/approve`/`/reject`, Phase 3); now also covered
+      for dedup — see below — via the same status-enum pattern, not a
+      shared/generic mechanism between the two (each has its own model).
+- [x] Human-review decision model for dedup, designed and built (no
+      frontend/API yet — see Architecture's "Dedup review decision
+      model" for the full design): `DuplicateReview` +
+      `DuplicateReviewMember` (migration `a7ad86ac80d3`),
+      `DedupReviewService` (`app/dedup/review_service.py`). This is the
+      DECISION stage inserted between existing DETECTION
+      (`DeduplicationService`, stateless) and the still-nonexistent
+      EXECUTION stage: `create_review_from_exact_group`/
+      `create_review_from_near_pair` persist a detected finding as a
+      reviewable record (evidence snapshot, confidence, a human-readable
+      recommendation reason, PENDING status); `approve_review`/
+      `reject_review` record a human decision. Neither creating nor
+      reviewing a record touches a file, a `Document` row, or an
+      `ImportJob` row — confirmed via real-database tests. Exact
+      reviews get a proposed canonical (the existing, safe "oldest
+      ingested" heuristic); near-duplicate reviews **always** propose no
+      canonical at all — similarity is evidence that two documents are
+      related, not evidence of which one is better, so the ambiguous
+      case is a first-class, structurally-guaranteed outcome rather than
+      a fallback. 18 new tests (unit + real-database), covering exact,
+      near/ambiguous, already-reviewed, invalid-id, provenance
+      preservation, and conflicting sequential review calls. Deliberately
+      **not** built this milestone: any API endpoint, any frontend, and
+      any execution mechanism — this was a design-and-model-only
+      milestone, stopped for review before proceeding.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
@@ -340,7 +365,9 @@ machine.
       itself permits it; documented and tested (both service- and
       HTTP-level), not fixed, since nothing in this milestone's scope
       needed it changed.
-- [ ] Dedup review — not started; its own later frontend slice.
+- [ ] Dedup review — frontend/API not started; its own later slice, now
+      unblocked by the KRM `DuplicateReview` decision model above (see
+      Phase 5).
 - [ ] No conversation list/switcher yet — only ever one active
       conversation per browser (`localStorage`), matching the
       chat-only scope of the original slice.

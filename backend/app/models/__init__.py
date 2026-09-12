@@ -1,4 +1,5 @@
 from app.models.conversation import Conversation
+from app.models.dedup_review import DuplicateReview, DuplicateReviewMember
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.import_job import ImportJob
@@ -10,6 +11,8 @@ __all__ = [
     "Conversation",
     "Document",
     "DocumentChunk",
+    "DuplicateReview",
+    "DuplicateReviewMember",
     "ImportJob",
     "Memory",
     "Message",

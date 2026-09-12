@@ -74,7 +74,7 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist, and computes `Document.content_hash` (SHA-256, streamed) for exact-duplicate detection; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
 | `services/` | Implemented | `DocumentService` (persistence, `list_documents`), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection, tool-calling loop). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory, tools, dedup. |
 | `db/` | Implemented | Session/engine setup, health checks. |
@@ -84,7 +84,7 @@ master backup / source files (read-only)
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store + `status` (pending/approved/rejected), no type taxonomy. `POST /memory`, `GET /memory?status=`, `POST /memory/{id}/approve`\|`/reject`, `DELETE /memory/{id}`. Review-gated write hook (`remember` tool) + read hook (approved-only) into `ChatService` — see Memory, below. |
 | `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup`, `read_file_content` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No write/move/delete or external-network tools exist. |
 | `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
-| `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
+| `dedup/` | Implemented (detection + dry-run plan); review model implemented, not yet exposed via API | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. `review_service.DedupReviewService`: persists a detected finding as a `DuplicateReview` (see Deduplication, below, for the full design) and records human approve/reject decisions — no API endpoint yet. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
 | `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor + memory review) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Three views toggled client-side: Chat, Import Jobs (read-only, polls `GET /import-jobs`), and Memory Review (human approve/reject queue over `GET /memory?status=`). |
 
@@ -355,6 +355,114 @@ anywhere that can actually delete a file, so "dry run" here means
 "compute and return a plan," not "simulate an execution that could
 otherwise happen." Executing a plan is a separate, deliberately
 unbuilt milestone.
+
+### Dedup review decision model
+
+A design-and-model milestone, stopped deliberately before any API or
+frontend work: KRM deduplication is split into three explicitly
+separate stages, and until now only the first existed as anything more
+than an in-memory computation.
+
+```
+Detection            DeduplicationService.find_exact_duplicates /
+                      find_near_duplicate_documents - stateless,
+                      re-run on demand, persists nothing.
+     │
+     ▼
+Decision              DuplicateReview + DuplicateReviewMember
+(this milestone)      (app/models/dedup_review.py, migration
+                      a7ad86ac80d3) + DedupReviewService
+                      (app/dedup/review_service.py) - persisted,
+                      human-reviewable findings. PENDING by default.
+     │
+     ▼
+Execution             Does not exist. No code path anywhere in
+(not built)           AI_Brain deletes, moves, quarantines, or
+                      renames a file. Approving a review has zero
+                      effect beyond the review row itself.
+```
+
+**Why a new persisted model, not an extension of the existing dry-run
+plan**: `plan_exact_duplicate_cleanup` is recomputed fresh on every
+call and never persists anything - there is no way to review a
+*specific* finding over time, record who decided what, or leave a
+paper trail. This mirrors exactly the gap Memory's `status` field
+closed for model-proposed facts (Phase 3); `DuplicateReview` is the
+same review-gate pattern applied to dedup findings, per KRM's own
+long-standing "Confidence Review Queue" backlog item.
+
+**What evidence actually exists to build this on** (inspected before
+designing anything): `Document` stores `content_hash` (SHA-256),
+`title`, `source` (full path), `source_type`, `import_job_id`, and
+`created_at`/`updated_at` - the *ingestion* timestamp, not the file's
+real filesystem mtime, which is never captured anywhere in the
+ingestion pipeline. There is no file-size column, no filesystem
+mtime/ctime, no version/revision metadata, and no image perceptual
+hash - none of that data exists in this codebase today, so none of it
+is used as evidence. `DocumentChunk` stores per-chunk text and a
+pgvector embedding, which is what backs the near-duplicate similarity
+score. No `_DUPLICATES_QUARANTINE` convention, quarantine directory,
+or quarantine flag exists anywhere in the codebase - dedup findings
+have never had anywhere to go but a computed API response, until now.
+
+**`DuplicateReview`** (`duplicate_reviews` table):
+`match_type` (`exact`/`near`), `content_hash` (exact only),
+`similarity` (near only, 0-1), `confidence` (0-1 - confidence this
+finding **is** a genuine match, not confidence in a canonical choice),
+`recommendation_reason` (human-readable, always populated),
+`evidence` (JSONB - a point-in-time snapshot of each member's
+title/source/source_type/content_hash/import_job_id/created_at, plus
+the arbitration rule or lack thereof; snapshotted like
+`Message.citations` so a review still explains itself even if a member
+`Document` is later changed), `status` (`pending`/`approved`/
+`rejected`, mirroring `MemoryStatus`), `reviewer_decision` (optional
+free-text human note, distinct from the system's own
+`recommendation_reason`), `reviewed_at`, timestamps.
+
+**`DuplicateReviewMember`** (`duplicate_review_members`): a child table
+rather than fixed `document_a_id`/`document_b_id` columns, because an
+exact-duplicate group is genuinely N-way (`find_exact_duplicates`
+already supports more than two documents sharing a hash) - fixed
+columns would silently truncate a real 3+-way group to a pair. Each row
+is one `Document`'s `role` in a finding: `proposed_canonical` (0 or 1
+per review) or `duplicate` (1 or more).
+
+**The ambiguous-candidate guarantee**: `DedupReviewService.
+create_review_from_exact_group` proposes a canonical using the same
+safe, deterministic rule as `plan_exact_duplicate_cleanup` (oldest
+`created_at`, tie-broken by `id`) - safe because byte-equality already
+proves the match; only the *choice of which byte-identical copy to
+keep* is a heuristic, always presented as an overridable proposal.
+`create_review_from_near_pair` **never** creates a `proposed_canonical`
+member, structurally, not as a fallback - similarity is evidence these
+documents are related, not evidence of which one is more complete,
+correct, or current, and guessing from recency/size/ingestion-order
+would be exactly the unsafe assumption this design exists to avoid. A
+near-duplicate review with no proposed canonical is not a missing
+recommendation; it **is** the recommendation - "a human needs to look
+at this."
+
+**Review decisions are permissive, matching `MemoryService`**:
+`approve_review`/`reject_review` place no guard on a review's current
+`status` - either can be called from any state, and the last call wins
+(no optimistic-locking/version column, same as `Memory`). Nothing
+before this needed a stricter rule, and the same future frontend
+constraint applies as for Memory: action buttons would only ever be
+shown for a `pending` review, so this path isn't reachable through a
+UI even though the service permits it.
+
+**Safety, verified against real Postgres, not just asserted**: creating
+a review and approving/rejecting one were both confirmed, via direct
+query immediately after, to leave every referenced `Document` and
+`ImportJob` row completely unmodified - content_hash, status, all
+fields byte-for-byte unchanged. No filesystem operation of any kind
+runs anywhere in `DedupReviewService`.
+
+**Deliberately not built this milestone**: any API endpoint (`app/api/`
+has no new router), any frontend view, and - as with the exact-only
+dry-run plan before it - any execution mechanism. This was a design
+checkpoint: the model and service exist and are tested, but nothing
+exposes them to a client yet, pending review of the design itself.
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file
