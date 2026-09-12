@@ -19,6 +19,7 @@ def test_build_default_registry_registers_expected_tools() -> None:
         "remember",
         "find_duplicate_documents",
         "plan_duplicate_cleanup",
+        "read_file_content",
     }
 
 
@@ -228,6 +229,43 @@ def test_plan_duplicate_cleanup_reports_none_found() -> None:
     result = registry.call("plan_duplicate_cleanup", {})
 
     assert result.content == "No exact duplicates to clean up."
+
+
+def test_read_file_content_returns_file_access_service_result() -> None:
+    db = MagicMock()
+
+    with patch("app.tools.builtin.FileAccessService") as file_access_service_class:
+        file_access_service_class.return_value.read_file.return_value = (
+            "the file's content"
+        )
+
+        registry = build_default_registry(db)
+
+    result = registry.call("read_file_content", {"path": "/imports/notes.txt"})
+
+    file_access_service_class.return_value.read_file.assert_called_once_with(
+        "/imports/notes.txt"
+    )
+    assert result.content == "the file's content"
+    assert result.is_error is False
+
+
+def test_read_file_content_surfaces_access_errors_as_tool_errors() -> None:
+    db = MagicMock()
+
+    with patch("app.tools.builtin.FileAccessService") as file_access_service_class:
+        from app.files.service import FileAccessError
+
+        file_access_service_class.return_value.read_file.side_effect = (
+            FileAccessError("Refusing to read '/etc/passwd': not inside any allowed root")
+        )
+
+        registry = build_default_registry(db)
+
+    result = registry.call("read_file_content", {"path": "/etc/passwd"})
+
+    assert result.is_error is True
+    assert "not inside any allowed root" in result.content
 
 
 def test_remember_proposes_a_pending_memory() -> None:

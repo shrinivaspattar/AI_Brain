@@ -6,6 +6,7 @@ from typing import Callable
 from sqlalchemy.orm import Session
 
 from app.dedup.service import DeduplicationService
+from app.files.service import FileAccessService
 from app.memory.service import MemoryService
 from app.rag.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService
@@ -21,10 +22,12 @@ def build_default_registry(
 
     Deliberately read-only over the user's data, with one narrow
     exception: `remember`, which proposes a memory but never writes it
-    live (see below) - no filesystem access, no network calls beyond the
-    local Ollama instance already used for chat/embeddings. Broader tools
-    (file operations, external APIs) are a separate, explicit decision -
-    not something to bundle in by default.
+    live (see below). `read_file_content` is the one tool with real
+    filesystem access, and it is also read-only, scoped to directories
+    already ingested via a completed import job (see
+    `app.files.service.FileAccessService`) - no write, move, or delete
+    capability exists anywhere in this registry, and no network calls
+    beyond the local Ollama instance already used for chat/embeddings.
 
     `conversation_id` and `on_memory_proposed` exist for `remember`'s
     provenance/backfill: ChatService rebuilds this registry once per
@@ -39,6 +42,7 @@ def build_default_registry(
     document_service = DocumentService(db)
     memory_service = MemoryService(db)
     dedup_service = DeduplicationService(db)
+    file_access_service = FileAccessService(db)
 
     def search_knowledge_base(query: str, top_k: int = 5) -> str:
         results = retrieval_service.search(query, top_k=int(top_k))
@@ -114,6 +118,37 @@ def build_default_registry(
                 },
             },
             handler=list_recent_documents,
+        )
+    )
+
+    def read_file_content(path: str) -> str:
+        return file_access_service.read_file(path)
+
+    registry.register(
+        Tool(
+            name="read_file_content",
+            description=(
+                "Read a file's full raw text content by its exact "
+                "filesystem path (as seen in a document's 'source' "
+                "field, e.g. from list_recent_documents or "
+                "find_duplicate_documents) - unlike search_knowledge_base, "
+                "which only returns matching chunks, this returns the "
+                "whole file. Read-only: this cannot write, move, or "
+                "delete anything. Only works for paths inside a "
+                "directory that has already been imported; it cannot "
+                "read arbitrary files on the filesystem."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Exact filesystem path of the file to read.",
+                    },
+                },
+                "required": ["path"],
+            },
+            handler=read_file_content,
         )
     )
 

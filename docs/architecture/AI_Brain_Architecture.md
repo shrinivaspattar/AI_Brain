@@ -44,8 +44,8 @@ master backup / source files (read-only)
         ▼
    tool loop (app/tools, up to 5 iterations) — search_knowledge_base,
    get_current_datetime, list_recent_documents, find_duplicate_documents,
-   plan_duplicate_cleanup (all read-only/dry-run), remember
-   (review-gated Memory proposal)   [implemented]
+   plan_duplicate_cleanup, read_file_content (all read-only/dry-run),
+   remember (review-gated Memory proposal)   [implemented]
         │
         ▼
    dedup detection (app/dedup, GET /dedup/exact|near) — exact-hash and
@@ -76,7 +76,8 @@ master backup / source files (read-only)
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store + `status` (pending/approved/rejected), no type taxonomy. `POST /memory`, `GET /memory?status=`, `POST /memory/{id}/approve`\|`/reject`, `DELETE /memory/{id}`. Review-gated write hook (`remember` tool) + read hook (approved-only) into `ChatService` — see Memory, below. |
-| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
+| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup`, `read_file_content` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No write/move/delete or external-network tools exist. |
+| `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
 | `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
 
@@ -192,7 +193,7 @@ give callers (the audit trail, below) a structured status without parsing
 the content string.
 
 `app/tools/builtin.build_default_registry(db, conversation_id=None,
-on_memory_proposed=None)` registers six tools:
+on_memory_proposed=None)` registers seven tools:
 - `search_knowledge_base(query, top_k=5)` — read-only, explicit on-demand
   `RetrievalService` search, letting the model search multiple times
   with different queries within one turn, distinct from the always-on
@@ -207,6 +208,10 @@ on_memory_proposed=None)` registers six tools:
   `DeduplicationService.plan_exact_duplicate_cleanup` (Best Copy
   Arbitration — see Deduplication, below). Returns a proposed keep/delete
   plan as text; computing the plan has zero effect on any file or row.
+- `read_file_content(path)` — the one tool with real filesystem access,
+  wraps `FileAccessService.read_file` (see File operations, below).
+  Read-only and scoped: refuses any path outside an already-ingested
+  import source directory.
 - `remember(content, confidence=None)` — the one write path, and even it
   never writes something live: see Memory, below, for the review-gate
   design (`Memory.status`) that makes this safe.
@@ -214,13 +219,47 @@ on_memory_proposed=None)` registers six tools:
 `conversation_id`/`on_memory_proposed` exist solely for `remember`'s
 provenance — see Memory for how `ChatService` supplies them.
 
-Exposed via `GET /tools`. Deliberately no filesystem read/write or
-external-network-call tools yet — before building around
-`qwen3:8b`'s tool support, confirmed via `ollama /api/show` that it
-actually advertises the `tools` capability. Verified end-to-end: asked
-the real model for the current date/time and got back a minute-precise
-answer only obtainable by actually calling `get_current_datetime` (the
-model's training data doesn't include 2026).
+Exposed via `GET /tools`. Before building around `qwen3:8b`'s tool
+support, confirmed via `ollama /api/show` that it actually advertises
+the `tools` capability. Verified end-to-end: asked the real model for
+the current date/time and got back a minute-precise answer only
+obtainable by actually calling `get_current_datetime` (the model's
+training data doesn't include 2026).
+
+### File operations
+`read_file_content` is the only tool with real filesystem access, and
+was deliberately deferred until its own explicit scoping conversation
+(everything else built so far only ever touches rows already inside
+Postgres — a real file read is a materially bigger security surface).
+That conversation settled three things before any code was written:
+read-only only for this milestone; a path may only be read if it falls
+under the `source_path` of a COMPLETED `ImportJob` (never an arbitrary
+filesystem path, and never the wider personal-data corpus or a "master
+backup" that hasn't been explicitly imported — see
+`docs/decisions/0002-master-backup-is-read-only.md`); and if a
+write/delete capability is ever added later, it must require a
+separate human-confirmation step the model itself cannot trigger — a
+`delete_file` tool the model can call directly is explicitly off the
+table.
+
+`FileAccessService.read_file(path)` (`app/files/service.py`)
+implements exactly that: resolves the requested path
+(`Path.resolve()`), checks it via `is_relative_to()` against every
+COMPLETED import job's resolved `source_path` (the same path-traversal
+pattern `ArchiveExtractor` already uses for `..`-escaping archive
+members), reuses `text_extractor.extract_text()` so PDF/DOCX/etc. read
+as text rather than raw bytes, and truncates at `MAX_FILE_READ_LENGTH`
+(20,000 characters) so one file can't flood the model's context. Raises
+`FileAccessError` — never a bare filesystem exception — for every
+refusal case: outside every allowed root, missing, not a regular file,
+or not decodable as text.
+
+Verified end-to-end against the real model both ways: asked it to read
+a real ingested file's exact content, and the `ToolCallRecord` audit
+trail showed a `SUCCESS` call whose result matched the file byte-for-
+byte; separately, asked it to read `/etc/hostname` (never imported),
+and the audit trail showed an `ERROR` call with the `FileAccessError`
+message, which the model then correctly explained back.
 
 ### Tool-call audit trail
 `ToolCallRecord` (`app/models/tool_call.py`, migration `db6a38db9323`):
@@ -251,10 +290,15 @@ Two safety properties, both directly tested:
   gets fed back to the model — only the audit copy is capped.
 
 This is explicitly an audit/debug record — never queried for chat context,
-RAG, or memory. None of today's tools take secrets as arguments or return
-raw filesystem contents, so no redaction logic exists yet; a future
-filesystem/write tool would need to revisit that before this trail could
-be trusted not to store something sensitive.
+RAG, or memory. No tool takes secrets as arguments, but `read_file_content`
+(see File operations, below) *can* return raw file contents from the
+user's own ingested data, and that result is subject to the same
+`MAX_TOOL_RESULT_LENGTH` truncation and no redaction beyond it — the
+audit trail will happily store whatever a read file contains up to that
+cap. No redaction logic exists yet since nothing sensitive has actually
+surfaced this way in practice; a future write tool, or evidence that
+ingested files commonly contain secrets, would be the trigger to revisit
+this before trusting the trail not to store something sensitive long-term.
 
 Verified end-to-end against the real model and directly against Postgres:
 asked it to list recently ingested documents, it called

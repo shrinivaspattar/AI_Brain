@@ -94,7 +94,7 @@ for the current module-by-module status this roadmap tracks against.
       if the memory store grows large enough that recency stops being a
       good proxy for relevance.
 
-## Phase 4 — Tool calling (started)
+## Phase 4 — Tool calling (done)
 - [x] Confirmed `qwen3:8b` advertises Ollama's `tools` capability before
       building around it (`ollama /api/show`).
 - [x] Tool registry and execution loop: `Tool`/`ToolRegistry`
@@ -125,15 +125,30 @@ for the current module-by-module status this roadmap tracks against.
       Postgres. This substantially covers the KRM backlog's "Immutable
       Audit Log" item for tool calls specifically (not yet extended to
       other subsystems).
-- [ ] File operations / external API tools — deliberately not built yet.
-      A materially bigger security surface for a system meant to index
-      720GB of personal data (see the `project-master-data-corpus`
-      memory note) than the read-only tools above; needs its own explicit
-      scoping decision (which paths, read vs. write, sandboxing) rather
-      than being bundled into "first tools." If/when they land, revisit
-      whether tool arguments/results need redaction before persisting —
-      none of today's tools take secrets or return raw filesystem
-      contents, so the audit trail didn't need that logic yet.
+- [x] File operations, scoped: after an explicit scoping conversation
+      (read-only only; paths restricted to a completed import job's
+      `source_path`; any future destructive action must require human
+      confirmation, the model must never be able to delete/move a file
+      directly), added exactly one capability — `read_file_content`,
+      via `FileAccessService` (`app/files/service.py`). It refuses any
+      path that doesn't resolve under a COMPLETED `ImportJob.source_path`
+      (`Path.resolve()` + `is_relative_to`, closing off `..` traversal
+      the same way `ArchiveExtractor` already does), truncates at
+      `MAX_FILE_READ_LENGTH` (20,000 chars), and reuses
+      `text_extractor.extract_text` so PDF/DOCX/etc. read as text, not
+      garbage bytes. No write, move, or delete tool exists — that
+      remains explicitly out of scope pending its own confirmation-gate
+      design. Verified end-to-end against the real model both ways: it
+      correctly read a real ingested file and quoted an exact string
+      from it, and separately, when told to read a system file
+      (`/etc/hostname`), it called the tool, got refused, and correctly
+      explained why — both calls confirmed in the real `ToolCallRecord`
+      audit trail (`SUCCESS` and `ERROR` respectively).
+      External-API tools remain fully out of scope; revisit tool-result
+      redaction now that one tool *can* return raw file contents (not
+      just chunk-level `search_knowledge_base` snippets) — no secrets
+      have surfaced in practice yet, but this is the first tool where
+      that's now possible in principle.
 
 ## Phase 5 — Repository health & knowledge management (KRM, started)
 Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
