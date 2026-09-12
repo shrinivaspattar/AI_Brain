@@ -215,6 +215,24 @@ class DedupPlanAuthorizationService:
         return authorization, validity, is_still_actionable
 
     def _get_active_authorization(self, plan_id: int) -> DedupPlanAuthorization | None:
+        """"Active" here means status == AUTHORIZED - nothing else.
+
+        Deliberately NOT "has remaining capacity to execute": an
+        authorization's own status is never automatically changed when
+        its (at most one) execution finishes, successfully or not -
+        `DedupExecutionService.complete_execution` only ever touches
+        the `DedupExecution` row. This means a CONSUMED authorization
+        (one already bound to a terminal execution, which can never be
+        executed again - see `DedupExecution`'s docstring) still reads
+        as "active" here, and `authorize_plan` will still refuse a new
+        authorization for the same plan until this one is explicitly
+        revoked via `revoke_authorization`. This is intentional, not an
+        oversight: it makes "this plan is available for a fresh
+        authorization attempt" an explicit, auditable, human-initiated
+        step (an explicit revoke, with an optional reason) rather than
+        something that happens silently the instant an execution
+        finalizes.
+        """
         return self.db.scalar(
             select(DedupPlanAuthorization)
             .where(DedupPlanAuthorization.plan_id == plan_id)

@@ -108,7 +108,11 @@ def _audit(
         expected_content_hash="hash-a",
         expected_file_size=11,
         result=result,
-        filesystem_mutation_occurred=(result == DedupExecutionActionResult.SUCCESS),
+        filesystem_mutation_occurred=(
+            None
+            if result == DedupExecutionActionResult.UNKNOWN
+            else result == DedupExecutionActionResult.SUCCESS
+        ),
     )
 
 
@@ -439,6 +443,140 @@ def test_record_action_result_raises_for_success_without_mutation() -> None:
     db.add.assert_not_called()
 
 
+# --- record_action_result: UNKNOWN (crash-recovery representation) -----
+
+
+def test_record_action_result_unknown_requires_null_mutation_flag() -> None:
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.get.return_value = plan_action
+    db.scalar.return_value = None
+
+    audit = service.record_action_result(
+        1,
+        1,
+        DedupExecutionActionResult.UNKNOWN,
+        filesystem_mutation_occurred=None,
+        error_message="executor process did not return; outcome could not be confirmed",
+    )
+
+    assert audit.result == DedupExecutionActionResult.UNKNOWN
+    assert audit.filesystem_mutation_occurred is None
+    assert audit.ended_at is None
+    # expected_* still frozen from the plan action, same as every other result.
+    assert audit.expected_content_hash == "hash-a"
+
+
+def test_record_action_result_unknown_rejects_true_mutation_flag() -> None:
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.get.return_value = plan_action
+    db.scalar.return_value = None
+
+    with pytest.raises(ValueError, match="requires filesystem_mutation_occurred=None"):
+        service.record_action_result(
+            1,
+            1,
+            DedupExecutionActionResult.UNKNOWN,
+            filesystem_mutation_occurred=True,
+        )
+
+    db.add.assert_not_called()
+
+
+def test_record_action_result_unknown_rejects_false_mutation_flag() -> None:
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.get.return_value = plan_action
+    db.scalar.return_value = None
+
+    with pytest.raises(ValueError, match="requires filesystem_mutation_occurred=None"):
+        service.record_action_result(
+            1,
+            1,
+            DedupExecutionActionResult.UNKNOWN,
+            filesystem_mutation_occurred=False,
+        )
+
+    db.add.assert_not_called()
+
+
+def test_record_action_result_unknown_rejects_ended_at() -> None:
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.get.return_value = plan_action
+    db.scalar.return_value = None
+
+    with pytest.raises(ValueError, match="requires ended_at=None"):
+        service.record_action_result(
+            1,
+            1,
+            DedupExecutionActionResult.UNKNOWN,
+            filesystem_mutation_occurred=None,
+            ended_at=datetime(2026, 9, 12, 12, 0, tzinfo=UTC),
+        )
+
+    db.add.assert_not_called()
+
+
+def test_record_action_result_unknown_allows_started_at() -> None:
+    """started_at MAY be set for UNKNOWN if a recovery step has
+    independent evidence of when the attempt began - only ended_at is
+    forced null."""
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.get.return_value = plan_action
+    db.scalar.return_value = None
+
+    audit = service.record_action_result(
+        1,
+        1,
+        DedupExecutionActionResult.UNKNOWN,
+        filesystem_mutation_occurred=None,
+        started_at=datetime(2026, 9, 12, 11, 0, tzinfo=UTC),
+    )
+
+    assert audit.started_at == datetime(2026, 9, 12, 11, 0, tzinfo=UTC)
+    assert audit.ended_at is None
+
+
+def test_record_action_result_failed_rejects_null_mutation_flag() -> None:
+    """Only UNKNOWN may leave filesystem_mutation_occurred indeterminate
+    - FAILED must still report a definite True or False."""
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.get.return_value = plan_action
+    db.scalar.return_value = None
+
+    with pytest.raises(ValueError, match="requires a definite filesystem_mutation_occurred"):
+        service.record_action_result(
+            1,
+            1,
+            DedupExecutionActionResult.FAILED,
+            filesystem_mutation_occurred=None,
+        )
+
+    db.add.assert_not_called()
+
+
 # --- complete_execution: derived overall status ------------------------
 
 
@@ -497,6 +635,47 @@ def test_complete_execution_partial_success_is_partially_completed() -> None:
 
     assert result.status == DedupExecutionStatus.PARTIALLY_COMPLETED
     assert "plan action 3" in result.failure_reason
+
+
+def test_complete_execution_any_unknown_result_is_needs_review() -> None:
+    """NEEDS_REVIEW takes priority over every other classification,
+    regardless of how many other actions cleanly succeeded - this
+    system must never describe an execution as COMPLETED/FAILED/
+    PARTIALLY_COMPLETED while part of its story is genuinely unknown."""
+    db = MagicMock()
+    execution = _execution()
+    audits = [
+        _audit(1, plan_action_id=1, result=DedupExecutionActionResult.SUCCESS),
+        _audit(2, plan_action_id=2, result=DedupExecutionActionResult.SUCCESS),
+        _audit(3, plan_action_id=3, result=DedupExecutionActionResult.UNKNOWN),
+    ]
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.scalars.side_effect = [[1, 2, 3], audits]
+
+    result = service.complete_execution(1)
+
+    assert result.status == DedupExecutionStatus.NEEDS_REVIEW
+    assert "plan action 3" in result.failure_reason
+    assert "unknown" in result.failure_reason.lower()
+
+
+def test_complete_execution_unknown_takes_priority_over_failed() -> None:
+    """Even when zero actions succeeded, a single UNKNOWN result still
+    yields NEEDS_REVIEW, never FAILED - FAILED specifically means "we
+    know for certain nothing succeeded," which isn't true here."""
+    db = MagicMock()
+    execution = _execution()
+    audits = [
+        _audit(1, plan_action_id=1, result=DedupExecutionActionResult.UNKNOWN),
+    ]
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    db.scalars.side_effect = [[1], audits]
+
+    result = service.complete_execution(1)
+
+    assert result.status == DedupExecutionStatus.NEEDS_REVIEW
 
 
 def test_complete_execution_raises_for_missing_execution() -> None:

@@ -25,11 +25,16 @@ class StartExecutionRequest(BaseModel):
 class RecordActionResultRequest(BaseModel):
     plan_action_id: int
     result: str = Field(
-        description="One of: success, precondition_failed, failed, not_attempted."
+        description=(
+            "One of: success, precondition_failed, failed, not_attempted, "
+            "unknown."
+        )
     )
     observed_content_hash: str | None = None
     observed_file_size: int | None = None
-    filesystem_mutation_occurred: bool = False
+    # Tri-state: True/False/null(unknown). Only result=unknown may
+    # leave this null - every other result requires a definite value.
+    filesystem_mutation_occurred: bool | None = False
     error_message: str | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
@@ -67,7 +72,10 @@ class DedupExecutionActionAuditResponse(BaseModel):
     result: str
     observed_content_hash: str | None
     observed_file_size: int | None
-    filesystem_mutation_occurred: bool
+    # Tri-state: True (definitely mutated) / False (definitely did
+    # not) / null (unknown/indeterminate - only ever paired with
+    # result=unknown; see DedupExecutionActionResult.UNKNOWN).
+    filesystem_mutation_occurred: bool | None
     error_message: str | None
     started_at: datetime | None
     ended_at: datetime | None

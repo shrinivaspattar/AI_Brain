@@ -147,16 +147,21 @@ class DedupExecutionService:
         *,
         observed_content_hash: str | None = None,
         observed_file_size: int | None = None,
-        filesystem_mutation_occurred: bool = False,
+        filesystem_mutation_occurred: bool | None = False,
         error_message: str | None = None,
         started_at: datetime | None = None,
         ended_at: datetime | None = None,
     ) -> DedupExecutionActionAudit:
         """Record what ACTUALLY happened for one planned action. Pure
         bookkeeping - this never performs a filesystem operation
-        itself; a caller (the future executor) reports the outcome it
-        already observed, and this persists it as a permanent,
-        immutable fact.
+        itself; a caller (the future executor, OR a future recovery
+        step reconstructing an indeterminate outcome after a crash -
+        see DedupExecutionActionResult.UNKNOWN) reports an outcome it
+        already observed elsewhere, and this persists it as a
+        permanent, immutable fact. Audit ordering contract: the real
+        attempt (or the recovery investigation) must already be
+        complete before this is called - this method never precedes
+        the fact it records.
 
         `planned_action`/`source_path`/`target_path`/
         `expected_content_hash`/`expected_file_size`/`document_id` are
@@ -169,8 +174,8 @@ class DedupExecutionService:
         Preconditions (ValueError, no row created on failure):
         1. The execution must exist.
         2. The execution must still be RUNNING - a terminal execution
-           (COMPLETED/FAILED/PARTIALLY_COMPLETED) never accepts a new
-           action result.
+           (COMPLETED/FAILED/PARTIALLY_COMPLETED/NEEDS_REVIEW) never
+           accepts a new action result.
         3. The plan action must belong to the SAME plan as this
            execution.
         4. No audit row may already exist for this
@@ -178,13 +183,23 @@ class DedupExecutionService:
            unique constraint) - exactly one recorded outcome per
            action per execution.
 
-        Definitional consistency checks (ValueError):
-        - PRECONDITION_FAILED and NOT_ATTEMPTED must never report a
-          filesystem mutation - by definition, a precondition check
-          runs strictly before any mutation, and a not-attempted
-          action was never reached.
-        - SUCCESS must report a filesystem mutation - today's only
-          action type, DELETE, has no successful no-op form.
+        Definitional consistency checks on the TRI-STATE
+        `filesystem_mutation_occurred` (True / False / None=unknown),
+        each a ValueError if violated:
+        - PRECONDITION_FAILED and NOT_ATTEMPTED must report False - by
+          definition, a precondition check runs strictly before any
+          mutation, and a not-attempted action was never reached.
+        - SUCCESS must report True - today's only action type,
+          DELETE, has no successful no-op form.
+        - UNKNOWN must report None - the entire point of this result
+          is that whether a mutation occurred is genuinely unknown;
+          reporting True or False here would falsely claim a certainty
+          that doesn't exist. UNKNOWN also forces `ended_at` to be
+          None - there is no confirmed completion time for an
+          indeterminate outcome.
+        - Every other result (FAILED, and any future addition) must
+          report a definite True or False, never None - only UNKNOWN
+          may leave the mutation outcome indeterminate.
         """
         execution = self._get_execution_or_raise(execution_id)
 
@@ -218,15 +233,34 @@ class DedupExecutionService:
                 "action's outcome is recorded exactly once per execution"
             )
 
-        if result in _NO_MUTATION_RESULTS and filesystem_mutation_occurred:
+        if result == DedupExecutionActionResult.UNKNOWN:
+            if filesystem_mutation_occurred is not None:
+                raise ValueError(
+                    "result=unknown requires filesystem_mutation_occurred=None "
+                    "- reporting True or False would falsely claim a certainty "
+                    "that doesn't exist; if the outcome is actually known, use "
+                    "success, precondition_failed, failed, or not_attempted "
+                    "instead"
+                )
+            if ended_at is not None:
+                raise ValueError(
+                    "result=unknown requires ended_at=None - there is no "
+                    "confirmed completion time for an indeterminate outcome"
+                )
+        elif filesystem_mutation_occurred is None:
+            raise ValueError(
+                f"result={result.value} requires a definite "
+                "filesystem_mutation_occurred (true or false) - only "
+                "result=unknown may leave it indeterminate"
+            )
+        elif result in _NO_MUTATION_RESULTS and filesystem_mutation_occurred:
             raise ValueError(
                 f"result={result.value} can never report "
                 "filesystem_mutation_occurred=True - a precondition check "
                 "runs strictly before any mutation, and a not-attempted "
                 "action was never reached"
             )
-
-        if result == DedupExecutionActionResult.SUCCESS and not filesystem_mutation_occurred:
+        elif result == DedupExecutionActionResult.SUCCESS and not filesystem_mutation_occurred:
             raise ValueError(
                 "result=success requires filesystem_mutation_occurred=True - "
                 "the only action type this system can propose (delete) has "
@@ -274,6 +308,12 @@ class DedupExecutionService:
         attempted or not.
 
         Overall status:
+        - NEEDS_REVIEW: at least one action's result is UNKNOWN - takes
+          priority over every other classification below, regardless
+          of how many other actions cleanly succeeded or failed. This
+          system must never describe an execution as COMPLETED/FAILED/
+          PARTIALLY_COMPLETED while part of its own story is
+          genuinely unknown (see DedupExecutionStatus.NEEDS_REVIEW).
         - COMPLETED: every action's result is SUCCESS.
         - FAILED: zero actions succeeded (the very first attempted
           action already failed or hit a precondition failure).
@@ -282,8 +322,9 @@ class DedupExecutionService:
           the default stop-on-first-failure policy.
 
         `failure_reason` (for any non-COMPLETED outcome) is derived
-        from the first non-SUCCESS audit row, in the order those rows
-        were recorded - never accepted as free-form caller input.
+        from the first UNKNOWN audit row if one exists, else the first
+        non-SUCCESS audit row, in the order those rows were recorded -
+        never accepted as free-form caller input.
 
         Raises ValueError if the execution does not exist, or is not
         currently RUNNING (a terminal execution can never be
@@ -322,33 +363,48 @@ class DedupExecutionService:
                 f"{len(missing)} of {len(plan_action_ids)} planned action(s) "
                 "have no recorded outcome yet (plan action id(s) "
                 f"{sorted(missing)}). Every planned action must be recorded "
-                "as SUCCESS, PRECONDITION_FAILED, FAILED, or NOT_ATTEMPTED "
-                "before an execution can be finalized."
+                "as SUCCESS, PRECONDITION_FAILED, FAILED, NOT_ATTEMPTED, or "
+                "UNKNOWN before an execution can be finalized."
             )
 
-        successes = [
-            a for a in audits if a.result == DedupExecutionActionResult.SUCCESS
-        ]
-        non_successes = [
-            a for a in audits if a.result != DedupExecutionActionResult.SUCCESS
+        unknowns = [
+            a for a in audits if a.result == DedupExecutionActionResult.UNKNOWN
         ]
 
-        if not non_successes:
-            status = DedupExecutionStatus.COMPLETED
-            failure_reason = None
-        else:
-            first_failure = non_successes[0]
+        if unknowns:
+            first_unknown = unknowns[0]
+            status = DedupExecutionStatus.NEEDS_REVIEW
             failure_reason = (
-                f"Action for plan action {first_failure.plan_action_id} "
-                f"(document {first_failure.document_id}) reported "
-                f"{first_failure.result.value}"
-                + (f": {first_failure.error_message}" if first_failure.error_message else "")
+                f"Action for plan action {first_unknown.plan_action_id} "
+                f"(document {first_unknown.document_id}) has an unknown/"
+                "indeterminate outcome and requires manual review before "
+                "this execution's overall result can be determined"
+                + (f": {first_unknown.error_message}" if first_unknown.error_message else "")
             )
-            status = (
-                DedupExecutionStatus.FAILED
-                if not successes
-                else DedupExecutionStatus.PARTIALLY_COMPLETED
-            )
+        else:
+            successes = [
+                a for a in audits if a.result == DedupExecutionActionResult.SUCCESS
+            ]
+            non_successes = [
+                a for a in audits if a.result != DedupExecutionActionResult.SUCCESS
+            ]
+
+            if not non_successes:
+                status = DedupExecutionStatus.COMPLETED
+                failure_reason = None
+            else:
+                first_failure = non_successes[0]
+                failure_reason = (
+                    f"Action for plan action {first_failure.plan_action_id} "
+                    f"(document {first_failure.document_id}) reported "
+                    f"{first_failure.result.value}"
+                    + (f": {first_failure.error_message}" if first_failure.error_message else "")
+                )
+                status = (
+                    DedupExecutionStatus.FAILED
+                    if not successes
+                    else DedupExecutionStatus.PARTIALLY_COMPLETED
+                )
 
         try:
             execution.status = status

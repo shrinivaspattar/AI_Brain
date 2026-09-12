@@ -435,6 +435,79 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       zero leftover rows. Deliberately not built: the filesystem
       executor itself, any endpoint that performs a real file action,
       and any frontend.
+- [x] Executor Safety & Recovery Design — a dedicated design pass on
+      the single hardest correctness boundary in this architecture
+      (what happens at, and around, the moment of a filesystem
+      mutation, including a crash), kept deliberately separate from
+      writing the executor. **No filesystem mutation capability was
+      added, no quarantine mechanism was implemented, and no executor
+      code exists anywhere in this codebase after this milestone.**
+      Two schema additions (migration `6189c90d31a8`) exist only
+      because the audit model built in the prior milestone genuinely
+      could not represent "we don't know" without them:
+      `DedupExecutionActionResult.UNKNOWN` (the outcome of an action
+      that was attempted, or may have been, but whose fate could not
+      be confirmed before the process that would have recorded it
+      died — always paired with `filesystem_mutation_occurred=None`
+      and `ended_at=None`, never written by a live executor, only by a
+      future recovery step reconstructing what it can) and
+      `DedupExecutionStatus.NEEDS_REVIEW` (an execution finalized with
+      any `UNKNOWN` action — takes priority over
+      COMPLETED/FAILED/PARTIALLY_COMPLETED regardless of how many
+      other actions cleanly succeeded, since this system must never
+      describe an execution's fate as known when part of it isn't).
+      `filesystem_mutation_occurred` became genuinely tri-state
+      (`True`/`False`/`None` — a plain boolean cannot represent
+      "unknown"), enforced by `record_action_result`: every result but
+      `UNKNOWN` must report a definite value, and `UNKNOWN` may never
+      report anything but `None`. **Reversible-delete decision made
+      explicitly, not implemented**: quarantine/staging recommended
+      over permanent deletion, with a documented destination
+      convention (namespaced by execution/plan-action id, making
+      filename collisions structurally impossible), and a documented
+      atomicity requirement (same-filesystem moves only — a
+      cross-device `EXDEV` must be treated as FAILED, never silently
+      degraded to non-atomic copy+delete). **Audit ordering contract
+      made explicit**: mutation first, `record_action_result` after,
+      never the reverse — a crash between those two steps leaves no
+      row at all, genuinely ambiguous between "not reached yet" and
+      "attempted, then lost," resolvable only by a future recovery
+      step gathering independent evidence. **A real bug was found and
+      fixed while building this**: a column-level `default=False`
+      silently coerced an explicit `None` into `False` at insert time
+      (SQLAlchemy cannot distinguish a deliberate `None` from an unset
+      value for a scalar default) — caught by the real-Postgres
+      integration test asserting a NULL round-trip, not by any mocked
+      unit test, which is exactly the case for insisting on real-
+      database verification here. **Idempotency documented**: the
+      existing one-execution-per-authorization constraint already
+      prevents a naive restart-and-retry; a genuinely new attempt
+      needs a new authorization, which itself requires the old one to
+      be explicitly revoked first — verified directly that a consumed
+      (already-executed) authorization still reads as active and
+      blocks re-authorization of its plan until revoked, an
+      intentional, auditable boundary rather than an automatic one.
+      **A real, currently-unresolved gap was also surfaced and locked
+      in with a test**: re-planning a partially-executed review's
+      remaining work isn't actually possible today, since a
+      regenerated plan will always include already-resolved
+      (now-missing) members and `check_plan_validity` can never
+      validate an action whose file was already gone at that plan's
+      own generation time — blocking authorization of the entire new
+      plan, not just the outstanding part. **Concurrency decision**:
+      the existing DB-level unique constraints (verified to raise real
+      `IntegrityError`s) are judged sufficient given AI_Brain's
+      single-process, single-user architecture — no distributed
+      locking infrastructure was built for a multi-worker scenario
+      that cannot occur today. 15 new tests (8 unit, 3 API, 4
+      real-database integration). Full suite: 466 tests, three
+      consecutive runs, zero flakiness. Verified against the real
+      running API and `aibrain`: a synthetic execution with one
+      SUCCESS and one UNKNOWN action correctly finalized to
+      NEEDS_REVIEW, the null mutation flag confirmed round-tripping
+      through real Postgres, the consumed-authorization/explicit-
+      revoke interaction reproduced exactly as documented — then fully
+      cleaned up with zero leftover rows.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

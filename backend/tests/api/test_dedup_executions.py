@@ -54,7 +54,11 @@ def _audit(
         result=result,
         observed_content_hash="hash-a" if result == DedupExecutionActionResult.SUCCESS else None,
         observed_file_size=11 if result == DedupExecutionActionResult.SUCCESS else None,
-        filesystem_mutation_occurred=(result == DedupExecutionActionResult.SUCCESS),
+        filesystem_mutation_occurred=(
+            None
+            if result == DedupExecutionActionResult.UNKNOWN
+            else result == DedupExecutionActionResult.SUCCESS
+        ),
         created_at=datetime(2026, 9, 12, 10, 5, tzinfo=UTC),
     )
 
@@ -285,6 +289,63 @@ def test_record_action_result_succeeds() -> None:
         app.dependency_overrides.clear()
 
 
+def test_record_action_result_unknown_succeeds_with_null_mutation_flag() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            audit = _audit(result=DedupExecutionActionResult.UNKNOWN)
+            service_class.return_value.record_action_result.return_value = audit
+
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/1/actions",
+                json={
+                    "plan_action_id": 1,
+                    "result": "unknown",
+                    "filesystem_mutation_occurred": None,
+                    "error_message": "executor did not confirm outcome before terminating",
+                },
+            )
+
+            assert response.status_code == 201
+            body = response.json()
+            assert body["result"] == "unknown"
+            assert body["filesystem_mutation_occurred"] is None
+
+            call_kwargs = service_class.return_value.record_action_result.call_args
+            assert call_kwargs.args[2] == DedupExecutionActionResult.UNKNOWN
+            assert call_kwargs.kwargs["filesystem_mutation_occurred"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_record_action_result_unknown_returns_422_for_non_null_mutation_flag() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            service_class.return_value.record_action_result.side_effect = ValueError(
+                "result=unknown requires filesystem_mutation_occurred=None"
+            )
+
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/1/actions",
+                json={
+                    "plan_action_id": 1,
+                    "result": "unknown",
+                    "filesystem_mutation_occurred": True,
+                },
+            )
+
+            assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_record_action_result_rejects_invalid_result_value() -> None:
     db = MagicMock()
     app.dependency_overrides[get_db] = lambda: db
@@ -472,6 +533,33 @@ def test_complete_execution_reports_partial_completion() -> None:
             body = response.json()
             assert body["status"] == "partially_completed"
             assert "plan action 3" in body["failure_reason"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_complete_execution_reports_needs_review() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            needs_review = _execution(
+                status=DedupExecutionStatus.NEEDS_REVIEW,
+                ended_at=datetime(2026, 9, 12, 10, 10, tzinfo=UTC),
+                failure_reason=(
+                    "Action for plan action 3 has an unknown/indeterminate "
+                    "outcome and requires manual review"
+                ),
+            )
+            service_class.return_value.complete_execution.return_value = needs_review
+
+            client = TestClient(app)
+            response = client.post("/dedup/executions/1/complete")
+
+            assert response.status_code == 200
+            body = response.json()
+            assert body["status"] == "needs_review"
+            assert "requires manual review" in body["failure_reason"]
     finally:
         app.dependency_overrides.clear()
 

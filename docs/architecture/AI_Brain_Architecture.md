@@ -1075,10 +1075,283 @@ component - everything it needs to call already exists:
 above, made explicitly before any executor code is written; a
 concrete implementation of "revalidate immediately before every
 mutation" inside the executor's per-action loop (the mechanism exists;
-nothing calls it in a loop yet); and operational recovery semantics
-for a `DedupExecution` left stuck in `RUNNING` by a process crash
-(not modeled - genuinely out of scope until a real, long-running
-executor process exists to actually crash).
+nothing calls it in a loop yet). Crash-recovery *representation* is no
+longer unmodeled - see "Executor Safety & Recovery Design" immediately
+below - but automatic crash *detection/resolution tooling* (something
+that notices a stuck `RUNNING` execution and investigates it) remains
+out of scope, since no long-running executor process exists yet to
+actually crash.
+
+### Executor Safety & Recovery Design
+
+A dedicated design pass, deliberately separate from building the
+executor itself, addressing the single hardest correctness boundary in
+this architecture: what a future executor must do (and how its outcome
+must be represented) at the exact moment of a filesystem mutation,
+including when that moment is interrupted by a crash. **No filesystem
+mutation capability was added.** No quarantine mechanism was
+implemented. No executor code (`DELETE`, move, rename, or equivalent)
+exists anywhere in this codebase after this milestone, same as before
+it. Two schema additions were made - `DedupExecutionActionResult.UNKNOWN`
+and `DedupExecutionStatus.NEEDS_REVIEW` - specifically because without
+them, the audit model built in the prior milestone could not honestly
+represent "a mutation may have happened, and we cannot currently say
+for certain" without either lying (claiming SUCCESS or FAILED) or
+losing the fact entirely (recording nothing). Everything else in this
+section is documentation of a *future* executor's required behavior,
+not new capability.
+
+#### 1. Reversible DELETE semantics
+
+**Decision: quarantine/staging (move), not permanent deletion**, for
+AI_Brain's first filesystem executor. A move gives every mistake - an
+executor bug, a bad plan, a human approving the wrong canonical - a
+recovery path; permanent deletion gives none. Reversibility is the
+safer default for a system whose entire design, up to this point, has
+never modified a real file, and should only be abandoned later for a
+concrete, demonstrated reason (e.g. disk space pressure from
+accumulated quarantined files), not by default.
+
+**No such mechanism exists in this codebase today.** Grepped and
+confirmed: `_DUPLICATES_QUARANTINE` does not appear anywhere in
+AI_Brain. Every existing mention of "quarantine" in this codebase (in
+`app/api/dedup_reviews.py`, `app/api/dedup_execution_plans.py`,
+`app/dedup/execution_plan_service.py`, `app/dedup/service.py`) is a
+docstring/comment explicitly listing it as a capability that does
+*not* exist - this milestone does not change that.
+
+**Destination convention (design only, not implemented)**: a
+quarantine root outside the corpus tree (e.g. a sibling of
+`INGESTION_DIR`, not inside `/mnt/t7ssd/vscode/data` itself - keeping
+quarantined files off the path anything else in this codebase scans or
+reads), with each quarantined file placed at
+`<quarantine_root>/<execution_id>/<plan_action_id>__<original_basename>`.
+
+**Collision handling**: namespacing the destination by
+`execution_id`/`plan_action_id` - both already unique, already
+present on every `DedupExecutionActionAudit` row - makes a filename
+collision structurally impossible without any additional uniqueness
+logic (no timestamp suffixes, no retry-on-collision loops, nothing
+speculative). Two different plans, or two actions within the same
+plan, can never target the same quarantine path.
+
+**Atomicity**: a `rename()`-based move is atomic on POSIX *only* when
+source and destination are on the same filesystem/volume; across
+volumes it degrades to a non-atomic copy-then-delete, which
+reintroduces exactly the partial-mutation risk this whole design
+avoids (a crash mid-copy leaves two partial states, not zero or one).
+**Required behavior for a future executor**: the quarantine root MUST
+live on the same filesystem/volume as the corpus it quarantines from,
+verified before first use, not discovered by accident. If a move ever
+raises `OSError` with `errno.EXDEV` (cross-device), the executor MUST
+treat that as a `FAILED` result and stop - never silently fall back to
+copy-then-delete.
+
+#### 2. Crash recovery
+
+**What happens to a `RUNNING` execution if the process dies**:
+nothing, automatically. The `DedupExecution` row simply stays
+`status=RUNNING` forever - there is no timeout, no heartbeat, no
+background sweep that notices a stuck execution and reclassifies it.
+This is deliberate, not an oversight: a time-based "this has been
+RUNNING too long, assume it failed" heuristic would be exactly the
+kind of guess this architecture exists to refuse to make. Detecting a
+stuck `RUNNING` execution (e.g. by `started_at` age, or by checking
+whether a matching process is still alive) is an operational/
+monitoring concern for whoever eventually builds the executor, not a
+data-model concern - no such detection is implemented or assumed here.
+
+**How an interrupted action is represented - three distinguishable
+cases**:
+- **Mutation definitely did not happen**: the action was never
+  attempted, or a precondition check correctly stopped it first. No
+  new representation needed - `NOT_ATTEMPTED` and `PRECONDITION_FAILED`
+  (both already `filesystem_mutation_occurred=False`) already say this.
+- **Mutation definitely happened**: the executor observed a definite
+  outcome and reported it. Already covered by `SUCCESS`
+  (`filesystem_mutation_occurred=True`) or `FAILED` (either value,
+  since a live executor's own definite report is what's trusted).
+- **Mutation outcome is unknown**: the process crashed between
+  attempting (or performing) the mutation and persisting its outcome -
+  *this* is the case with no prior representation, and the reason
+  `DedupExecutionActionResult.UNKNOWN` was added this milestone. See
+  its docstring (`app/models/dedup_execution.py`) for the exact
+  contract.
+
+**`UNKNOWN` is never written by a live in-progress executor** - by the
+time a process crashes, there is no live caller left to write
+anything. An `UNKNOWN` row can only ever be written *after the fact*,
+by a future recovery step that has independently concluded an
+action's fate cannot be confirmed (or has chosen not to spend the
+effort re-verifying and would rather force human review). That
+recovery step does not exist in this codebase - only the
+representation it would use does.
+
+**"Avoid falsely marking an action successful merely because the
+executor crashed after mutation"** is enforced structurally, not just
+by convention: `record_action_result` refuses to accept
+`SUCCESS`/`FAILED`/`PRECONDITION_FAILED`/`NOT_ATTEMPTED` paired with a
+`None` mutation flag, and refuses `UNKNOWN` paired with anything
+*but* `None` (see `app/dedup/execution_service.py`). There is no way
+to construct an audit row that claims certainty about a mutation
+outcome without a caller explicitly asserting a definite `True`/`False`.
+
+#### 3. Audit ordering
+
+**The mutation happens, then the audit is persisted - never the
+reverse, and never speculatively before the attempt.** This ordering
+is now the explicit contract documented on
+`DedupExecutionActionResult` itself. One direct consequence: if a
+process dies between those two steps, the affected action has **no
+audit row at all** - and that absence is genuinely ambiguous, from the
+database alone, between "never reached this action yet" (a live
+execution still has work left) and "attempted it, then crashed before
+recording" (needs recovery). Resolving that ambiguity requires
+out-of-band evidence (typically: re-observing the filesystem to see
+whether the file is now gone) that only a future recovery step can
+gather - it is not something `record_action_result` or
+`complete_execution` can infer from the database alone, and neither
+method tries to.
+
+**The meaning of `filesystem_mutation_occurred` (tri-state, on
+`DedupExecutionActionAudit`)**:
+- **`True`** - the mutation demonstrably occurred, either directly
+  observed by the executor immediately after the operation or
+  independently reconfirmed later.
+- **`False`** - the mutation demonstrably did NOT occur: never
+  attempted, or attempted and the filesystem confirmed unchanged (a
+  precondition check correctly refusing before any OS call; an
+  attempted operation failing before any write took effect).
+- **`None`/NULL** - genuinely indeterminate. Reserved exclusively for
+  `result=UNKNOWN`. Must never be treated as equivalent to `False` by
+  any code, anywhere, ever - "we don't know" and "it definitely didn't
+  happen" are different facts with different consequences for what a
+  future recovery step should do next.
+
+A plain non-nullable boolean cannot represent this third case, which
+is why `filesystem_mutation_occurred` was changed from `NOT NULL` to
+nullable this milestone (migration `6189c90d31a8`) - a real, if small,
+schema change, made only because the tri-state distinction is
+genuinely required, not spec­ulative.
+
+**An important implementation pitfall found and fixed while building
+this**: SQLAlchemy's `mapped_column(..., default=False)` silently
+coerces an explicit `None` into `False` at flush time (a scalar column
+default fires whenever the value being flushed is `None`, regardless
+of whether that `None` was a deliberate assignment or simply never
+set - it has no way to distinguish the two). The column-level default
+was removed entirely; `record_action_result`'s own Python-level
+default (`False`, applied only when a caller omits the parameter, not
+when they explicitly pass `None`) is what the earlier code should have
+relied on. This was caught by the real-Postgres integration test for
+`UNKNOWN` - assertions against an in-memory unit-test mock would never
+have surfaced it, which is exactly why this project insists on real-
+database verification, not mocked verification alone, for anything
+this load-bearing.
+
+#### 4. Idempotency / restart behavior
+
+**What happens if the executor is restarted**: it cannot resume a
+previously-`RUNNING` execution by calling `start_execution` again for
+the same authorization - that call is refused (see "duplicate
+execution prevention" in the prior milestone), backed by both a
+service-level check and a real `UNIQUE` constraint on
+`dedup_executions.authorization_id`. This existing property doubles as
+restart protection: a naive "just retry with the same authorization"
+approach is already structurally impossible, not merely discouraged.
+**A genuinely new attempt requires a brand-new authorization** - which
+itself requires the old one to be explicitly revoked first (see next
+point) and re-passes a fresh `check_plan_validity`.
+
+**A subtle, real interaction surfaced and verified this milestone**:
+finalizing an execution (`complete_execution`) never changes its
+authorization's own `status` - that field only ever moves
+`AUTHORIZED` → `REVOKED`, and only via `revoke_authorization`, called
+explicitly. This means a **consumed** authorization (one already bound
+to a terminal execution, which per the unique constraint above can
+never execute again) still reads as "active" to `authorize_plan`'s own
+duplicate-authorization check, and a fresh authorization attempt for
+the same plan is refused (409) until the consumed one is explicitly
+revoked. This is intentional: "this plan is available for a fresh
+attempt" is a deliberate, auditable, human-initiated step (an explicit
+revoke, with an optional reason) rather than something that happens
+silently the instant an execution finalizes - fully consistent with
+"an authorization should not automatically become an execution
+record" running in the other direction too: an execution finishing
+does not automatically free its authorization.
+
+**A genuine, currently-unresolved gap this design pass surfaced**:
+re-planning a *partially*-executed review's remaining work is not
+actually possible today. Once a duplicate has really been removed by
+an earlier execution, `generate_plan_for_review` has no concept of
+"already resolved" at the review-member level - it will include that
+member in any new plan regardless. Because a plan action's own
+`observed_exists` is frozen at *that* plan's generation time, and
+`check_plan_validity`'s `is_valid` requires the file to exist *now*
+for that exact action, an action generated against an already-missing
+file can never be valid - not now, not ever. This blocks authorization
+of the **entire** new plan, not just the still-outstanding part of it,
+even though the outstanding member's own file is completely untouched
+and its own action would otherwise be perfectly valid on its own.
+Verified directly (`test_replanning_after_a_successful_deletion_
+produces_a_permanently_invalid_plan`): a real successful deletion (a
+test simulating what an executor would have left behind - no AI_Brain
+code performs it) followed by a real plan regeneration reproduces
+this exactly. **Not fixed here** - resolving it needs either a way to
+mark specific review members "already resolved" (excluding them from
+a regenerated plan), or a way for validity checking to treat "file
+confirmed already gone per an earlier `COMPLETED`/`PARTIALLY_COMPLETED`
+execution" as an accepted terminal state rather than staleness.
+Deferred until partial re-execution is actually needed in practice.
+
+#### 5. Per-action locking/concurrency
+
+**Decision: rely on the existing database-level unique constraints;
+do not build additional locking infrastructure.** AI_Brain is a
+single-process, single-user, local system - there is no task queue, no
+worker pool, and no distributed-execution architecture anywhere else
+in this codebase, and none is planned. Building lease tokens,
+heartbeats, or distributed locks for a multi-worker scenario that
+cannot occur given how this system is actually deployed would be
+exactly the kind of speculative infrastructure this project avoids.
+
+**What actually prevents concurrent double-execution today**: the
+`UNIQUE` constraint on `dedup_executions.authorization_id` (an
+authorization can never back two executions, even if two callers
+somehow both pass `start_execution`'s pre-check before either commits
+- the constraint, not the pre-check, is what's truly load-bearing
+under a race) and the `UNIQUE` constraint on
+`dedup_execution_action_audits.(execution_id, plan_action_id)` (the
+same reasoning, per action). Both were verified directly against real
+Postgres to raise a real `IntegrityError` when the service-level
+pre-check is deliberately bypassed. The service-level checks exist to
+turn that raw `IntegrityError` into a clean `ValueError`/409 in the
+common (non-contended) case - they are a usability nicety, not the
+actual safety mechanism.
+
+**If AI_Brain ever gains a genuine multi-process or distributed
+executor architecture**, this decision should be revisited - but not
+before there is a concrete reason to.
+
+#### Testing and verification for this design pass
+
+15 new tests total: unit (8, covering `UNKNOWN`'s validation rules and
+`NEEDS_REVIEW` derivation/priority), API (3, the same behaviors
+through the HTTP layer), and real-database integration (4): the full
+crash-recovery representation against
+real Postgres (including a real NULL round-trip check via
+`db.expire_all()` + re-fetch, which is exactly what caught the
+SQLAlchemy default-coercion bug above), the consumed-authorization
+interaction, and the re-planning gap. Full suite: 466 tests, run three
+consecutive times with zero flakiness. Verified against the real
+running API and the real `aibrain` database: a synthetic three-document
+review executed with one `SUCCESS` and one `UNKNOWN` action, correctly
+finalized to `NEEDS_REVIEW`, with the `null` mutation flag confirmed
+round-tripping through real Postgres in the raw API response; the
+consumed-authorization/explicit-revoke interaction reproduced exactly
+as documented. Cleaned up afterward with zero leftover rows. No real
+corpus file was read, created, deleted, moved, renamed, or modified at
+any point.
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file
