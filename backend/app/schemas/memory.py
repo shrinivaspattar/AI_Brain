@@ -14,6 +14,7 @@ class MemoryResponse(BaseModel):
     id: int
     content: str
     confidence: float | None
+    status: str
     conversation_id: str | None
     message_id: int | None
     created_at: datetime

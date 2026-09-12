@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.memory.service import MemoryService
 from app.models.conversation import Conversation
-from app.models.memory import Memory
+from app.models.memory import Memory, MemoryStatus
 from app.models.message import Message, MessageRole
 from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
@@ -51,6 +51,11 @@ class ChatService:
         self.chat_client = chat_client or ChatClient()
         self.retrieval_service = retrieval_service or RetrievalService(db)
         self.memory_service = memory_service or MemoryService(db)
+        # None means "use the real, per-turn registry" - see send_message.
+        # A caller-supplied registry (tests, mainly) is used as-is and
+        # never rebuilt, since it has no conversation-specific behavior
+        # to wire up.
+        self._tool_registry_override = tool_registry
         self.tool_registry = tool_registry or build_default_registry(db)
 
     def send_message(
@@ -70,8 +75,22 @@ class ChatService:
         self.db.commit()
         self.db.refresh(user_message)
 
+        proposed_memory_ids: list[int] = []
+        if self._tool_registry_override is None:
+            self.tool_registry = build_default_registry(
+                self.db,
+                conversation_id=conversation.id,
+                on_memory_proposed=proposed_memory_ids.append,
+            )
+
         retrieved = self.retrieval_service.search(content, top_k=top_k)
-        memories = self.memory_service.list_memories(limit=MAX_MEMORIES)
+        # Only APPROVED memories ever reach the model - a PENDING proposal
+        # (from `remember`, awaiting review) must not influence answers
+        # before a human has confirmed it.
+        memories = self.memory_service.list_memories(
+            limit=MAX_MEMORIES,
+            status=MemoryStatus.APPROVED,
+        )
         history = self._load_history(conversation.id)
         prompt = self._build_prompt(history, retrieved, memories)
 
@@ -97,6 +116,9 @@ class ChatService:
 
         if tool_call_ids:
             self._link_tool_calls_to_message(tool_call_ids, assistant_message.id)
+
+        if proposed_memory_ids:
+            self._link_memories_to_message(proposed_memory_ids, assistant_message.id)
 
         return assistant_message
 
@@ -240,6 +262,26 @@ class ChatService:
             logger.warning(
                 "Failed to link tool call records %s to message %s",
                 tool_call_ids,
+                message_id,
+                exc_info=True,
+            )
+
+    def _link_memories_to_message(
+        self,
+        memory_ids: list[int],
+        message_id: int,
+    ) -> None:
+        try:
+            self.db.query(Memory).filter(Memory.id.in_(memory_ids)).update(
+                {"message_id": message_id}, synchronize_session=False
+            )
+            self.db.commit()
+
+        except Exception:
+            self.db.rollback()
+            logger.warning(
+                "Failed to link proposed memories %s to message %s",
+                memory_ids,
                 message_id,
                 exc_info=True,
             )

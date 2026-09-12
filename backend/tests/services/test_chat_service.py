@@ -1,25 +1,25 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.models.conversation import Conversation
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
-from app.models.memory import Memory
+from app.models.memory import Memory, MemoryStatus
 from app.models.message import Message, MessageRole
 from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievedChunk
-from app.services.chat_service import ChatService
+from app.services.chat_service import MAX_MEMORIES, ChatService
 from app.tools.registry import ToolCallResult
 
 
 def _make_fake_refresh():
     """A db.refresh side_effect that assigns ids the way a real commit
-    would, for Conversation/Message/ToolCallRecord - so code that reads
-    `.id` right after refresh() behaves the same as it would against a
-    real database.
+    would, for Conversation/Message/ToolCallRecord/Memory - so code that
+    reads `.id` right after refresh() behaves the same as it would
+    against a real database.
     """
-    counters = {"message": 0, "tool_call": 0}
+    counters = {"message": 0, "tool_call": 0, "memory": 0}
 
     def fake_refresh(obj):
         if isinstance(obj, Conversation) and obj.id is None:
@@ -30,6 +30,9 @@ def _make_fake_refresh():
         if isinstance(obj, ToolCallRecord) and obj.id is None:
             counters["tool_call"] += 1
             obj.id = counters["tool_call"]
+        if isinstance(obj, Memory) and obj.id is None:
+            counters["memory"] += 1
+            obj.id = counters["memory"]
 
     return fake_refresh
 
@@ -690,3 +693,189 @@ def test_chat_service_defaults_to_builtin_tool_registry() -> None:
     assert "search_knowledge_base" in tool_names
     assert "get_current_datetime" in tool_names
     assert "list_recent_documents" in tool_names
+    assert "remember" in tool_names
+
+
+def test_send_message_only_loads_approved_memories() -> None:
+    """The chat read-hook must never surface a PENDING (unreviewed)
+    memory proposal - only APPROVED memories are safe to inject into
+    the prompt.
+    """
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    memory_service = MagicMock()
+    memory_service.list_memories.return_value = []
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+        memory_service=memory_service,
+    )
+
+    service.send_message("hello")
+
+    memory_service.list_memories.assert_called_once_with(
+        limit=MAX_MEMORIES,
+        status=MemoryStatus.APPROVED,
+    )
+
+
+def test_send_message_rebuilds_registry_with_conversation_context() -> None:
+    """When no tool_registry override is given, send_message must build a
+    fresh one scoped to the current conversation (so `remember` can
+    attach the right conversation_id), not reuse whatever was built at
+    __init__ time.
+    """
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    with patch("app.services.chat_service.build_default_registry") as build_registry:
+        fake_registry = MagicMock()
+        fake_registry.to_ollama_schema.return_value = []
+        build_registry.return_value = fake_registry
+
+        service = ChatService(
+            db,
+            chat_client=chat_client,
+            retrieval_service=retrieval_service,
+        )
+        build_registry.reset_mock()  # ignore the __init__-time call
+
+        service.send_message("hello")
+
+        build_registry.assert_called_once()
+        call_kwargs = build_registry.call_args.kwargs
+        assert call_kwargs["conversation_id"] == "conv-1"
+        assert callable(call_kwargs["on_memory_proposed"])
+
+
+def test_send_message_does_not_rebuild_an_overridden_registry() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    tool_registry = MagicMock()
+    tool_registry.to_ollama_schema.return_value = []
+
+    with patch("app.services.chat_service.build_default_registry") as build_registry:
+        service = ChatService(
+            db,
+            chat_client=chat_client,
+            retrieval_service=retrieval_service,
+            tool_registry=tool_registry,
+        )
+
+        service.send_message("hello")
+
+        build_registry.assert_not_called()
+        assert service.tool_registry is tool_registry
+
+
+def test_send_message_persists_and_links_a_proposed_memory() -> None:
+    """Full flow through the real (non-overridden) registry: the model
+    calls `remember`, a PENDING Memory is created via the real
+    MemoryService, and its message_id is backfilled once the assistant
+    Message exists - mirroring how ToolCallRecord linkage works.
+    """
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("remember", content="The user's name is Alex.")),
+        _reply("Got it, I'll remember that."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+    )
+
+    result = service.send_message("My name is Alex.")
+
+    assert result.content == "Got it, I'll remember that."
+
+    added_memories = [
+        call.args[0] for call in db.add.call_args_list if isinstance(call.args[0], Memory)
+    ]
+    assert len(added_memories) == 1
+
+    memory = added_memories[0]
+    assert memory.content == "The user's name is Alex."
+    assert memory.status == MemoryStatus.PENDING
+    assert memory.conversation_id == "conv-1"
+
+    link_filters = db.query.return_value.filter.return_value
+    link_filters.update.assert_any_call(
+        {"message_id": result.id}, synchronize_session=False
+    )
+
+
+def test_send_message_succeeds_even_if_memory_proposal_fails() -> None:
+    """Mirrors the tool-call-audit resilience guarantee: a DB failure
+    while persisting a proposed Memory must not prevent the user from
+    getting an answer.
+    """
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+
+    last_added = {"obj": None}
+    db.add.side_effect = lambda obj: last_added.__setitem__("obj", obj)
+
+    def maybe_fail_commit():
+        if isinstance(last_added["obj"], Memory):
+            raise RuntimeError("db unavailable")
+
+    db.commit.side_effect = maybe_fail_commit
+
+    chat_client = MagicMock()
+    chat_client.chat.side_effect = [
+        _tool_reply(_tool_call("remember", content="The user's name is Alex.")),
+        _reply("Got it, I'll remember that."),
+    ]
+
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(
+        db,
+        chat_client=chat_client,
+        retrieval_service=retrieval_service,
+    )
+
+    result = service.send_message("My name is Alex.")
+
+    assert result.content == "Got it, I'll remember that."

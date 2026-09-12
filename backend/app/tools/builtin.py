@@ -1,26 +1,42 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Callable
 
 from sqlalchemy.orm import Session
 
+from app.memory.service import MemoryService
 from app.rag.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService
 from app.tools.registry import Tool, ToolRegistry
 
 
-def build_default_registry(db: Session) -> ToolRegistry:
+def build_default_registry(
+    db: Session,
+    conversation_id: str | None = None,
+    on_memory_proposed: Callable[[int], None] | None = None,
+) -> ToolRegistry:
     """Build the registry of tools available to the chat loop.
 
-    Deliberately read-only: no filesystem access, no network calls beyond
-    the local Ollama instance already used for chat/embeddings, no writes.
-    Broader tools (file operations, external APIs) are a separate,
-    explicit decision - not something to bundle in by default.
+    Deliberately read-only over the user's data, with one narrow
+    exception: `remember`, which proposes a memory but never writes it
+    live (see below) - no filesystem access, no network calls beyond the
+    local Ollama instance already used for chat/embeddings. Broader tools
+    (file operations, external APIs) are a separate, explicit decision -
+    not something to bundle in by default.
+
+    `conversation_id` and `on_memory_proposed` exist for `remember`'s
+    provenance/backfill: ChatService rebuilds this registry once per
+    `send_message` call (when the caller hasn't supplied its own
+    ToolRegistry) so `remember` can attach the current conversation and
+    report back which Memory rows it created, for message_id backfill
+    once the assistant Message exists.
     """
     registry = ToolRegistry()
 
     retrieval_service = RetrievalService(db)
     document_service = DocumentService(db)
+    memory_service = MemoryService(db)
 
     def search_knowledge_base(query: str, top_k: int = 5) -> str:
         results = retrieval_service.search(query, top_k=int(top_k))
@@ -96,6 +112,59 @@ def build_default_registry(db: Session) -> ToolRegistry:
                 },
             },
             handler=list_recent_documents,
+        )
+    )
+
+    def remember(content: str, confidence: float | None = None) -> str:
+        memory = memory_service.propose_memory(
+            content=content,
+            confidence=confidence,
+            conversation_id=conversation_id,
+        )
+
+        if on_memory_proposed is not None:
+            on_memory_proposed(memory.id)
+
+        return (
+            f'Noted: proposed "{content}" as a memory (pending review). '
+            "It won't be used in future conversations until the user "
+            "approves it."
+        )
+
+    registry.register(
+        Tool(
+            name="remember",
+            description=(
+                "Propose a fact or preference about the user to remember "
+                "for future conversations. This does not take effect "
+                "immediately - it is queued for the user to review and "
+                "approve or reject, since you might be wrong. Only "
+                "propose things the user actually told you or that are "
+                "clearly and directly stated, not speculation or "
+                "inference."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "The fact or preference to remember, stated "
+                            "plainly and in third person (e.g. \"The "
+                            "user's name is Alex.\")."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": (
+                            "How confident you are this is accurate, "
+                            "from 0 to 1 (optional)."
+                        ),
+                    },
+                },
+                "required": ["content"],
+            },
+            handler=remember,
         )
     )
 

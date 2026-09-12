@@ -16,6 +16,7 @@ def test_build_default_registry_registers_expected_tools() -> None:
         "search_knowledge_base",
         "get_current_datetime",
         "list_recent_documents",
+        "remember",
     }
 
 
@@ -94,3 +95,65 @@ def test_list_recent_documents_reports_none_ingested() -> None:
     result = registry.call("list_recent_documents", {})
 
     assert result.content == "No documents have been ingested yet."
+
+
+def test_remember_proposes_a_pending_memory() -> None:
+    db = MagicMock()
+
+    with patch("app.tools.builtin.MemoryService") as memory_service_class:
+        proposed = MagicMock()
+        proposed.id = 7
+        memory_service_class.return_value.propose_memory.return_value = proposed
+
+        registry = build_default_registry(db, conversation_id="conv-1")
+
+    result = registry.call(
+        "remember",
+        {"content": "The user's name is Alex.", "confidence": 0.9},
+    )
+
+    memory_service_class.return_value.propose_memory.assert_called_once_with(
+        content="The user's name is Alex.",
+        confidence=0.9,
+        conversation_id="conv-1",
+    )
+    assert result.is_error is False
+    assert "pending review" in result.content
+    assert "The user's name is Alex." in result.content
+
+
+def test_remember_invokes_on_memory_proposed_callback() -> None:
+    db = MagicMock()
+    proposed_ids: list[int] = []
+
+    with patch("app.tools.builtin.MemoryService") as memory_service_class:
+        proposed = MagicMock()
+        proposed.id = 42
+        memory_service_class.return_value.propose_memory.return_value = proposed
+
+        registry = build_default_registry(
+            db,
+            conversation_id="conv-1",
+            on_memory_proposed=proposed_ids.append,
+        )
+
+    registry.call("remember", {"content": "test fact"})
+
+    assert proposed_ids == [42]
+
+
+def test_remember_works_without_a_callback() -> None:
+    """on_memory_proposed is optional - registry.call() must not raise
+    when it's absent (e.g. a caller that doesn't care about linkage)."""
+    db = MagicMock()
+
+    with patch("app.tools.builtin.MemoryService") as memory_service_class:
+        proposed = MagicMock()
+        proposed.id = 1
+        memory_service_class.return_value.propose_memory.return_value = proposed
+
+        registry = build_default_registry(db)
+
+    result = registry.call("remember", {"content": "test fact"})
+
+    assert result.is_error is False

@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.memory.service import MemoryService
+from app.models.memory import MemoryStatus
 from app.schemas.memory import MemoryCreate, MemoryResponse
 
 router = APIRouter(
@@ -30,9 +31,52 @@ def create_memory(
 )
 def list_memories(
     db: Session = Depends(get_db),
+    status_filter: MemoryStatus | None = Query(default=None, alias="status"),
 ) -> list[MemoryResponse]:
     service = MemoryService(db)
-    return service.list_memories()
+    return service.list_memories(status=status_filter)
+
+
+@router.post(
+    "/{memory_id}/approve",
+    response_model=MemoryResponse,
+    responses={404: {"description": "Memory not found"}},
+)
+def approve_memory(
+    memory_id: int,
+    db: Session = Depends(get_db),
+) -> MemoryResponse:
+    service = MemoryService(db)
+
+    try:
+        return service.approve_memory(memory_id)
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+
+
+@router.post(
+    "/{memory_id}/reject",
+    response_model=MemoryResponse,
+    responses={404: {"description": "Memory not found"}},
+)
+def reject_memory(
+    memory_id: int,
+    db: Session = Depends(get_db),
+) -> MemoryResponse:
+    service = MemoryService(db)
+
+    try:
+        return service.reject_memory(memory_id)
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
 
 
 @router.delete(

@@ -23,6 +23,7 @@ def test_list_tools_returns_registered_tools() -> None:
             "search_knowledge_base",
             "get_current_datetime",
             "list_recent_documents",
+            "remember",
         }
 
         for tool in response.json():
