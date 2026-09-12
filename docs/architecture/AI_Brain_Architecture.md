@@ -1987,11 +1987,22 @@ verify the destination path (`<quarantine_root>/<execution_id>/
 not defensive theater**: `os.rename()` silently overwrites an existing
 destination on POSIX with no error at all - this check is the only
 thing standing between "nothing there yet" and silent data
-destruction) → exactly one `os.rename()` → verify the result (source
-gone, destination present, hash/size match) before ever recording
-`SUCCESS` - a `rename()` that raised no error but left something the
-verification cannot corroborate is recorded `UNKNOWN`, never trusted
-into a false `SUCCESS`.
+destruction) → exactly one `os.rename()` → **verify the resulting
+quarantine object** before ever recording `SUCCESS`, checking each
+condition independently and by name (so a failing test - or a future
+reader - can see exactly which one broke, not one opaque combined
+boolean): the source path no longer exists; the destination exists as
+a genuine regular file; the destination is *not* a symlink (checked
+explicitly, never merely implied by a hash comparison); and the
+destination's hash and size match what the plan expected. "No
+unexpected second filesystem operation occurred" holds by
+construction, not by a runtime check - `_attempt_action` contains
+exactly one `os.rename()` call site, and nothing in this class ever
+calls copy, chmod, or a second move. Any one of these conditions
+failing - a `rename()` that raised no error but left something the
+verification cannot corroborate - is recorded `UNKNOWN`, with the
+specific failed check(s) named in `error_message`, never trusted into
+a false `SUCCESS`.
 
 **Failure policy, exactly as specified**: the first action that does
 not cleanly succeed stops the run; every action already recorded
@@ -2015,7 +2026,7 @@ the assumption every other test in the suite depends on for its
 accidentally passing only because the device check never actually
 distinguished them).
 
-**Tests**: 28 real-database (`aibrain_test`) + real-synthetic-
+**Tests**: 30 real-database (`aibrain_test`) + real-synthetic-
 filesystem (`tmp_path`) tests, covering: successful quarantine
 (including byte-for-byte destination content verification), hash
 mismatch, size mismatch, missing source, a symlinked source, a
@@ -2025,15 +2036,33 @@ authorization revoked mid-run, a live `Document.source_type` change
 raw file change), destination collision, a real permission failure
 (skipped when running as root, where the check is meaningless), stop-
 on-first-failure with the middle of three actions corrupted, an
-all-actions-fail case, a mocked post-move verification mismatch
-(`UNKNOWN`), a mocked unexpected exception (`UNKNOWN`, and the run
-still reaches a terminal state), calling `execute()` twice after
-completion, calling it on an execution with pre-existing partial
-audits, a nonexistent execution id, and the full set of constructor
-fail-closed checks. Every test's `allowed_root`/`quarantine_root` are
-disposable `tmp_path` subdirectories, torn down automatically by
-pytest - **no test in this suite references, could reach, or was ever
-pointed at the real personal corpus.**
+all-actions-fail case, a mocked post-move hash/size mismatch
+(`UNKNOWN`), a mocked destination-is-a-symlink mismatch (`UNKNOWN`,
+exercising that specific named check on its own), a mocked unexpected
+exception (`UNKNOWN`, and the run still reaches a terminal state),
+calling `execute()` twice after completion, calling it on an execution
+with pre-existing partial audits, a nonexistent execution id, and the
+full set of constructor fail-closed checks.
+
+**Test isolation, proven the same way the production code's isolation
+is proven**: every test's `allowed_root`/`quarantine_root` is a
+disposable `tmp_path` subdirectory, created fresh and torn down
+automatically by pytest - no test in this suite references, could
+reach, or was ever pointed at the real personal corpus, the user's
+home directory, or any other existing personal-data directory, and
+none discovers a filesystem root dynamically from the host environment
+(no `os.environ`, no `BASE_DIR`/`INGESTION_DIR`, no config setting).
+`test_executor_tests_never_reference_real_paths_or_discover_roots_
+dynamically` scans the test file's own source for exactly these
+forbidden references and asserts none exist - the same source-scanning
+technique already used to prove the production code's own isolation,
+now applied to the tests themselves. (Writing that test surfaced its
+own small lesson: a source-scanning test that reads its *entire own
+file* must not spell out the literal forbidden strings in its own
+assertions or docstring, or it fails against itself - the forbidden
+literals are built via string concatenation specifically so the
+banned substrings never appear contiguously in this file's own
+source.)
 
 One real, unrelated finding surfaced while verifying zero leftover
 rows for this milestone: `aibrain_test` had two stray `dedup_plan_

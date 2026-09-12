@@ -174,7 +174,46 @@ def test_executor_source_never_references_real_corpus_path() -> None:
     source = inspect.getsource(DedupFilesystemExecutor)
     assert "/mnt" not in source
     assert "t7ssd" not in source
-    assert "vscode/data" not in source
+    assert ("vscode" + "/data") not in source
+
+
+def test_executor_tests_never_reference_real_paths_or_discover_roots_dynamically() -> None:
+    """Test isolation, proven the same way the production code's
+    isolation is proven above: THIS test file's own source contains no
+    reference to the real corpus, to the user's home directory as a
+    path prefix, or to any of this project's own settings that name a
+    real on-disk location - none of which should ever be needed to
+    construct an executor test fixture. Every allowed_root/
+    quarantine_root in this file is a `tmp_path` subdirectory, created
+    fresh per test and torn down by pytest - never an existing, real,
+    personal-data directory. (The forbidden strings themselves are
+    deliberately not spelled out literally in this docstring or in the
+    assertions below - doing so would make this test fail against its
+    own source.)"""
+    this_file = Path(__file__).read_text()
+
+    # Built via concatenation, deliberately: a literal, contiguous
+    # occurrence of these strings anywhere else in this file would be
+    # a real violation, but this function's own assertions necessarily
+    # have to name what they're checking for - splitting the literals
+    # here keeps this test from flagging itself.
+    forbidden_corpus_root = "/mnt/" + "t7ssd"
+    forbidden_corpus_subdir = "vscode" + "/data"
+    # The user's home directory as a literal path PREFIX - not merely
+    # the substring "personal" on its own, which would false-positive
+    # on pytest's own disposable tmp_path prefix (a system temp
+    # directory, never a personal-data one).
+    forbidden_home_prefix = "/home/" + "personal"
+    forbidden_env_lookup = "os." + "environ"
+    forbidden_base_dir = "BASE_" + "DIR"
+    forbidden_ingestion_dir = "INGESTION_" + "DIR"
+
+    assert forbidden_corpus_root not in this_file
+    assert forbidden_corpus_subdir not in this_file
+    assert forbidden_home_prefix not in this_file
+    assert forbidden_env_lookup not in this_file
+    assert forbidden_base_dir not in this_file
+    assert forbidden_ingestion_dir not in this_file
 
 
 def test_executor_rejects_nonexistent_allowed_root(tmp_path) -> None:
@@ -1072,6 +1111,60 @@ def test_execute_post_move_verification_mismatch_is_unknown(tmp_path) -> None:
             assert audits[0].result == DedupExecutionActionResult.UNKNOWN
             assert audits[0].filesystem_mutation_occurred is None
             assert "post-move verification" in audits[0].error_message
+            assert "destination hash/size does not match expected" in audits[0].error_message
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_execute_destination_that_is_a_symlink_is_unknown(tmp_path) -> None:
+    """Even if hash/size somehow matched, a destination that turns out
+    to be a symlink rather than the real regular file the move was
+    supposed to produce must never be reported SUCCESS - this is
+    exactly the "destination is not a symlink" check the post-move
+    verification is required to make explicit, not merely implied by
+    a hash comparison."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+        execution_service = DedupExecutionService(db)
+        executor = DedupFilesystemExecutor(db, allowed_root, quarantine_root)
+        execution_ids: list[int] = []
+
+        real_is_symlink = Path.is_symlink
+
+        def fake_is_symlink(self):
+            if str(quarantine_root) in str(self):
+                return True
+            return real_is_symlink(self)
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            with patch.object(Path, "is_symlink", fake_is_symlink):
+                finalized = executor.execute(execution.id, confirm=True)
+
+            assert finalized.status == DedupExecutionStatus.NEEDS_REVIEW
+            audits = execution_service.get_action_audits(execution.id)
+            assert audits[0].result == DedupExecutionActionResult.UNKNOWN
+            assert audits[0].filesystem_mutation_occurred is None
+            assert "destination is a symlink" in audits[0].error_message
 
         finally:
             _cleanup(

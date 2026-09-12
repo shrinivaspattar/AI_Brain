@@ -662,30 +662,46 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       recorded, everything after is explicit `NOT_ATTEMPTED`, and a
       last-resort exception handler around each action ensures the
       execution always reaches a terminal state rather than getting
-      stuck `RUNNING` from something unanticipated. 28 new tests (all
-      real-database + real-synthetic-filesystem, `aibrain_test` +
-      `tmp_path`) covering every scenario asked for: successful
-      quarantine with byte-for-byte content verification, hash/size
-      mismatch, missing source, symlinked source, multi-hard-linked
-      source, source outside the allowed root, authorization revoked
-      mid-run, a live `Document.source_type` change distinct from a
-      raw file change, destination collision, a real permission
-      failure, stop-on-first-failure with the middle of three actions
-      corrupted, an all-fail case, mocked post-move-verification and
-      unexpected-exception `UNKNOWN` paths, repeated execution
-      attempts (both after completion and against partial audits), and
-      the full constructor fail-closed suite. Full suite: 515 tests,
-      three consecutive runs, zero flakiness. One unrelated finding
-      surfaced while verifying zero leftover rows: two stray
+      stuck `RUNNING` from something unanticipated. Post-move
+      verification checks each condition independently and by name —
+      source gone, destination is a genuine regular file, destination
+      is explicitly *not* a symlink, hash/size match — rather than one
+      opaque combined boolean, so a failure names exactly which check
+      broke; "no unexpected second filesystem operation" holds by
+      construction (exactly one `os.rename()` call site in the whole
+      class). 30 new tests (all real-database + real-synthetic-
+      filesystem, `aibrain_test` + `tmp_path`) covering every scenario
+      asked for: successful quarantine with byte-for-byte content
+      verification, hash/size mismatch, missing source, symlinked
+      source, multi-hard-linked source, source outside the allowed
+      root, authorization revoked mid-run, a live
+      `Document.source_type` change distinct from a raw file change,
+      destination collision, a real permission failure, stop-on-first-
+      failure with the middle of three actions corrupted, an all-fail
+      case, a mocked post-move hash/size mismatch and a separately
+      mocked destination-is-a-symlink mismatch (each its own `UNKNOWN`
+      test), a mocked unexpected exception, repeated execution
+      attempts (both after completion and against partial audits), the
+      full constructor fail-closed suite, and — matching the explicit
+      test-isolation requirement for this milestone — a dedicated test
+      that scans the test file's own source and asserts it contains no
+      reference to the real corpus, the user's home directory, or any
+      dynamic host-environment root discovery, proven the same way the
+      production code's own isolation is proven. Full suite: 517
+      tests, three consecutive runs, zero flakiness. One unrelated
+      finding surfaced while verifying zero leftover rows: two stray
       authorization/review/document rows in `aibrain_test`, left
       behind by an *earlier* milestone's now-fixed test cleanup bug
       (never touched by any later successful run) — found and removed;
       `aibrain_test`'s dedup tables confirmed empty. **No test in this
       suite references, reads, or could reach the real personal
-      corpus** — every mutation happened inside a disposable `tmp_path`
-      pair. Deliberately not built: any API/router wiring, any default
-      or configured production root, permanent deletion, resumption of
-      a partially-run `execute()` call, `DedupExecutionActionReconciliation`
+      corpus, the user's home directory, or any other existing
+      personal-data directory** — every mutation happened inside a
+      disposable `tmp_path` pair, and none of this milestone's tests
+      discover a filesystem root dynamically from the host environment.
+      Deliberately not built: any API/router wiring, any default or
+      configured production root, permanent deletion, resumption of a
+      partially-run `execute()` call, `DedupExecutionActionReconciliation`
       (still deferred), and any frontend.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy

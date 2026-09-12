@@ -387,14 +387,40 @@ class DedupFilesystemExecutor:
         # something inconsistent at the destination (or the source
         # somehow still present) is UNKNOWN, not SUCCESS - "the OS
         # call didn't error" is not the same as "verified correct."
-        post_observation = _observe_file(str(destination))
+        # Every check below is independently named so a future reader
+        # (or a failing test) can see exactly which expectation broke,
+        # rather than one opaque combined condition.
+        destination_is_symlink = destination.is_symlink()
+        destination_is_regular_file = destination.is_file() and not destination_is_symlink
         source_still_present = source_path.exists()
-        if (
-            source_still_present
-            or not post_observation.exists
-            or post_observation.content_hash != plan_action.observed_content_hash
-            or post_observation.file_size != plan_action.observed_file_size
-        ):
+        post_observation = _observe_file(str(destination))
+        destination_hash_matches = (
+            post_observation.exists
+            and post_observation.content_hash == plan_action.observed_content_hash
+            and post_observation.file_size == plan_action.observed_file_size
+        )
+        # "No unexpected second filesystem operation occurred" is true
+        # by construction, not by a runtime check: this method contains
+        # exactly one os.rename() call site (above), and nothing here
+        # or anywhere else in this class ever calls copy, chmod, a
+        # second rename, or any other mutating filesystem function.
+        verification_passed = (
+            not source_still_present
+            and destination_is_regular_file
+            and not destination_is_symlink
+            and destination_hash_matches
+        )
+        if not verification_passed:
+            failed_checks = []
+            if source_still_present:
+                failed_checks.append("source still exists")
+            if not destination_is_regular_file:
+                failed_checks.append("destination is not a regular file")
+            if destination_is_symlink:
+                failed_checks.append("destination is a symlink")
+            if not destination_hash_matches:
+                failed_checks.append("destination hash/size does not match expected")
+
             self.execution_service.record_action_result(
                 execution.id,
                 plan_action.id,
@@ -404,7 +430,8 @@ class DedupFilesystemExecutor:
                 filesystem_mutation_occurred=None,
                 error_message=(
                     "rename() reported success but post-move verification did "
-                    "not corroborate it - manual investigation required"
+                    "not corroborate it - manual investigation required "
+                    f"(failed: {', '.join(failed_checks)})"
                 ),
             )
             return _ActionOutcome(should_continue=False)
