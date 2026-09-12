@@ -365,6 +365,76 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       layer's "Authorize this exact plan for future execution" concept
       is the highest-stakes yet exposed by this system; its UI is
       deferred until a real executor exists to authorize *for*).
+- [x] Execution audit model — prepares this pipeline for a future
+      filesystem executor without introducing one: `DedupExecution` +
+      `DedupExecutionActionAudit` (migration `16a7cf136058`),
+      `DedupExecutionService` (`app/dedup/execution_service.py`),
+      `POST /dedup/authorizations/{id}/executions`, `GET
+      /dedup/executions`\|`/{id}`\|`/{id}/actions`, `POST
+      /dedup/executions/{id}/actions`, `POST
+      /dedup/executions/{id}/complete`. Every method is pure
+      bookkeeping — none performs a filesystem operation; there is
+      still no filesystem executor anywhere in this codebase.
+      **Plan vs. actual, made structural**: `DedupExecutionActionAudit`
+      freezes what was *planned* (source/target path, expected
+      hash/size, action type — copied straight from the plan action,
+      never accepted as request input) alongside what *actually
+      happened* (result, observed hash/size, whether a mutation truly
+      occurred, error detail) — a `PRECONDITION_FAILED` row proves a
+      mismatch was caught with `filesystem_mutation_occurred=false`
+      sitting right next to the expected/observed values that
+      triggered it. **State machine**: `RUNNING` →
+      `COMPLETED`/`FAILED`/`PARTIALLY_COMPLETED`, always *derived* from
+      the execution's own action-audit rows by `complete_execution`,
+      never accepted as caller input — all-`SUCCESS` is `COMPLETED`,
+      zero-`SUCCESS` is `FAILED`, some-but-not-all is
+      `PARTIALLY_COMPLETED`. No `EXECUTION_STARTED`/pending states
+      exist — a row is only ever created already `RUNNING`, matching
+      how `authorize_plan` never creates a row for a failed attempt
+      either. **Failure semantics — stop on first unexpected failure,
+      always**: the spec's own worked example (10 actions, 2 succeed,
+      1 fails, 7 never attempted) is represented as exactly 10 audit
+      rows — 2 `SUCCESS`, 1 `FAILED`, 7 `NOT_ATTEMPTED` — with
+      `NOT_ATTEMPTED` an explicit recorded fact, never inferred from a
+      missing row. `complete_execution` refuses to finalize (422)
+      unless every planned action has exactly one recorded outcome —
+      "do not claim the whole plan completed" is enforced structurally.
+      **Duplicate execution prevention**: an authorization backs at
+      most one execution *ever* (`UNIQUE` constraint on
+      `dedup_executions.authorization_id`, verified to raise a real
+      Postgres `IntegrityError` when bypassed) — stricter than
+      authorization's own "at most one active" rule, since there is no
+      retry path through the same authorization; a second attempt
+      needs a brand-new authorization. `start_execution` re-checks
+      everything fresh — authorization exists, is currently
+      `AUTHORIZED`, has no existing execution, and the plan still
+      passes a `check_plan_validity` re-check run at that exact moment
+      (the TOCTOU check: being `AUTHORIZED` doesn't mean the files
+      haven't changed since). **Documented, not implemented**: the
+      future executor's required per-action sequence (load
+      authorization → confirm still valid → load plan → revalidate →
+      **revalidate the source file immediately before mutation, not
+      once for the whole plan** → perform the operation → verify →
+      record the audit → continue/stop per policy), and the
+      reversible-delete decision — recommending quarantine/staging
+      over permanent deletion for AI_Brain's first executor, noting
+      explicitly that no `_DUPLICATES_QUARANTINE` mechanism exists
+      anywhere in this codebase today. 59 new tests (26 unit, 22 API,
+      11 real-database integration), covering successful/failed/
+      partially-completed representation, the plan-vs-actual
+      distinction, authorization linkage, invalid/revoked
+      authorization, a plan gone stale after authorization, duplicate
+      execution prevention (service-level and real Postgres
+      `IntegrityError`), and audit-row immutability. Verified against
+      the real running API and the real `aibrain` database: a
+      synthetic file changed externally (never through any AI_Brain
+      code path) after execution start, recorded as
+      `PRECONDITION_FAILED` with zero mutation, execution correctly
+      derived to `FAILED`, a second execution attempt under the same
+      authorization correctly refused — then fully cleaned up with
+      zero leftover rows. Deliberately not built: the filesystem
+      executor itself, any endpoint that performs a real file action,
+      and any frontend.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

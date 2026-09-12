@@ -550,7 +550,7 @@ The full pipeline, with this milestone's addition in context:
 ```
 Detection -> Recommendation -> Human Review -> Approval
     -> Dry-run Execution Plan
-    -> Explicit Execution Authorization   (this milestone)
+    -> Explicit Execution Authorization
     -> Filesystem Execution   (not built)
     -> Verification   (not built)
 ```
@@ -849,6 +849,236 @@ events exist to record), and a decision on what a partially-completed
 execution (plan has N actions, action K fails or the process is
 interrupted) means for the remaining unexecuted actions - out of scope
 until an executor exists to actually raise the question.
+
+### Execution audit model
+
+Still no filesystem executor anywhere in AI_Brain. This milestone
+prepares the architecture for one - the execution audit model, an
+explicit execution state machine, and documented failure/safety
+semantics - without introducing any capability that creates, deletes,
+moves, renames, or modifies a real file. Every model, service method,
+and API endpoint below performs zero filesystem I/O; they exist purely
+to record and query facts a caller (eventually, a real executor)
+reports.
+
+```
+Detection -> Recommendation -> Human Review -> Approval
+    -> Dry-run Execution Plan
+    -> Explicit Execution Authorization
+    -> Filesystem Execution   (still not built)
+    -> Verification           (still not built)
+    -> Execution Audit        (this milestone - the RECORDING side)
+```
+
+**Review approval != plan generation != execution authorization !=
+execution.** Each is checked fresh and independently, never inferred
+from another: `DedupExecutionService.start_execution` does not trust
+that an authorization's `AUTHORIZED` status still implies its plan is
+valid - it re-runs `check_plan_validity` itself, the same discipline
+`authorize_plan` already applies to review approval. An authorization
+never automatically becomes an execution record; `start_execution`
+must be called explicitly, and can still fail for a perfectly valid,
+un-revoked authorization if the underlying files changed in the
+meantime.
+
+**`DedupExecution`** (`dedup_executions` table) - one row per
+authorized *attempt*: `authorization_id` (FK, **UNIQUE** - see below),
+`plan_id` (duplicated from the authorization for the same
+self-description reason `DedupExecutionPlanAction.target_document_id`
+is duplicated), `status`, `executor_identity` (optional free text -
+no real executor exists to define a version convention yet),
+`started_at`, `ended_at` (null while running), `failure_reason`
+(derived, never caller-supplied - see below), `updated_at` (this row
+*is* mutated exactly once, RUNNING -> a terminal status, unlike the
+fully immutable `DedupExecutionPlan`).
+
+**`DedupExecutionActionAudit`** (`dedup_execution_action_audits`
+table) - one row per planned action *per execution*, unique on
+`(execution_id, plan_action_id)`. This is where **plan vs. actual** is
+made structural, not just a naming convention: `planned_action`/
+`source_path`/`target_path`/`expected_content_hash`/
+`expected_file_size`/`document_id` are frozen copies of the plan
+action's own fields, copied by `DedupExecutionService.
+record_action_result` directly from the plan action row - never
+accepted as request/caller input, so nothing can describe "what was
+intended" any differently than the plan itself says. `result`/
+`observed_content_hash`/`observed_file_size`/
+`filesystem_mutation_occurred`/`error_message`/`started_at`/`ended_at`
+describe what actually happened, entirely caller-reported. Example
+from the spec, represented exactly as designed: a DELETE was planned
+with `expected_content_hash=ABC`; the file changed before mutation;
+the row records `observed_content_hash=XYZ`, `result=
+precondition_failed`, `filesystem_mutation_occurred=false` - proof
+nothing was touched, sitting right next to proof of *why*. Rows are
+immutable once inserted (no `updated_at`, no update method anywhere) -
+a recorded outcome is a permanent historical fact, matching
+`DedupExecutionPlanAction`.
+
+**Execution state machine** (`DedupExecutionStatus`): `RUNNING` ->
+one of `COMPLETED` / `FAILED` / `PARTIALLY_COMPLETED`. No persisted
+"requested"/"pending" state exists before `RUNNING`: exactly like
+`authorize_plan`, `start_execution` raises before ever creating a row
+if any precondition fails, so a row only ever comes into existence
+already running. No separate `EXECUTION_STARTED` state either - the
+moment a row is created *is* the moment execution starts; there is no
+real, observable interval between "started" and "running" for this
+system's synchronous, one-action-at-a-time model, so persisting both
+would document a distinction that can never actually be seen.
+`COMPLETED`/`FAILED`/`PARTIALLY_COMPLETED` are never accepted as
+caller input - `complete_execution` *derives* the outcome from the
+execution's own action-audit rows: all `SUCCESS` -> `COMPLETED`; zero
+`SUCCESS` among attempted/recorded actions -> `FAILED` (the very first
+action already failed or hit a precondition failure - zero progress);
+at least one `SUCCESS` and at least one non-`SUCCESS` -> `PARTIALLY_
+COMPLETED` (progress was made, then execution stopped). This split is
+introduced because it is genuinely distinguishable in the data, not
+speculatively - `PARTIALLY_COMPLETED` answers a question `FAILED`
+alone cannot: "did we make zero progress, or some?"
+
+**Failure semantics: STOP on first unexpected failure, always.** The
+worked example from the spec - 10 planned actions, 2 succeed, action 3
+fails, actions 4-10 are never attempted - is represented as exactly 10
+`DedupExecutionActionAudit` rows: 2 `SUCCESS`, 1 `FAILED`, 7
+`NOT_ATTEMPTED`. `NOT_ATTEMPTED` is itself a recorded, explicit fact -
+never the mere *absence* of a row - specifically so "not attempted"
+can never be confused with "the audit system forgot to record this."
+`complete_execution` refuses to finalize at all (422) unless every
+`DedupExecutionPlanAction` belonging to the plan has exactly one
+corresponding audit row: "do not claim the whole plan completed" is
+enforced structurally, not just documented. Once finalized, an
+execution is permanently terminal - `start_execution` refuses a second
+attempt under the same authorization (see below) and
+`record_action_result`/`complete_execution` both refuse to act on a
+non-`RUNNING` execution.
+
+**`DedupExecutionActionResult`** - four values, each a plausible real
+outcome, none invented for a capability that doesn't exist: `SUCCESS`
+(mutation occurred - today's only action type, DELETE, has no
+successful no-op form, enforced by `record_action_result`), `PRECONDITION_
+FAILED` (the mandatory immediately-before-mutation revalidation didn't
+match - by definition no mutation was attempted, enforced the same
+way), `FAILED` (the operation was attempted and the OS/filesystem
+itself failed - permissions, I/O error, unrelated to staleness),
+`NOT_ATTEMPTED` (execution stopped before reaching this action -
+`started_at`/`ended_at` are always null, since there is no real
+attempt interval to time).
+
+**Duplicate execution prevention**: an authorization backs **at most
+one execution, ever** - enforced by a `UNIQUE` constraint on
+`dedup_executions.authorization_id` (verified directly against real
+Postgres: a second insert for the same `authorization_id` raises an
+`IntegrityError`) plus a service-level pre-check for a clean 409
+before ever touching the database. This is deliberately *stricter*
+than `DedupPlanAuthorization`'s own "at most one **active**
+authorization per plan" rule (which permits revoke-then-reauthorize,
+each pass re-validating the plan fresh): there is no retry path
+through the *same* authorization for execution. A genuine second
+attempt requires a brand-new authorization - which itself requires
+today's authorization to be revoked first, and re-passes a fresh
+`check_plan_validity`. "Do not retry indefinitely" is structural here,
+not a policy note.
+
+**`start_execution` pre-check order** (every step fresh, nothing
+cached): authorization exists (404) -> authorization status is
+`AUTHORIZED` right now (409) -> no `DedupExecution` already exists for
+this authorization (409) -> `check_plan_validity` passes right now
+(422, the **TOCTOU** check - being `AUTHORIZED` is necessary but not
+sufficient, since the filesystem may have changed since authorization
+was granted). No automatic regeneration: a stale plan blocks execution
+outright, exactly as it already blocks authorization.
+
+**Filesystem safety semantics for the future executor** (documented
+here, not implemented): for *every* action, in order - load the
+authorization and confirm it is still `AUTHORIZED`; load the immutable
+plan; revalidate the relevant plan state; **revalidate the source file
+immediately before mutation** (not once for the whole plan); verify
+expected hash/size/path/type; perform exactly the planned operation;
+verify the result; persist the action audit via `record_action_result`;
+continue or stop per the failure policy above. The critical point,
+repeated because it is the single most important safety property this
+architecture depends on: **validating once for the entire plan and
+assuming all actions remain valid is not safe** - two actions in the
+same plan can be seconds apart in wall-clock time, and the filesystem
+can change in that window. `check_plan_validity` (existing, reused
+verbatim) already does everything a per-action revalidation needs; a
+future executor's only remaining job is to call it immediately before
+*each* mutation, not once at the start.
+
+**Reversibility decision - unresolved, deliberately not implemented
+this milestone**: should a future executor's DELETE mean (A) permanent
+deletion, or (B) move to a controlled quarantine/staging area first?
+**Recommendation: (B)** for AI_Brain's first filesystem executor -
+reversibility is the safer default for a system that has, until this
+point, never modified a real file, and a staging area turns an
+executor bug from data loss into an inconvenience. Note explicitly:
+**no `_DUPLICATES_QUARANTINE` constant, directory convention, or
+quarantine mechanism exists anywhere in this codebase today** (grepped
+and confirmed) - every prior mention of "quarantine" in this codebase
+is a docstring/comment explicitly listing it as a capability that does
+*not* exist. This decision must be made explicitly, before writing the
+first line of executor code - implementing DELETE-as-permanent by
+default, then trying to retrofit reversibility later, is the wrong
+order.
+
+**API** (`app/api/dedup_executions.py`): `POST
+/dedup/authorizations/{id}/executions` (start, 201, body:
+`{confirm: true, executor_identity?}`), `GET /dedup/executions`
+(optional `?plan_id=`, `?authorization_id=`, `?status=`), `GET
+/dedup/executions/{id}`, `GET /dedup/executions/{id}/actions` (list
+that execution's action audits), `POST
+/dedup/executions/{id}/actions` (record one action's actual outcome -
+body: `plan_action_id`, `result`, and only the *observed* fields;
+never the planned ones), `POST /dedup/executions/{id}/complete`
+(finalize - takes no status input, derives it). Error mapping extends
+the existing convention: not found -> 404; authorization not active,
+an execution already exists for it, an execution already finalized, or
+an action result already recorded -> 409; a stale plan, an incomplete
+audit trail, a plan-action/execution plan mismatch, or a definitional
+consistency violation (e.g. `SUCCESS` without a mutation) -> 422. **No
+endpoint anywhere performs a filesystem action, and none accepts a
+generic `execute=true` flag.**
+
+**Frontend: none built this milestone** - same deliberate scope
+decision as the two prior milestones in this pipeline.
+
+**Auditability**: the full chain - Review -> Plan -> Authorization ->
+Execution -> individual action audits - is reconstructable via foreign
+keys alone (`DedupExecution.authorization_id`/`plan_id`,
+`DedupExecutionActionAudit.execution_id`/`plan_action_id`), verified
+directly against real Postgres. `Verification`/`Execution Audit`'s
+*consuming* side (a future executor calling `check_plan_validity`
+immediately before each mutation, then calling
+`record_action_result` to report what it found) remains genuinely
+out of scope - there is nothing yet to consume these APIs, since no
+executor exists.
+
+**Real-database verification performed**: synthetic records created
+and fully exercised against real Postgres (both `aibrain_test` and, via
+the real running API, `aibrain` itself) - successful/failed/partially-
+completed execution representation, a precondition failure recorded
+against a file deliberately changed outside any AI_Brain code path
+(proving the plan-vs-actual distinction end-to-end), the
+`authorization_id` and `(execution_id, plan_action_id)` unique
+constraints both verified to raise real `IntegrityError`s when bypassed
+at the ORM level, and confirmation - via byte-for-byte file comparison
+before and after every scenario - that no file was ever created,
+deleted, moved, renamed, or modified. All `aibrain` test data was
+fully cleaned up afterward with zero leftover rows.
+
+**Deliberately not built this milestone**: the filesystem executor
+itself, any endpoint that performs a real file action, and any
+frontend. **Remaining decisions/work before a filesystem executor can
+safely be implemented**: the executor itself (the only genuinely new
+component - everything it needs to call already exists:
+`check_plan_validity`, `start_execution`, `record_action_result`,
+`complete_execution`); the DELETE-as-permanent-vs-quarantine decision
+above, made explicitly before any executor code is written; a
+concrete implementation of "revalidate immediately before every
+mutation" inside the executor's per-action loop (the mechanism exists;
+nothing calls it in a loop yet); and operational recovery semantics
+for a `DedupExecution` left stuck in `RUNNING` by a process crash
+(not modeled - genuinely out of scope until a real, long-running
+executor process exists to actually crash).
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file
