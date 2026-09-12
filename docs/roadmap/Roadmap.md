@@ -308,6 +308,63 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       check immediately before acting, is the natural next design).
       41 new tests (unit incl. real synthetic files via `tmp_path`, API,
       real-database + real-filesystem integration).
+- [x] Explicit execution authorization layer — the one thing in this
+      pipeline that is actual permission, and still strictly upstream
+      of any real filesystem action: `DedupPlanAuthorization` (migration
+      `d0ac67db7d95`), `DedupPlanAuthorizationService`
+      (`app/dedup/authorization_service.py`), `POST
+      /dedup/plans/{id}/authorize`, `GET /dedup/authorizations`\|`/{id}`\|`/{id}/currency`,
+      `POST /dedup/authorizations/{id}/revoke`. **Approval is not
+      execution authorization. Authorization is not execution.** —
+      neither `DuplicateReview.status == APPROVED` nor
+      `DedupExecutionPlan.status == GENERATED` is ever treated as
+      permission to touch a file anywhere in this codebase; only a
+      `DedupPlanAuthorization` row with `status == authorized`
+      represents that, and even that performs zero filesystem writes
+      itself. `authorize_plan` re-checks everything fresh, in order,
+      before creating a row: the plan exists (404), its review is
+      **APPROVED** (409), no other *active* authorization already
+      exists for this plan (409 — at most one active authorization per
+      plan, enforced at the service level), and — reusing the existing
+      `check_plan_validity` verbatim, not duplicated — the plan still
+      passes a validity re-check run at that exact moment (422 if
+      stale). A stale plan is refused outright, never silently
+      regenerated, updated, or patched — a human must deliberately
+      generate and review a new plan. Requires an explicit
+      `confirm: true` in the request body; there is no default that
+      authorizes anything from an empty request. **Filesystem state is
+      revalidated immediately before execution** — `validity_snapshot`
+      freezes what was true *at authorization time*, and is explicitly
+      not a permanent guarantee; the new `GET
+      /dedup/authorizations/{id}/currency` endpoint (the TOCTOU check)
+      re-runs `check_plan_validity` fresh on every call and reports a
+      combined `is_still_actionable`, proven against real files to flip
+      from `true` to `false` the instant a planned file is edited after
+      authorization, while the authorization's own frozen snapshot
+      stays exactly as it was. A future filesystem executor must still
+      perform its own fresh revalidation immediately before every
+      mutation regardless of this check. 45 new tests (17 unit, 15 API,
+      13 real-database + real-filesystem integration), covering every
+      case from the spec: approved+valid succeeds; pending/rejected
+      review rejected; stale plan (changed hash/size/path/file
+      type/missing source) rejected; nonexistent plan 404; duplicate
+      active authorization rejected; an authorization proven bound to
+      its exact plan and unusable for any other plan, including a
+      second plan from the same review; the plan, its review, and both
+      real synthetic files proven byte-for-byte unchanged by
+      authorization, revocation, or a currency check. Verified against
+      the real running API and the real `aibrain` database (synthetic
+      temp files only) through the full 8-step protocol: authorize a
+      valid plan → no mutation → edit the file → old plan's
+      authorization now refused → generate a fresh plan → it captures
+      the new file state → authorize the fresh plan → still no
+      mutation — then fully cleaned up with zero leftover rows.
+      Deliberately not built: any endpoint or executor that consumes an
+      authorization to perform a real file action, any execution-audit
+      record (nothing exists yet to audit), and any frontend (this
+      layer's "Authorize this exact plan for future execution" concept
+      is the highest-stakes yet exposed by this system; its UI is
+      deferred until a real executor exists to authorize *for*).
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

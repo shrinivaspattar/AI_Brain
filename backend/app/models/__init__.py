@@ -1,4 +1,5 @@
 from app.models.conversation import Conversation
+from app.models.dedup_authorization import DedupPlanAuthorization, DedupPlanAuthorizationStatus
 from app.models.dedup_execution_plan import DedupExecutionPlan, DedupExecutionPlanAction
 from app.models.dedup_review import DuplicateReview, DuplicateReviewMember
 from app.models.document import Document
@@ -12,6 +13,8 @@ __all__ = [
     "Conversation",
     "DedupExecutionPlan",
     "DedupExecutionPlanAction",
+    "DedupPlanAuthorization",
+    "DedupPlanAuthorizationStatus",
     "Document",
     "DocumentChunk",
     "DuplicateReview",

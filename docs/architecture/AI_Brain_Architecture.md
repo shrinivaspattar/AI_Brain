@@ -549,8 +549,8 @@ The full pipeline, with this milestone's addition in context:
 
 ```
 Detection -> Recommendation -> Human Review -> Approval
-    -> Dry-run Execution Plan   (this milestone)
-    -> Explicit Execution Authorization   (not built)
+    -> Dry-run Execution Plan
+    -> Explicit Execution Authorization   (this milestone)
     -> Filesystem Execution   (not built)
     -> Verification   (not built)
 ```
@@ -686,6 +686,169 @@ since none of those have anything to attach to yet. No real file was
 read for anything other than computing a hash/size, and none was
 written, moved, renamed, deleted, or overwritten anywhere in this
 milestone.
+
+### Explicit execution authorization layer
+
+**Approval is not execution authorization. Authorization is not
+execution.** Neither `DuplicateReview.status == APPROVED` nor
+`DedupExecutionPlan.status == GENERATED` is ever treated anywhere in
+this codebase as permission to touch a file. This milestone adds the
+one thing that *is* such permission - and even it is not a filesystem
+action: creating, listing, reading, or revoking a
+`DedupPlanAuthorization` performs zero filesystem writes. There is
+still no filesystem executor anywhere in AI_Brain; this layer exists to
+be the thing a future executor will be required to check before acting,
+not to act on anything itself.
+
+**`DedupPlanAuthorization`** (`dedup_plan_authorizations` table):
+`plan_id` (FK to `dedup_execution_plans.id`, NOT NULL - binds an
+authorization to exactly one immutable plan, permanently; no method
+anywhere reassigns it), `status` (an enum with exactly two reachable
+values, `authorized` and `revoked` - deliberately no `executed`/`failed`
+value, since no filesystem executor exists anywhere in this codebase to
+ever produce that event; inventing it now would document a lifecycle
+stage this system cannot enter, the same reasoning already applied to
+`DedupPlanStatus` and `DedupPlanActionType`), `validity_snapshot`
+(JSONB - a frozen copy of the `PlanValidity` result the pre-check
+computed at the moment authorization was granted, via
+`dataclasses.asdict()`; proof of what was true then, deliberately not a
+duplicate of the plan or its actions, which stay reachable via
+`plan_id` and never change), `authorized_by` (optional free text, this
+being a single-user system with no account model - mirrors
+`DuplicateReview.reviewer_decision`), `authorized_at`, `revoked_at`/
+`revocation_reason` (nullable - populated only on revocation),
+`created_at`, and - unlike the fully immutable `DedupExecutionPlan` -
+an `updated_at`, since status *can* change (`authorized` ->
+`revoked`).
+
+**No persisted "requested"/"pending" authorization state.** The
+lifecycle is: `GENERATED PLAN -> AUTHORIZATION REQUESTED (ephemeral
+API call, not a row) -> AUTHORIZED -> [future: EXECUTED/FAILED, out of
+scope] / REVOKED`. If any pre-check fails, `authorize_plan` raises
+before ever calling `db.add` - no half-authorized row is ever written,
+matching how `DedupReviewService`/`DedupExecutionPlanService` already
+raise `ValueError` before persisting anything for a failed attempt.
+
+**At most one *active* (non-revoked) authorization per plan**,
+enforced at the application/service level in `authorize_plan` (a
+`SELECT` for an existing `authorized`-status row for the same
+`plan_id`), not as a database constraint - the same precedent already
+set by `DuplicateReview`'s PENDING-only guard and `ImportJob`'s state
+transitions. Attempting to authorize an already-actively-authorized
+plan raises (409); revoking first and re-authorizing is the only path
+to a second authorization for the same plan.
+
+**Authorization is a single synchronous call requiring explicit
+confirmation**: `AuthorizePlanRequest.confirm` must be literally `true`
+in the request body - there is no default that authorizes anything from
+an empty or omitted body. This satisfies "require explicit
+confirmation" without a two-phase request/confirm HTTP exchange.
+
+**Pre-check order in `DedupPlanAuthorizationService.authorize_plan`**
+(every step re-fetched fresh, nothing cached or trusted from an
+earlier call in this same session):
+1. Fetch the plan fresh (`DedupExecutionPlanService.get_plan`) - 404 if
+   missing.
+2. Fetch its review fresh via `plan.review_id` - 404 if somehow missing
+   (defensive; FK integrity should make this unreachable).
+3. Confirm `review.status == APPROVED` - 409 if not (pending or
+   rejected are both refused identically here, exactly as
+   `generate_plan_for_review` already refuses them).
+4. Confirm no other *active* authorization already exists for this
+   plan - 409 if one does.
+5. Run `DedupExecutionPlanService.check_plan_validity(plan_id)` fresh -
+   the **existing** dry-run staleness check, reused verbatim, not
+   duplicated - and refuse (422) unless `validity.is_valid`.
+
+Only after all five pass is a `DedupPlanAuthorization` row created,
+carrying the passing `PlanValidity` as `validity_snapshot`.
+
+**No automatic regeneration, ever.** A stale plan is refused outright;
+`authorize_plan` never regenerates, updates, or silently patches a
+plan on the caller's behalf. A human must deliberately call `POST
+/dedup/reviews/{review_id}/plans` again and have the new plan
+independently pass its own fresh validity check.
+
+**TOCTOU: authorization is not a permanent guarantee.** *Filesystem
+state is revalidated immediately before execution* - not merely
+"was valid a moment ago." `validity_snapshot` is historical proof of
+what `check_plan_validity` found at authorization time; it is
+explicitly **not** a promise that stays true afterward, since the
+filesystem can change the instant after the call returns. The
+`check_currency` method (exposed as `GET
+/dedup/authorizations/{id}/currency`) makes this boundary explicit by
+re-running `check_plan_validity` fresh on every call and combining it
+with the authorization's current (non-frozen) `status` into one
+`is_still_actionable` boolean - deliberately separate from, and able to
+disagree with, the frozen snapshot. Verified against real files: an
+authorization created while a file is unchanged reports
+`is_still_actionable: true`; editing that file afterward flips it to
+`false` on the very next `check_currency` call, while
+`validity_snapshot` on the authorization itself remains exactly what it
+was at authorization time. **Whoever eventually builds a filesystem
+executor must still perform its own fresh `check_plan_validity`
+immediately before every mutation, every time** - `check_currency`
+narrows the TOCTOU window for callers who ask, but does not eliminate
+it, since the filesystem can change in the instant between that
+question and the next action.
+
+**API** (`app/api/dedup_plan_authorizations.py`): `POST
+/dedup/plans/{plan_id}/authorize` (create, 201, body:
+`{confirm: true, authorized_by?}`), `GET /dedup/authorizations`
+(optional `?plan_id=`, `?status=`), `GET /dedup/authorizations/{id}`,
+`GET /dedup/authorizations/{id}/currency` (the TOCTOU check above),
+`POST /dedup/authorizations/{id}/revoke` (optional body `{reason?}`).
+Error mapping extends the existing convention: not found -> 404;
+review not approved, an active authorization already exists, or an
+authorization is already revoked -> 409; a missing/false `confirm` or a
+plan that failed its fresh validity re-check -> 422. **No execution
+endpoint exists anywhere in this API, and no endpoint anywhere accepts
+a generic `execute=true` flag.**
+
+**Frontend: none built this milestone**, a deliberate scope decision
+consistent with the prior dry-run-planning milestone. This layer
+introduces the highest-stakes concept yet exposed by this system - an
+explicit, named "authorize this for future execution" action - and
+building its UI without a concrete filesystem executor to authorize
+*for* would be speculative. If a frontend is added once an executor
+exists, it must remain read-only with respect to files, must present
+authorization as "Authorize this exact plan for future execution," and
+must never label it "Delete," "Clean up," or "Execute."
+
+**Auditability**: the chain `Review -> Plan -> Authorization` is fully
+reconstructable - a `DedupPlanAuthorization` reaches its plan via
+`plan_id`, and the plan reaches its review via `review_id`, with
+`validity_snapshot` proving what was independently re-verified at each
+authorization attempt (not merely what the plan looked like at
+*generation* time). `Future Execution -> Future Verification ->
+Execution Audit` are explicitly out of scope: no execution-audit table
+exists yet, since nothing produces execution events to audit.
+
+**Real-filesystem verification performed**: the full 8-step protocol -
+authorize a valid synthetic plan (succeeds, no file touched); modify a
+planned file; authorize the now-stale plan (refused, 422); generate a
+fresh plan; confirm the fresh plan captures the new file state;
+authorize the fresh, valid plan (succeeds); confirm authorization
+itself never modified any file - was run against the real running API
+and the real `aibrain` database (via a temporary synthetic directory,
+never the personal corpus), then fully cleaned up with zero leftover
+rows.
+
+**Deliberately not built this milestone**: any filesystem executor,
+any endpoint that consumes an authorization to perform a real file
+action, any execution-audit record (nothing exists yet to audit), and
+any frontend. **Remaining work before a filesystem executor can safely
+be implemented**: the executor itself (the only genuinely new
+component), a per-mutation immediate revalidation call into
+`check_plan_validity` (the existing method already does everything
+needed; the executor must simply call it, and abort on `is_valid ==
+False`, immediately before *each* file operation rather than once for
+the whole plan), a persisted execution-audit table recording per-action
+outcomes (this is a natural, ordinary extension once real execution
+events exist to record), and a decision on what a partially-completed
+execution (plan has N actions, action K fails or the process is
+interrupted) means for the remaining unexecuted actions - out of scope
+until an executor exists to actually raise the question.
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file
