@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.api.chat import router as chat_router
 from app.api.database import router as database_router
+from app.api.dedup import router as dedup_router
 from app.api.documents import router as documents_router
 from app.api.health import router as health_router
 from app.api.memory import router as memory_router
@@ -31,3 +32,4 @@ app.include_router(rag_router)
 app.include_router(chat_router)
 app.include_router(memory_router)
 app.include_router(tools_router)
+app.include_router(dedup_router)

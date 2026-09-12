@@ -30,6 +30,7 @@ class DocumentService:
             title=document_data.title,
             source=document_data.source,
             source_type=document_data.source_type,
+            content_hash=document_data.content_hash,
             import_job_id=document_data.import_job_id,
         )
 

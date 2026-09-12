@@ -31,6 +31,17 @@ class Document(Base):
         nullable=False,
     )
 
+    # SHA-256 hex digest of the file's raw bytes, for exact-duplicate
+    # detection. Nullable: only computed when ingestion has real file
+    # access (DocumentIngestor); a document created via POST /documents
+    # (metadata only, no guaranteed file access) may not have one.
+    # Deliberately not unique - duplicates are exactly what this is for.
+    content_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+
     import_job_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("import_jobs.id"),

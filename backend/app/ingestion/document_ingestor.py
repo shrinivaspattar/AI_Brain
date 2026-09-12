@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from app.ingestion.archive import ArchiveExtractor
@@ -8,6 +9,8 @@ from app.services.document_service import DocumentService
 
 
 ARCHIVE_CONTAINER_SUFFIXES = {".zip", ".7z"}
+
+_HASH_READ_CHUNK_SIZE = 1024 * 1024
 
 
 class DocumentIngestor:
@@ -63,5 +66,24 @@ class DocumentIngestor:
             title=file.path.name,
             source=str(file.path),
             source_type=file.path.suffix.lower().lstrip(".") or "unknown",
+            content_hash=_hash_file(file.path),
             import_job_id=import_job_id,
         )
+
+
+def _hash_file(path: Path) -> str | None:
+    """SHA-256 of a file's bytes, streamed to avoid loading it fully into
+    memory. Returns None (rather than raising) if the file can't be read -
+    exact-duplicate detection is a nice-to-have, not something that should
+    ever block ingestion.
+    """
+    digest = hashlib.sha256()
+
+    try:
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(_HASH_READ_CHUNK_SIZE), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    except OSError:
+        return None

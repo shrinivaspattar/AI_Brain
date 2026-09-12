@@ -24,6 +24,7 @@ def test_list_tools_returns_registered_tools() -> None:
             "get_current_datetime",
             "list_recent_documents",
             "remember",
+            "find_duplicate_documents",
         }
 
         for tool in response.json():

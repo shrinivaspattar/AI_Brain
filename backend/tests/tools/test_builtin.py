@@ -17,6 +17,7 @@ def test_build_default_registry_registers_expected_tools() -> None:
         "get_current_datetime",
         "list_recent_documents",
         "remember",
+        "find_duplicate_documents",
     }
 
 
@@ -95,6 +96,82 @@ def test_list_recent_documents_reports_none_ingested() -> None:
     result = registry.call("list_recent_documents", {})
 
     assert result.content == "No documents have been ingested yet."
+
+
+def test_find_duplicate_documents_defaults_to_exact_scope() -> None:
+    db = MagicMock()
+
+    document_a = Document(
+        id="doc-1", title="a.txt", source="/documents/a.txt", source_type="txt"
+    )
+    document_b = Document(
+        id="doc-2", title="b.txt", source="/documents/b.txt", source_type="txt"
+    )
+
+    with patch("app.tools.builtin.DeduplicationService") as dedup_service_class:
+        from app.dedup.service import ExactDuplicateGroup
+
+        dedup_service_class.return_value.find_exact_duplicates.return_value = [
+            ExactDuplicateGroup(
+                content_hash="hash-a",
+                documents=[document_a, document_b],
+            )
+        ]
+
+        registry = build_default_registry(db)
+
+    result = registry.call("find_duplicate_documents", {})
+
+    dedup_service_class.return_value.find_exact_duplicates.assert_called_once()
+    assert "2 identical copies" in result.content
+    assert "a.txt" in result.content
+    assert "b.txt" in result.content
+
+
+def test_find_duplicate_documents_near_scope() -> None:
+    db = MagicMock()
+
+    document_a = Document(
+        id="doc-1",
+        title="report-v1.pdf",
+        source="/documents/report-v1.pdf",
+        source_type="pdf",
+    )
+    document_b = Document(
+        id="doc-2",
+        title="report-v2.pdf",
+        source="/documents/report-v2.pdf",
+        source_type="pdf",
+    )
+
+    with patch("app.tools.builtin.DeduplicationService") as dedup_service_class:
+        from app.dedup.service import NearDuplicatePair
+
+        dedup_service_class.return_value.find_near_duplicate_documents.return_value = [
+            NearDuplicatePair(document_a=document_a, document_b=document_b, similarity=0.97)
+        ]
+
+        registry = build_default_registry(db)
+
+    result = registry.call("find_duplicate_documents", {"scope": "near"})
+
+    dedup_service_class.return_value.find_near_duplicate_documents.assert_called_once()
+    assert "report-v1.pdf" in result.content
+    assert "report-v2.pdf" in result.content
+    assert "0.97" in result.content
+
+
+def test_find_duplicate_documents_reports_none_found() -> None:
+    db = MagicMock()
+
+    with patch("app.tools.builtin.DeduplicationService") as dedup_service_class:
+        dedup_service_class.return_value.find_exact_duplicates.return_value = []
+
+        registry = build_default_registry(db)
+
+    result = registry.call("find_duplicate_documents", {})
+
+    assert result.content == "No exact duplicate documents found."
 
 
 def test_remember_proposes_a_pending_memory() -> None:

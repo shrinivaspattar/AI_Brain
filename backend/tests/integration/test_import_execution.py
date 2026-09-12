@@ -1,3 +1,4 @@
+import hashlib
 import socket
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -14,12 +15,32 @@ from app.models.import_job import ImportJob, ImportStatus
 from app.services.import_job_service import ImportJobService
 
 
+def _fake_embedding_for(text: str) -> list[float]:
+    """A cheap, deterministic, content-dependent fake embedding.
+
+    Deliberately NOT a constant vector: aibrain_test has no per-test
+    isolation (rows accumulate across runs - a known, tracked
+    limitation), and a constant embedding made every accumulated chunk
+    mutually "identical" under cosine similarity. That silently broke
+    any later query that scans the whole corpus (e.g. dedup's
+    near-duplicate search saw thousands of spurious 1.0-similarity
+    pairs). Hashing the text into the vector keeps embeddings varied
+    without needing a real model.
+    """
+    dimensions = settings.EMBEDDING_DIMENSIONS
+    vector = [0.0] * dimensions
+
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    for index, byte in enumerate(digest):
+        vector[index % dimensions] += (byte / 255.0) - 0.5
+
+    return vector
+
+
 def fake_embedding_client() -> MagicMock:
     """A deterministic stand-in for EmbeddingClient, independent of Ollama."""
     client = MagicMock()
-    client.embed.side_effect = lambda texts: [
-        [0.1] * settings.EMBEDDING_DIMENSIONS for _ in texts
-    ]
+    client.embed.side_effect = lambda texts: [_fake_embedding_for(t) for t in texts]
     return client
 
 

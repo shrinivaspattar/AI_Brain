@@ -5,6 +5,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session
 
+from app.dedup.service import DeduplicationService
 from app.memory.service import MemoryService
 from app.rag.retrieval_service import RetrievalService
 from app.services.document_service import DocumentService
@@ -37,6 +38,7 @@ def build_default_registry(
     retrieval_service = RetrievalService(db)
     document_service = DocumentService(db)
     memory_service = MemoryService(db)
+    dedup_service = DeduplicationService(db)
 
     def search_knowledge_base(query: str, top_k: int = 5) -> str:
         results = retrieval_service.search(query, top_k=int(top_k))
@@ -130,6 +132,54 @@ def build_default_registry(
             "It won't be used in future conversations until the user "
             "approves it."
         )
+
+    def find_duplicate_documents(scope: str = "exact") -> str:
+        if scope == "near":
+            pairs = dedup_service.find_near_duplicate_documents()
+
+            if not pairs:
+                return "No near-duplicate documents found."
+
+            return "\n".join(
+                f"{pair.document_a.title} ~ {pair.document_b.title} "
+                f"(similarity {pair.similarity:.2f})"
+                for pair in pairs
+            )
+
+        groups = dedup_service.find_exact_duplicates()
+
+        if not groups:
+            return "No exact duplicate documents found."
+
+        return "\n".join(
+            f"{len(group.documents)} identical copies: "
+            + ", ".join(document.title for document in group.documents)
+            for group in groups
+        )
+
+    registry.register(
+        Tool(
+            name="find_duplicate_documents",
+            description=(
+                "Find duplicate ingested documents. 'exact' finds "
+                "byte-identical files (same content hash); 'near' finds "
+                "documents whose opening content is highly similar but "
+                "not identical. This only reports duplicates - it never "
+                "deletes or modifies anything."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["exact", "near"],
+                        "description": "Which kind of duplicates to look for (default exact).",
+                    },
+                },
+            },
+            handler=find_duplicate_documents,
+        )
+    )
 
     registry.register(
         Tool(
