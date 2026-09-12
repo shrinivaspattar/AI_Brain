@@ -770,6 +770,48 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       root discovery, no real-corpus execution, and no permanent
       deletion were added** — the real corpus was not read, mutated, or
       referenced by any code or test in this milestone.
+- [x] Executor Reconciliation & TOCTOU Strategy — design only, zero
+      code changed, settling every question the hardening milestone
+      left deferred. **TOCTOU**: current containment (re-observation +
+      post-move verification) judged sufficient for continued
+      synthetic-only development but explicitly *not* sufficient to
+      authorize real-corpus use — the residual same-hash/same-size
+      substitution gap is real, if narrow, given AI_Brain's
+      single-process, no-API threat model. Closing primitive chosen:
+      inode-identity pinning via file descriptor (open the source,
+      `fstat` for `(st_dev, st_ino)`, hash through the fd, then after
+      `os.rename()` compare the destination's `stat()` identity against
+      the pinned one) — proves the object actually moved is the exact
+      inode last observed, independent of content, with no advisory
+      locking needed since the actors capable of racing this window
+      (the user, an editor, a backup job) have no reason to cooperate
+      with a lock this system invents. **Reconciliation**: finalizes
+      the `DedupExecutionActionReconciliation` shape first proposed in
+      the Executor Safety & Recovery Design milestone (audit-scoped,
+      unique per audit, `verified_result` restricted to SUCCESS/FAILED,
+      purely additive — never edits the original audit row or
+      retroactively changes `DedupExecution.status`). New design
+      decision: reconciliation must corroborate the human's claim
+      against the system's own fresh, independent re-observation of the
+      source path before recording it (`SUCCESS` requires the file to
+      currently not exist; `FAILED` requires it to still match its
+      pre-mutation expected hash/size) — a claim inconsistent with what
+      the system can itself observe is refused, not trusted blindly.
+      **Confirmed, not changed**: re-planning's existing live-file-
+      existence exclusion already makes reconciliation's effect on
+      future plans exactly zero, by design — the live filesystem check
+      is the sole authority regardless of whether a historical `UNKNOWN`
+      was ever reconciled. **Confirmed**: reconciliation can never
+      auto-authorize a new execution — a new attempt always requires
+      the full explicit plan → authorization → execution chain,
+      unchanged. **One genuine gap surfaced**: `recover_stale_execution`
+      does not itself take a `SELECT ... FOR UPDATE` claim before
+      writing, unlike the executor's own `_claim_execution` — flagged as
+      a required fix for the next implementation milestone, not fixed
+      here. Deliberately not built this pass: the reconciliation
+      model/migration/service/API/tests themselves, the fd-pinning
+      implementation, the `recover_stale_execution` locking fix, any
+      API/UI exposure, any real-corpus execution.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

@@ -2248,6 +2248,161 @@ quarantine-vs-permanent-delete semantics. **The real corpus was not
 read, mutated, or referenced by any code or test added in this
 milestone.**
 
+### Executor Reconciliation & TOCTOU Strategy — design only, zero code changed
+
+A design pass settling every open question the hardening milestone left
+explicitly deferred, before any of it becomes an implementation
+milestone. **Zero code, model, migration, service, or test changed** -
+this section documents decisions only.
+
+**1. Is the current TOCTOU containment sufficient for AI_Brain's threat
+model? No - not for real-corpus use, though it is sufficient for the
+system's current synthetic-only, human-supervised stage.** AI_Brain
+runs as a single process with no API/UI exposure to the executor and
+no untrusted multi-tenant access, so the realistic risk is not a live
+adversary racing `os.rename()` - it is a low-probability but nonzero
+window in which some other legitimate actor (the user's own editor, an
+external backup/sync job, antivirus scanning) touches a source file in
+the microseconds between the executor's final re-observation and the
+move. Post-move verification already turns a *content-different*
+substitution into `UNKNOWN` rather than a false `SUCCESS` (see
+"Executor hardening," above) - the residual gap is narrow and specific:
+a same-hash, same-size substitution in that exact window would be
+recorded as `SUCCESS` even though the file the executor actually moved
+was not the one it last observed. For a mutation system acting on
+irreplaceable personal data, that residual is real enough to gate
+real-corpus use on closing it, even though it does not block continued
+synthetic-only development.
+
+**2. What primitive should close it: inode-identity pinning via file
+descriptor, not advisory locking.** The concrete design: open the
+source path with `os.open()` to get a file descriptor, `os.fstat(fd)`
+that descriptor to capture its `(st_dev, st_ino)` - the kernel's
+ground-truth identity for "this exact inode," immune to any later
+rename or replacement of the *name* - then hash the file's content by
+reading through that same fd (not by re-opening the path), so the hash
+that gates the decision to mutate is guaranteed to describe the literal
+bytes behind that inode. After `os.rename()` completes, `os.stat()` the
+destination path and compare its `(st_dev, st_ino)` against the fd's
+captured identity. A match proves, independent of content, that the
+object moved to quarantine is the exact inode last observed and hashed
+- no substitution in the intervening window could produce a match,
+because a substitution necessarily involves a different inode even
+when its content happens to be byte-identical. Advisory locking was
+considered and rejected: it only constrains cooperating processes, and
+the actors capable of touching a file in this window (the user, an
+editor, a backup tool) have no reason to participate in a lock this
+system invents. Inode-pinning needs no other actor's cooperation at
+all - it is a verification the executor performs entirely on its own
+after the fact.
+
+**3. How `UNKNOWN` reconciles without mutating historical audit
+rows: the existing designed shape, unchanged, finalized here.**
+`DedupExecutionActionReconciliation` (proposed in the earlier
+Executor Safety & Recovery Design, "designed, not implemented"):
+
+```
+DedupExecutionActionReconciliation
+    id
+    audit_id              -- FK to DedupExecutionActionAudit, UNIQUE
+                           --   (at most one reconciliation per audit)
+    verified_result        -- SUCCESS or FAILED only
+    verified_by             -- free text, mirrors authorized_by
+    verification_method     -- free text: HOW it was verified
+    observed_content_hash   -- the reconciler's OWN re-observation,
+                             --   captured independently of the human's
+                             --   claim (see point 4)
+    observed_file_size
+    verified_at
+    created_at
+```
+
+Purely additive: the original `DedupExecutionActionAudit` row is never
+edited, and `DedupExecution.status` (`NEEDS_REVIEW` included) is never
+retroactively rewritten - a reconciliation answers "what do we now
+believe happened," not "what should history have said."
+
+**4. How a human-verified outcome becomes a reconciliation record: a
+new `reconcile_action(audit_id, verified_result, verified_by,
+verification_method)` service method that corroborates the human's
+claim against the system's own fresh, independent re-observation rather
+than trusting it blindly.** Preconditions: the audit must exist, its
+`result` must currently be `UNKNOWN` (a definite `SUCCESS`/`FAILED`/
+`PRECONDITION_FAILED`/`NOT_ATTEMPTED` never needs reconciling), and no
+reconciliation may already exist for it (mirroring
+`record_action_result`'s own one-outcome-per-action pattern). The
+method then calls the existing, non-mutating `_observe_file` on the
+audit's own `source_path` - exactly the same read `recover_stale_
+execution` already performs - and requires the live observation to be
+*consistent* with the claimed `verified_result` before recording it:
+`SUCCESS` requires the source path to currently not exist (a delete
+genuinely cannot have happened if the file is still there); `FAILED`
+requires the source path to currently exist, matching the audit's own
+`expected_content_hash`/`expected_file_size` (nothing happened to the
+original). A claim inconsistent with what the system can itself
+observe right now is refused (`ValueError`), not silently recorded -
+the same "never trust an unverifiable claim" posture the whole executor
+is built on, now applied to the human's own investigation rather than
+only to the executor's. The independent observation is stored on the
+reconciliation row alongside the human's `verification_method`, so a
+later reader sees both what the human reported and what the system
+itself confirmed at that moment.
+
+**5. Effect on subsequent planning: none, by design - already true
+today, unchanged by reconciliation's existence.** `generate_plan_for_
+review`'s live-file-existence exclusion (see "Execution Recovery &
+Partial-Replanning Design") re-observes the *actual* filesystem at
+plan-generation time regardless of whether any reconciliation row
+exists - a member whose file is gone is excluded whether that fact is
+reconciled or not. Reconciliation exists purely for human auditability
+and confidence in the historical record; the live check remains the
+sole authority for what a new plan may safely propose, and stays that
+way with this design.
+
+**6. Can reconciliation ever auto-authorize another execution: no.**
+`reconcile_action` performs no filesystem operation, creates no plan,
+authorization, or execution, and does not change `DedupExecution.
+status`. A new execution against the same review always requires the
+full explicit chain unchanged by this design - fresh plan generation,
+fresh authorization, fresh `start_execution` - regardless of whether
+the earlier `UNKNOWN` was ever reconciled. This is the same principle
+underlying every gate built so far: **authorization grants permission
+to execute a specific immutable plan; it does not grant permission to
+reinterpret the plan or discover new filesystem targets** - and
+reconciliation, being purely forensic, must never become a path around
+that.
+
+**7. Can an executor crash be recovered without manual database
+surgery: yes today for the common case, with one genuine gap this
+design pass surfaced.** `recover_stale_execution` already closes out a
+crashed `RUNNING` execution with no manual SQL - it re-observes every
+unresolved planned action and finalizes via `complete_execution`,
+requiring no knowledge of the new `claimed_at` field at all: once
+`complete_execution` moves the execution out of `RUNNING`,
+`_claim_execution`'s own first check (`status != RUNNING`) permanently
+forecloses any future claim on that execution, exactly matching "one
+execution per authorization, permanently." **The gap**: `recover_
+stale_execution` does not itself take a `SELECT ... FOR UPDATE` claim
+before reading and writing - if the "crashed" executor were actually
+still alive (a false assumption, not a truly dead process; AI_Brain has
+no process supervision to rule this out) and resumed writing action
+results at the same moment a human called `recover_stale_execution`,
+both could race to record a result for the same plan action, which
+today would surface as a raw `IntegrityError` from the audit table's
+own unique constraint rather than the clean, deliberate refusal the
+executor's own `_claim_execution` now provides. **Recommendation for
+the next implementation milestone**: `recover_stale_execution` should
+take the same `SELECT ... FOR UPDATE` claim the executor now does
+before proceeding, for exactly the same reason - recovery is a second
+way to reach the RUNNING execution's action-writing path, and it
+deserves the same exclusivity guarantee the hardening milestone gave
+the primary path.
+
+**Deliberately not built this pass**: `DedupExecutionActionReconciliation`
+itself (model, migration, service, API, tests - this is decisions only);
+fd-pinning implementation; the `recover_stale_execution` locking fix
+identified in point 7; any API/UI exposure; any real-corpus execution.
+
 ## Provenance chain
 The schema already links every derived fact back toward a source file
 via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,
