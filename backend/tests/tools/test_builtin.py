@@ -18,6 +18,7 @@ def test_build_default_registry_registers_expected_tools() -> None:
         "list_recent_documents",
         "remember",
         "find_duplicate_documents",
+        "plan_duplicate_cleanup",
     }
 
 
@@ -172,6 +173,61 @@ def test_find_duplicate_documents_reports_none_found() -> None:
     result = registry.call("find_duplicate_documents", {})
 
     assert result.content == "No exact duplicate documents found."
+
+
+def test_plan_duplicate_cleanup_formats_plan() -> None:
+    db = MagicMock()
+
+    keep = Document(
+        id="doc-1", title="a.txt", source="/documents/a.txt", source_type="txt",
+        content_hash="hash-abcdefghijklmnop",
+    )
+    duplicate = Document(
+        id="doc-2", title="a-copy.txt", source="/documents/a-copy.txt", source_type="txt",
+        content_hash="hash-abcdefghijklmnop",
+    )
+
+    with patch("app.tools.builtin.DeduplicationService") as dedup_service_class:
+        from app.dedup.service import DryRunAction, ExactDuplicatePlan
+
+        dedup_service_class.return_value.plan_exact_duplicate_cleanup.return_value = [
+            ExactDuplicatePlan(
+                content_hash="hash-abcdefghijklmnop",
+                keep=keep,
+                actions=[
+                    DryRunAction(
+                        action="delete",
+                        document=duplicate,
+                        reason="identical to kept copy 'a.txt'",
+                    )
+                ],
+            )
+        ]
+
+        registry = build_default_registry(db)
+
+    result = registry.call("plan_duplicate_cleanup", {})
+
+    dedup_service_class.return_value.plan_exact_duplicate_cleanup.assert_called_once_with(
+        limit=10
+    )
+    assert "Keep: a.txt" in result.content
+    assert "Would delete: a-copy.txt" in result.content
+    assert "dry run only" in result.content
+    assert result.is_error is False
+
+
+def test_plan_duplicate_cleanup_reports_none_found() -> None:
+    db = MagicMock()
+
+    with patch("app.tools.builtin.DeduplicationService") as dedup_service_class:
+        dedup_service_class.return_value.plan_exact_duplicate_cleanup.return_value = []
+
+        registry = build_default_registry(db)
+
+    result = registry.call("plan_duplicate_cleanup", {})
+
+    assert result.content == "No exact duplicates to clean up."
 
 
 def test_remember_proposes_a_pending_memory() -> None:

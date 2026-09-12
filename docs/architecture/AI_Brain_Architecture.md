@@ -43,12 +43,19 @@ master backup / source files (read-only)
         │  chat_client.chat(messages, tools=...) ↔ tool_calls
         ▼
    tool loop (app/tools, up to 5 iterations) — search_knowledge_base,
-   get_current_datetime, list_recent_documents, find_duplicate_documents
-   (read-only), remember (review-gated Memory proposal)   [implemented]
+   get_current_datetime, list_recent_documents, find_duplicate_documents,
+   plan_duplicate_cleanup (all read-only/dry-run), remember
+   (review-gated Memory proposal)   [implemented]
         │
         ▼
    dedup detection (app/dedup, GET /dedup/exact|near) — exact-hash and
    near-duplicate (pgvector) document groups, detection only   [implemented]
+        │
+        ▼
+   dry-run cleanup planning (app/dedup, GET /dedup/exact/plan) — Best
+   Copy Arbitration over exact-duplicate groups (keep oldest, propose
+   deleting the rest); returns a plan only, never deletes anything
+   [implemented]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -64,8 +71,8 @@ master backup / source files (read-only)
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store + `status` (pending/approved/rejected), no type taxonomy. `POST /memory`, `GET /memory?status=`, `POST /memory/{id}/approve`\|`/reject`, `DELETE /memory/{id}`. Review-gated write hook (`remember` tool) + read hook (approved-only) into `ChatService` — see Memory, below. |
-| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents` (all read-only), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
-| `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings). Detection only — never deletes, moves, or quarantines anything. Exposed via `GET /dedup/exact`\|`/near` and the `find_duplicate_documents` tool. |
+| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
+| `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -179,7 +186,7 @@ give callers (the audit trail, below) a structured status without parsing
 the content string.
 
 `app/tools/builtin.build_default_registry(db, conversation_id=None,
-on_memory_proposed=None)` registers four tools:
+on_memory_proposed=None)` registers six tools:
 - `search_knowledge_base(query, top_k=5)` — read-only, explicit on-demand
   `RetrievalService` search, letting the model search multiple times
   with different queries within one turn, distinct from the always-on
@@ -187,6 +194,13 @@ on_memory_proposed=None)` registers four tools:
 - `get_current_datetime()` — read-only, UTC, ISO 8601.
 - `list_recent_documents(limit=10)` — read-only, wraps
   `DocumentService.list_documents`.
+- `find_duplicate_documents(scope="exact"|"near")` — read-only, wraps
+  `DeduplicationService.find_exact_duplicates`/`find_near_duplicate_documents`
+  (see Deduplication, below). Reports duplicates; never acts on them.
+- `plan_duplicate_cleanup(limit=10)` — dry-run only, wraps
+  `DeduplicationService.plan_exact_duplicate_cleanup` (Best Copy
+  Arbitration — see Deduplication, below). Returns a proposed keep/delete
+  plan as text; computing the plan has zero effect on any file or row.
 - `remember(content, confidence=None)` — the one write path, and even it
   never writes something live: see Memory, below, for the review-gate
   design (`Memory.status`) that makes this safe.
@@ -231,8 +245,8 @@ Two safety properties, both directly tested:
   gets fed back to the model — only the audit copy is capped.
 
 This is explicitly an audit/debug record — never queried for chat context,
-RAG, or memory. Today's three tools don't take secrets as arguments or
-return raw filesystem contents, so no redaction logic exists yet; a future
+RAG, or memory. None of today's tools take secrets as arguments or return
+raw filesystem contents, so no redaction logic exists yet; a future
 filesystem/write tool would need to revisit that before this trail could
 be trusted not to store something sensitive.
 
@@ -241,6 +255,49 @@ asked it to list recently ingested documents, it called
 `list_recent_documents(limit=10)` on its own, and the resulting
 `ToolCallRecord` showed the correct arguments, `SUCCESS` status,
 `message_id` linkage, and a 2ms `duration_ms`.
+
+## Deduplication
+`DeduplicationService` (`app/dedup/service.py`) is detection (and
+dry-run planning) only — nothing in this module, or anywhere else in the
+codebase, deletes, moves, or modifies a file. Three methods:
+
+- `find_exact_duplicates(limit=100)` — groups `Document` rows sharing an
+  identical `content_hash` (SHA-256 over raw file bytes, computed during
+  ingestion). Zero false positives; misses re-saved/re-compressed copies
+  that changed on disk without changing content.
+- `find_near_duplicate_documents(similarity_threshold=0.95, limit=100)` —
+  cross-joins each document's first-chunk (`chunk_index=0`) pgvector
+  embedding against every other's via cosine distance. A lightweight
+  proxy for whole-document similarity (first ~1000 characters only, not
+  a full-document comparison — that would be O(chunk_count²) and wasn't
+  needed for a first pass).
+- `plan_exact_duplicate_cleanup(limit=100)` — **Best Copy Arbitration**:
+  for each exact-duplicate group, sorts by `(created_at, id)` and
+  proposes keeping the oldest copy, with a `DryRunAction(action="delete",
+  document, reason)` for each remaining copy. Deliberately scoped to
+  exact duplicates only — "highly similar" isn't "safe to discard,"
+  so near-duplicate arbitration isn't automated. The arbitration rule
+  itself is a simple, deterministic first pass (oldest copy wins; no
+  inspection of path depth, filename quality, or file location) —
+  revisit if that assumption doesn't hold up in practice. A plan is
+  pure computed data returned to the caller; producing one never
+  writes to the database or touches a file.
+
+Exposed via `GET /dedup/exact`, `GET /dedup/near`, `GET /dedup/exact/plan`,
+and the `find_duplicate_documents`/`plan_duplicate_cleanup` chat tools
+(see Tool calling, above). Verified end-to-end: ingested two real
+byte-identical files, confirmed `GET /dedup/exact/plan` proposed keeping
+the earlier-ingested one, confirmed via direct Postgres query that both
+documents were untouched afterward, then asked the real model for a dry
+run cleanup plan — it called `plan_duplicate_cleanup`, and its answer
+matched the API's keep/delete decision exactly.
+
+This is KRM's "Dry-run mode for destructive/derived operations" item,
+narrowly scoped to exact-duplicate cleanup: there is still no code path
+anywhere that can actually delete a file, so "dry run" here means
+"compute and return a plan," not "simulate an execution that could
+otherwise happen." Executing a plan is a separate, deliberately
+unbuilt milestone.
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),

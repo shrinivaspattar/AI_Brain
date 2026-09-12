@@ -23,12 +23,30 @@ class NearDuplicatePair:
     similarity: float
 
 
-class DeduplicationService:
-    """Detection only - this never deletes, moves, or quarantines a file.
+@dataclass(frozen=True)
+class DryRunAction:
+    action: str
+    document: Document
+    reason: str
 
-    Deciding *which* copy to keep (KRM's "Best Copy Arbitration") and
-    actually acting on a duplicate are separate, riskier concerns -
-    intentionally not part of this service.
+
+@dataclass(frozen=True)
+class ExactDuplicatePlan:
+    content_hash: str
+    keep: Document
+    actions: list[DryRunAction]
+
+
+class DeduplicationService:
+    """Detection (and dry-run planning) only - this never deletes, moves,
+    or quarantines a file, and never writes anything to the database.
+
+    `plan_exact_duplicate_cleanup` performs Best Copy Arbitration and
+    proposes a cleanup plan, but a plan is just data returned to the
+    caller - producing one has zero effect on any file or row. Actually
+    carrying out a plan is a separate, riskier concern (KRM's own "Dry-run
+    mode" backlog item exists precisely because that step isn't built
+    yet) and intentionally not part of this service.
     """
 
     def __init__(self, db: Session):
@@ -135,3 +153,52 @@ class DeduplicationService:
             for document_a_id, document_b_id, dist in rows
             if document_a_id in documents and document_b_id in documents
         ]
+
+    def plan_exact_duplicate_cleanup(
+        self,
+        limit: int = DEFAULT_GROUP_LIMIT,
+    ) -> list[ExactDuplicatePlan]:
+        """Dry-run only: propose which copy to keep in each exact-duplicate
+        group and which copies would be deleted, without deleting anything.
+
+        Scoped to exact duplicates only - a byte-identical match is safe
+        to arbitrate automatically. Near-duplicates are NOT included here:
+        "highly similar" isn't "safe to discard," and arbitrating those
+        needs human judgment, not a heuristic.
+
+        Arbitration rule: keep the oldest copy (earliest `created_at`,
+        `id` as a tiebreak for equal timestamps) and propose deleting the
+        rest. This is a simple, deterministic first pass - it assumes the
+        first-ingested copy is as good a "original" as any; it does not
+        inspect file location, path depth, or filename quality. Revisit
+        if that assumption turns out to be wrong in practice.
+        """
+        groups = self.find_exact_duplicates(limit=limit)
+
+        plans = []
+        for group in groups:
+            ordered = sorted(group.documents, key=lambda d: (d.created_at, d.id))
+            keep, *rest = ordered
+
+            actions = [
+                DryRunAction(
+                    action="delete",
+                    document=document,
+                    reason=(
+                        f"identical to kept copy '{keep.title}' "
+                        f"(content_hash match); ingested {document.created_at} "
+                        f"vs. kept copy's {keep.created_at}"
+                    ),
+                )
+                for document in rest
+            ]
+
+            plans.append(
+                ExactDuplicatePlan(
+                    content_hash=group.content_hash,
+                    keep=keep,
+                    actions=actions,
+                )
+            )
+
+        return plans

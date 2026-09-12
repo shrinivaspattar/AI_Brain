@@ -1,4 +1,6 @@
-from sqlalchemy import create_engine
+from datetime import timedelta
+
+from sqlalchemy import create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
@@ -65,6 +67,63 @@ def test_find_exact_duplicates_against_real_database() -> None:
         finally:
             db.query(Document).filter(
                 Document.id.in_([doc_a.id, doc_b.id, doc_c.id])
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_plan_exact_duplicate_cleanup_against_real_database() -> None:
+    database_url = make_url(settings.DATABASE_URL).set(database="aibrain_test")
+    engine = create_engine(database_url)
+
+    with Session(engine) as db:
+        document_service = DocumentService(db)
+
+        doc_a = document_service.create_document(
+            DocumentCreate(
+                title="original.txt",
+                source="/dedup-test/original.txt",
+                source_type="txt",
+                content_hash="plan-test-hash-789",
+            )
+        )
+        doc_b = document_service.create_document(
+            DocumentCreate(
+                title="original-copy.txt",
+                source="/dedup-test/original-copy.txt",
+                source_type="txt",
+                content_hash="plan-test-hash-789",
+            )
+        )
+
+        # Force a deterministic ordering rather than relying on clock
+        # resolution between the two create_document() calls above.
+        doc_b.created_at = doc_a.created_at + timedelta(seconds=1)
+        db.commit()
+
+        try:
+            service = DeduplicationService(db)
+            plans = service.plan_exact_duplicate_cleanup()
+
+            own_plans = [p for p in plans if p.content_hash == "plan-test-hash-789"]
+            assert len(own_plans) == 1
+
+            plan = own_plans[0]
+            # doc_a was created first (earlier created_at), so it should
+            # be the one kept; doc_b is the proposed deletion.
+            assert plan.keep.id == doc_a.id
+            assert len(plan.actions) == 1
+            assert plan.actions[0].action == "delete"
+            assert plan.actions[0].document.id == doc_b.id
+
+            # nothing was actually deleted - both documents still exist
+            still_present = db.scalars(
+                select(Document).where(Document.id.in_([doc_a.id, doc_b.id]))
+            ).all()
+            assert len(still_present) == 2
+
+        finally:
+            db.query(Document).filter(
+                Document.id.in_([doc_a.id, doc_b.id])
             ).delete(synchronize_session=False)
             db.commit()
 

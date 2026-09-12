@@ -25,6 +25,7 @@ def test_list_tools_returns_registered_tools() -> None:
             "list_recent_documents",
             "remember",
             "find_duplicate_documents",
+            "plan_duplicate_cleanup",
         }
 
         for tool in response.json():

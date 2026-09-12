@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -6,13 +7,19 @@ from app.dedup.service import DeduplicationService
 from app.models.document import Document
 
 
-def _document(doc_id: str, title: str, content_hash: str | None) -> Document:
+def _document(
+    doc_id: str,
+    title: str,
+    content_hash: str | None,
+    created_at: datetime | None = None,
+) -> Document:
     return Document(
         id=doc_id,
         title=title,
         source=f"/documents/{title}",
         source_type="txt",
         content_hash=content_hash,
+        created_at=created_at or datetime(2026, 1, 1, tzinfo=UTC),
     )
 
 
@@ -104,3 +111,71 @@ def test_find_near_duplicate_documents_builds_pairs_with_similarity() -> None:
     assert pairs[0].document_a is doc1
     assert pairs[0].document_b is doc2
     assert pairs[0].similarity == pytest.approx(0.95)
+
+
+def test_plan_exact_duplicate_cleanup_keeps_oldest_copy() -> None:
+    db = MagicMock()
+    service = DeduplicationService(db)
+
+    db.execute.return_value.all.return_value = [("hash-a",)]
+
+    older = _document("doc-1", "original.txt", "hash-a", datetime(2026, 1, 1, tzinfo=UTC))
+    newer = _document("doc-2", "original-copy.txt", "hash-a", datetime(2026, 2, 1, tzinfo=UTC))
+    # Deliberately returned out of chronological order, to prove the
+    # plan sorts for itself rather than trusting caller ordering.
+    db.scalars.return_value = [newer, older]
+
+    plans = service.plan_exact_duplicate_cleanup()
+
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan.content_hash == "hash-a"
+    assert plan.keep is older
+    assert len(plan.actions) == 1
+    assert plan.actions[0].action == "delete"
+    assert plan.actions[0].document is newer
+    assert "original.txt" in plan.actions[0].reason
+
+
+def test_plan_exact_duplicate_cleanup_breaks_ties_by_id() -> None:
+    db = MagicMock()
+    service = DeduplicationService(db)
+
+    db.execute.return_value.all.return_value = [("hash-a",)]
+
+    same_time = datetime(2026, 1, 1, tzinfo=UTC)
+    doc_b = _document("doc-b", "b.txt", "hash-a", same_time)
+    doc_a = _document("doc-a", "a.txt", "hash-a", same_time)
+    db.scalars.return_value = [doc_b, doc_a]
+
+    plans = service.plan_exact_duplicate_cleanup()
+
+    assert plans[0].keep is doc_a
+    assert plans[0].actions[0].document is doc_b
+
+
+def test_plan_exact_duplicate_cleanup_returns_empty_when_no_duplicates() -> None:
+    db = MagicMock()
+    service = DeduplicationService(db)
+
+    db.execute.return_value.all.return_value = []
+
+    assert service.plan_exact_duplicate_cleanup() == []
+
+
+def test_plan_exact_duplicate_cleanup_handles_multiple_extra_copies() -> None:
+    db = MagicMock()
+    service = DeduplicationService(db)
+
+    db.execute.return_value.all.return_value = [("hash-a",)]
+
+    keep = _document("doc-1", "a.txt", "hash-a", datetime(2026, 1, 1, tzinfo=UTC))
+    copy1 = _document("doc-2", "a-copy1.txt", "hash-a", datetime(2026, 1, 2, tzinfo=UTC))
+    copy2 = _document("doc-3", "a-copy2.txt", "hash-a", datetime(2026, 1, 3, tzinfo=UTC))
+    db.scalars.return_value = [keep, copy1, copy2]
+
+    plans = service.plan_exact_duplicate_cleanup()
+
+    assert plans[0].keep is keep
+    assert {a.document for a in plans[0].actions} == {copy1, copy2}
+    assert all(a.action == "delete" for a in plans[0].actions)

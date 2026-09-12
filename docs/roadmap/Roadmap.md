@@ -150,18 +150,27 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       embeddings). Exposed via `GET /dedup/exact`, `GET /dedup/near`,
       and a `find_duplicate_documents` chat tool. Verified against real
       ingested duplicate files and the real model. **Not** included:
-      Best Copy Arbitration (deciding which copy to keep), any actual
-      file action (delete/move/quarantine — needs Dry-Run Mode first,
-      below), and image perceptual hashing (pHash) — this only covers
-      text documents with embeddings, not photos/images, which AI_Brain
-      doesn't process at all yet.
+      any actual file action (delete/move/quarantine), and image
+      perceptual hashing (pHash) — this only covers text documents with
+      embeddings, not photos/images, which AI_Brain doesn't process at
+      all yet.
 - [x] Immutable audit log — substantially covered for tool calls
       specifically (`ToolCallRecord`, Phase 4) and memory proposals
       (`Memory.status`, Phase 3); not yet extended to other subsystems
       (e.g. ingestion decisions, dedup findings themselves).
-- [ ] Dry-run mode for destructive/derived operations — not started;
-      becomes relevant once any dedup/repository-health finding can
-      trigger a real file action.
+- [x] Dry-run mode for destructive/derived operations — started, scoped
+      to exact duplicates: `DeduplicationService.plan_exact_duplicate_cleanup`
+      performs Best Copy Arbitration (keep the oldest copy by
+      `created_at`, tie-broken by `id`; propose deleting the rest) and
+      returns a plan — computing one has zero effect on any file or row.
+      Exposed via `GET /dedup/exact/plan` and a `plan_duplicate_cleanup`
+      chat tool. Verified end-to-end against the real model (it correctly
+      called the tool and reported the same keep/delete decision the API
+      returned) and confirmed via direct DB query that both documents
+      were untouched. Deliberately **not** included: near-duplicate
+      arbitration (similarity isn't identity — needs human judgment, not
+      a heuristic) and any mechanism to actually execute a plan (still no
+      code path anywhere that deletes, moves, or modifies a file).
 - [x] Confidence review queue — substantially covered for memory
       specifically (`Memory.status: pending/approved/rejected`,
       `POST /memory/{id}/approve`/`/reject`, Phase 3); not yet a

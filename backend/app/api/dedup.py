@@ -7,7 +7,11 @@ from app.dedup.service import (
     DEFAULT_NEAR_DUPLICATE_THRESHOLD,
     DeduplicationService,
 )
-from app.schemas.dedup import ExactDuplicateGroupResponse, NearDuplicatePairResponse
+from app.schemas.dedup import (
+    ExactDuplicateGroupResponse,
+    ExactDuplicatePlanResponse,
+    NearDuplicatePairResponse,
+)
 
 router = APIRouter(
     prefix="/dedup",
@@ -41,3 +45,18 @@ def find_near_duplicate_documents(
         similarity_threshold=threshold,
         limit=limit,
     )
+
+
+@router.get(
+    "/exact/plan",
+    response_model=list[ExactDuplicatePlanResponse],
+)
+def plan_exact_duplicate_cleanup(
+    db: Session = Depends(get_db),
+    limit: int = Query(default=DEFAULT_GROUP_LIMIT, ge=1, le=1000),
+) -> list[ExactDuplicatePlanResponse]:
+    """Dry run only: propose which copy to keep and which to delete in
+    each exact-duplicate group. Never deletes anything - this returns a
+    plan for a human to review, nothing more."""
+    service = DeduplicationService(db)
+    return service.plan_exact_duplicate_cleanup(limit=limit)

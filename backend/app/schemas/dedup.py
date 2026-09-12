@@ -12,3 +12,15 @@ class NearDuplicatePairResponse(BaseModel):
     document_a: DocumentResponse
     document_b: DocumentResponse
     similarity: float = Field(ge=0, le=1)
+
+
+class DryRunActionResponse(BaseModel):
+    action: str
+    document: DocumentResponse
+    reason: str
+
+
+class ExactDuplicatePlanResponse(BaseModel):
+    content_hash: str
+    keep: DocumentResponse
+    actions: list[DryRunActionResponse]

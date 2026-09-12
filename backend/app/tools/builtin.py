@@ -157,6 +157,48 @@ def build_default_registry(
             for group in groups
         )
 
+    def plan_duplicate_cleanup(limit: int = 10) -> str:
+        plans = dedup_service.plan_exact_duplicate_cleanup(limit=int(limit))
+
+        if not plans:
+            return "No exact duplicates to clean up."
+
+        lines = []
+        for plan in plans:
+            lines.append(f"Keep: {plan.keep.title} (content_hash {plan.content_hash[:12]}...)")
+            for action in plan.actions:
+                lines.append(f"  Would delete: {action.document.title} - {action.reason}")
+
+        lines.append(
+            "This is a dry run only - nothing was deleted. Ask the user "
+            "before deleting any file."
+        )
+        return "\n".join(lines)
+
+    registry.register(
+        Tool(
+            name="plan_duplicate_cleanup",
+            description=(
+                "Propose which copy to keep and which to delete for each "
+                "exact-duplicate document group (Best Copy Arbitration). "
+                "This is a DRY RUN - it only returns a proposed plan and "
+                "never deletes, moves, or modifies anything. Use this to "
+                "show the user what a cleanup would look like, not to "
+                "perform one."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum duplicate groups to plan for (default 10).",
+                    },
+                },
+            },
+            handler=plan_duplicate_cleanup,
+        )
+    )
+
     registry.register(
         Tool(
             name="find_duplicate_documents",

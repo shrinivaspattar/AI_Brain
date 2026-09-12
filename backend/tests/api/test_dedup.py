@@ -124,3 +124,69 @@ def test_find_exact_duplicates_rejects_out_of_range_limit() -> None:
     response = client.get("/dedup/exact", params={"limit": 0})
 
     assert response.status_code == 422
+
+
+def test_plan_exact_duplicate_cleanup() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup.DeduplicationService") as service_class:
+            from app.dedup.service import DryRunAction, ExactDuplicatePlan
+
+            keep = _mock_document("doc-1", "a.txt", "hash-a")
+            duplicate = _mock_document("doc-2", "a-copy.txt", "hash-a")
+
+            service_class.return_value.plan_exact_duplicate_cleanup.return_value = [
+                ExactDuplicatePlan(
+                    content_hash="hash-a",
+                    keep=keep,
+                    actions=[
+                        DryRunAction(
+                            action="delete",
+                            document=duplicate,
+                            reason="identical to kept copy 'a.txt'",
+                        )
+                    ],
+                )
+            ]
+
+            client = TestClient(app)
+
+            response = client.get("/dedup/exact/plan")
+
+            assert response.status_code == 200
+            body = response.json()
+            assert len(body) == 1
+            assert body[0]["keep"]["title"] == "a.txt"
+            assert len(body[0]["actions"]) == 1
+            assert body[0]["actions"][0]["action"] == "delete"
+            assert body[0]["actions"][0]["document"]["title"] == "a-copy.txt"
+
+            service_class.return_value.plan_exact_duplicate_cleanup.assert_called_once_with(
+                limit=100
+            )
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_plan_exact_duplicate_cleanup_returns_empty_list() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup.DeduplicationService") as service_class:
+            service_class.return_value.plan_exact_duplicate_cleanup.return_value = []
+
+            client = TestClient(app)
+
+            response = client.get("/dedup/exact/plan")
+
+            assert response.status_code == 200
+            assert response.json() == []
+
+    finally:
+        app.dependency_overrides.clear()
