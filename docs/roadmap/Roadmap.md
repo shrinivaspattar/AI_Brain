@@ -75,12 +75,20 @@ for the current module-by-module status this roadmap tracks against.
       about the user" block, separate from the numbered document-context
       block (citation `[n]` markers apply only to the latter). Verified
       end-to-end against the real model.
-- [ ] Write hook into the chat loop: writing is explicit-only for now (via
-      the API). Automatic LLM-driven extraction of "facts" from casual
-      conversation is a real quality/trust risk (a hallucinated "fact"
-      silently becoming permanent memory) — needs a deliberate design
-      (confirmation step? confidence threshold? review queue, echoing the
-      KRM backlog's "Confidence Review Queue"?), not a default-on behavior.
+- [x] Write hook into the chat loop, review-gated: `Memory.status`
+      (migration `bb3be4e51d72`) — `pending`/`approved`/`rejected`. The
+      model can propose a memory via the new `remember` tool, but a
+      proposal is always `PENDING` and never reaches the read-hook
+      (which explicitly filters `status=APPROVED`) until a human calls
+      `POST /memory/{id}/approve` (or `/reject`, which keeps the row as
+      a record rather than deleting it). `POST /memory` (human-authored,
+      via the API) still writes `APPROVED` directly — typing "remember
+      this" is already the confirmation step. This is the "review queue"
+      design the note above called for, echoing the KRM backlog's
+      "Confidence Review Queue". Verified end-to-end against the real
+      model through the full cycle: propose → confirm pending →
+      confirm a genuinely separate conversation has no knowledge of it
+      → approve → confirm it's used afterward.
 - [ ] Relevance-based memory retrieval — currently "most recent N", not
       similarity-ranked like document retrieval. Fine at low volume; revisit
       if the memory store grows large enough that recency stops being a
@@ -100,10 +108,11 @@ for the current module-by-module status this roadmap tracks against.
       infinite loop). Verified end-to-end against the real model: asked
       for the current date/time, got a minute-precise real answer the
       model could only have produced by actually calling the tool.
-- [x] First tools (`app/tools/builtin.py`), deliberately all read-only:
-      `search_knowledge_base` (explicit on-demand RAG via
+- [x] First tools (`app/tools/builtin.py`), read-only over the user's
+      data: `search_knowledge_base` (explicit on-demand RAG via
       `RetrievalService`), `get_current_datetime`, `list_recent_documents`.
-      Exposed via `GET /tools`.
+      Plus `remember` (Phase 3) — the one narrow exception, and even it
+      never writes anything live; see Phase 3. Exposed via `GET /tools`.
 - [x] Persisted tool-call audit trail: `ToolCallRecord` (migration
       `db6a38db9323`) — conversation/message linkage, tool name,
       iteration/call_index, arguments, status, truncated result (full

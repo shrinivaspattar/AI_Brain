@@ -59,7 +59,7 @@ master backup / source files (read-only)
 | `embeddings/` | Implemented | `chunker.chunk_text` (character-bounded, overlapping chunks); `client.EmbeddingClient` wraps Ollama's `embed` API for `nomic-embed-text`. |
 | `rag/` | Implemented | `retrieval_service.RetrievalService.search(query, top_k)`: embeds the query, ranks `document_chunks` by pgvector cosine distance, joined to source `Document`. Exposed via `POST /rag/search`. No reranking/relevance filtering beyond raw distance yet. |
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store, no type taxonomy. `POST /memory`, `GET /memory`, `DELETE /memory/{id}`. Read-only hook into `ChatService` (loads up to 50, most-recent-first); no automatic write hook from chat yet. |
-| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents` — all read-only. Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
+| `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents` (all read-only), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No filesystem or external-network tools yet. |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -172,14 +172,21 @@ message (on failure, a human-readable description); `is_error`/`error`
 give callers (the audit trail, below) a structured status without parsing
 the content string.
 
-`app/tools/builtin.build_default_registry(db)` registers three tools, all
-**read-only**:
-- `search_knowledge_base(query, top_k=5)` — explicit, on-demand
+`app/tools/builtin.build_default_registry(db, conversation_id=None,
+on_memory_proposed=None)` registers four tools:
+- `search_knowledge_base(query, top_k=5)` — read-only, explicit on-demand
   `RetrievalService` search, letting the model search multiple times
   with different queries within one turn, distinct from the always-on
   context already injected into the prompt.
-- `get_current_datetime()` — UTC, ISO 8601.
-- `list_recent_documents(limit=10)` — wraps `DocumentService.list_documents`.
+- `get_current_datetime()` — read-only, UTC, ISO 8601.
+- `list_recent_documents(limit=10)` — read-only, wraps
+  `DocumentService.list_documents`.
+- `remember(content, confidence=None)` — the one write path, and even it
+  never writes something live: see Memory, below, for the review-gate
+  design (`Memory.status`) that makes this safe.
+
+`conversation_id`/`on_memory_proposed` exist solely for `remember`'s
+provenance — see Memory for how `ChatService` supplies them.
 
 Exposed via `GET /tools`. Deliberately no filesystem read/write or
 external-network-call tools yet — before building around
@@ -231,26 +238,63 @@ asked it to list recently ingested documents, it called
 
 ## Memory
 `Memory` (`app/models/memory.py`): `content` (the fact/preference itself),
-optional `confidence` (0–1), optional provenance (`conversation_id`/
+optional `confidence` (0–1), `status` (`pending`/`approved`/`rejected`,
+migration `bb3be4e51d72`), optional provenance (`conversation_id`/
 `message_id` it was derived from — null for anything written directly via
 the API). No `memory_type` taxonomy (episodic/semantic/preference/etc.) —
 the original project brief explicitly said not to invent one until
 something in the actual implementation needs it, and nothing does yet.
+`status`, by contrast, is a lifecycle field the trust concern below
+directly justified.
 
-`MemoryService` (`app/memory/service.py`): `create_memory`, `get_memory`,
-`list_memories` (most-recent-first, capped), `delete_memory` (raises
-`ValueError` → 404 if missing). Exposed via `POST /memory`, `GET /memory`,
+`MemoryService` (`app/memory/service.py`): `create_memory` (human-authored
+via the API, always `APPROVED` — typing "remember this" is already the
+confirmation step), `propose_memory` (model-authored via the `remember`
+tool, always `PENDING`), `get_memory`, `list_memories` (most-recent-first,
+capped, optional `status` filter), `approve_memory`/`reject_memory` (raise
+`ValueError` → 404 if missing; a rejected row is kept, not deleted, as a
+record of what was proposed and rejected), `delete_memory` (actually
+removes a row). Exposed via `POST /memory`, `GET /memory?status=`,
+`POST /memory/{id}/approve`, `POST /memory/{id}/reject`,
 `DELETE /memory/{id}`.
 
-Read-only hook into `ChatService` today: every chat turn loads up to 50
-memories and injects them into the prompt (see Chat, above). There is
-deliberately no write hook yet — nothing in the chat loop automatically
-extracts "facts" from casual conversation into memory. An LLM silently
-deciding what's worth remembering is a real trust/quality risk (a
-hallucinated "fact" becoming permanent, unreviewed context for every future
-turn); that needs its own deliberate design — e.g. a confidence threshold,
-an explicit confirmation step, or a review queue akin to the KRM backlog's
-"Confidence Review Queue" — not a default-on side effect of chatting.
+**Read hook**: every chat turn loads up to 50 memories via
+`list_memories(status=APPROVED)` and injects them into the prompt (see
+Chat, above) — a `PENDING` proposal is structurally excluded, not just
+by convention.
+
+**Write hook**: the `remember` tool (`app/tools/builtin.py`) lets the
+model propose a memory, but `propose_memory` always writes `PENDING` — a
+model's own claim of confidence isn't independently verified, so nothing
+it proposes takes effect until a human calls `/approve` or `/reject`. This
+is the review-gate design the trust concern called for (echoing the KRM
+backlog's "Confidence Review Queue"), not a default-on side effect of
+chatting. A `remember` call also produces its own `ToolCallRecord` like
+any other tool call.
+
+Provenance for a proposed memory works the same way as tool calls: the
+`remember` tool doesn't know the eventual assistant `Message`'s id (it
+doesn't exist yet mid-loop), so `ChatService` rebuilds a fresh, per-turn
+`ToolRegistry` scoped to the current `conversation_id` (via
+`build_default_registry(db, conversation_id, on_memory_proposed)`) whenever
+the caller hasn't supplied its own registry, and backfills `message_id`
+via `_link_memories_to_message` once the `Message` is persisted — mirroring
+`_link_tool_calls_to_message`. Persisting a proposal is best-effort, same
+guarantee as the audit trail: a DB failure while writing a `Memory` row
+can't break the chat turn (it surfaces as a failed tool call instead,
+which the model sees and can react to).
+
+Verified end-to-end against the real model through the full review cycle:
+asked it to remember a fact → confirmed `GET /memory?status=pending`
+showed it → confirmed a **genuinely separate** new conversation had no
+knowledge of it (the actual property this design protects) → approved it
+→ confirmed a new conversation afterward answered correctly using it. (A
+same-conversation follow-up *did* reference the still-pending fact, but
+that's the model reading ordinary conversation history — the user's own
+prior message — not the memory system; the read-hook only governs what
+gets injected as a remembered fact for turns/conversations that don't
+already have it in their history.)
+
 Memory retrieval is "most recent N", not similarity-ranked like document
 retrieval; revisit if the store grows large enough that recency stops
 being a good proxy for relevance.
