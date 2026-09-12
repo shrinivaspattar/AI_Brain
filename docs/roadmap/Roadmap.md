@@ -132,17 +132,41 @@ for the current module-by-module status this roadmap tracks against.
       scoping decision (which paths, read vs. write, sandboxing) rather
       than being bundled into "first tools." If/when they land, revisit
       whether tool arguments/results need redaction before persisting —
-      today's three tools don't take secrets or return raw filesystem
+      none of today's tools take secrets or return raw filesystem
       contents, so the audit trail didn't need that logic yet.
 
-## Phase 5 — Repository health & knowledge management (KRM)
+## Phase 5 — Repository health & knowledge management (KRM, started)
 Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
 `docs/architecture/KRM_Architecture.md` (currently empty). Must-have items:
-- [ ] Provenance chain (every derived fact traceable to a source file)
-- [ ] Perceptual deduplication
-- [ ] Immutable audit log
-- [ ] Dry-run mode for destructive/derived operations
-- [ ] Confidence review queue
+- [ ] Provenance chain (every derived fact traceable to a source file) —
+      largely already true in practice (`Document.import_job_id`,
+      `DocumentChunk.document_id`, `Message.conversation_id`,
+      `ToolCallRecord`/`Memory` → `message_id` all link back to source),
+      but never formalized/documented as one coherent "chain" end to end.
+- [x] Perceptual deduplication — **detection only**, started:
+      `DeduplicationService` (`app/dedup/service.py`) finds exact
+      duplicates (`Document.content_hash`, SHA-256) and near-duplicate
+      text documents (pgvector cosine similarity on first-chunk
+      embeddings). Exposed via `GET /dedup/exact`, `GET /dedup/near`,
+      and a `find_duplicate_documents` chat tool. Verified against real
+      ingested duplicate files and the real model. **Not** included:
+      Best Copy Arbitration (deciding which copy to keep), any actual
+      file action (delete/move/quarantine — needs Dry-Run Mode first,
+      below), and image perceptual hashing (pHash) — this only covers
+      text documents with embeddings, not photos/images, which AI_Brain
+      doesn't process at all yet.
+- [x] Immutable audit log — substantially covered for tool calls
+      specifically (`ToolCallRecord`, Phase 4) and memory proposals
+      (`Memory.status`, Phase 3); not yet extended to other subsystems
+      (e.g. ingestion decisions, dedup findings themselves).
+- [ ] Dry-run mode for destructive/derived operations — not started;
+      becomes relevant once any dedup/repository-health finding can
+      trigger a real file action.
+- [x] Confidence review queue — substantially covered for memory
+      specifically (`Memory.status: pending/approved/rejected`,
+      `POST /memory/{id}/approve`/`/reject`, Phase 3); not yet a
+      general-purpose mechanism other subsystems (e.g. dedup arbitration)
+      could reuse.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
