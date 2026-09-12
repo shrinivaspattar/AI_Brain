@@ -569,6 +569,57 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       correctly excluding only the genuinely-resolved document and
       authorizing successfully in a single call — then fully cleaned up
       with zero leftover rows.
+- [x] Filesystem Executor Design (no implementation) — settles every
+      open question before writing any mutation code, kept as its own
+      milestone specifically so executor design and executor
+      implementation stay separate decisions. **Zero code changed** —
+      no model, migration, service, API, or test; nothing in this
+      codebase performs a filesystem mutation after this milestone any
+      more than before it. Key decisions: the operation is a
+      same-filesystem `rename()` (move to quarantine), never a copy or
+      an unlink — `DedupPlanActionType.DELETE` keeps meaning "remove
+      this duplicate" as user intent, permanently mapped to a
+      reversible quarantine move, not a stand-in for eventual real
+      deletion (a genuinely irreversible delete, if ever added, would
+      need its own new, separately-authorized action type). **A real,
+      verified finding**: checking this actual deployment (read-only
+      `stat`, no mutation) showed `BASE_DIR` and the real corpus
+      (`/mnt/t7ssd/vscode/data`) sit on different filesystem devices —
+      the natural instinct to put a quarantine directory under
+      `BASE_DIR` would force a non-atomic cross-device move on every
+      single quarantine operation, exactly the failure mode the design
+      exists to forbid; the quarantine root must instead live on the
+      same device as the corpus. A complete crash-window inventory
+      (seven distinct windows, W1–W7) maps every point a process could
+      die relative to the mutation-then-audit ordering contract to
+      exactly what recovery would see and how it's already handled —
+      including confirming a crash during `complete_execution` itself
+      (after every action is already correctly audited) is already
+      handled correctly today by recovery's existing "nothing to
+      recover" refusal. **Recovery/reconciliation fully designed, not
+      built**: a proposed `DedupExecutionActionReconciliation` record
+      — referencing an existing `UNKNOWN` audit row, never editing it
+      — for when a human later verifies what an indeterminate action's
+      outcome actually was, keeping audit immutability intact while
+      still capturing the human's later-confirmed truth; purely
+      forensic, since live-file-existence exclusion already makes
+      re-planning safe with or without a reconciliation record. New
+      safety requirements specified for the first time: allowed
+      mutation roots with path canonicalization (defending against a
+      `Document` row somehow pointing outside the corpus), refusing
+      symlinks and multi-linked files outright (a hard link's data
+      would survive quarantining one name, misleadingly implying the
+      duplicate is gone), and requiring a regular file before touching
+      anything. Refined `FAILED`'s semantics for this specific
+      operation: because a same-device `rename()` is atomic,
+      `FAILED` for this executor always means
+      `filesystem_mutation_occurred=False` — an atomic operation either
+      fully succeeds or has no effect. Closed with an explicit list of
+      what the executor may never touch (the canonical's file, anything
+      outside its own plan's actions or the allowed roots, an earlier
+      run's quarantined output, and — always — `Document` rows
+      themselves, since filesystem state and database records stay
+      deliberately decoupled).
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

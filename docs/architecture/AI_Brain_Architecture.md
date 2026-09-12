@@ -1561,6 +1561,366 @@ advisory only); any mechanism to convert a human-confirmed `UNKNOWN`
 finding into a `SUCCESS` fact (point 4's documented, deliberately
 unresolved question); any frontend.
 
+### Filesystem Executor Design (no implementation)
+
+**Zero code changed in this milestone.** No model, migration, service
+method, or API endpoint was added, and none of the operations named
+below - `unlink`, `remove`, `rename`, `move`, quarantine placement, or
+any other filesystem mutation - exists anywhere in this codebase after
+it. This is a settled design for code that does not yet exist, written
+so the actual implementation milestone has nothing left to improvise
+under pressure. Everything here is a decision or a specification;
+where a decision requires a new concept (recovery/reconciliation,
+below) that concept is designed in full but built later, explicitly
+gated on this design being reviewed first.
+
+#### 1. Quarantine/staging semantics
+
+**The operation is a same-filesystem `rename()` (move), never a copy,
+never an unlink.** The duplicate's bytes are relocated, not destroyed
+- reversibility comes from the fact that the data still exists
+somewhere findable, not from any undo mechanism.
+
+**Destination path**: `<quarantine_root>/<execution_id>/
+<plan_action_id>__<original_basename>`. Namespacing by
+`execution_id`/`plan_action_id` - both already unique, already present
+on every `DedupExecutionActionAudit` row - makes a destination
+collision structurally impossible without any additional uniqueness
+logic (no timestamp suffixes, no retry-on-collision loops). The
+original basename is carried through unmodified for human
+readability; it plays no role in the uniqueness guarantee and is never
+parsed or interpreted.
+
+**`quarantine_root` must live on the same filesystem/device as the
+corpus it quarantines from - verified, not assumed.** This was checked
+directly against this actual deployment while writing this design:
+`BASE_DIR` (the AI_Brain checkout, under `/home`) resolves to device
+`nvme0n1p8`; the real corpus at `/mnt/t7ssd/vscode/data` resolves to
+device `sdc1` - **entirely different filesystems.** The natural,
+naive choice - a quarantine directory under `BASE_DIR`, alongside
+`INGESTION_DIR` - would be wrong: every quarantine move would be a
+cross-device rename, which is never atomic and would force exactly the
+copy-then-delete fallback this design exists to forbid. The quarantine
+root must instead live on the SAME device as the corpus (e.g. a
+sibling of `/mnt/t7ssd/vscode/data`, such as
+`/mnt/t7ssd/vscode/.dedup_quarantine`) - outside the ingested/scanned
+subtree, so a quarantined file can never be re-ingested or
+re-flagged as a duplicate of itself. **Required executor startup
+check**: compare `os.stat(quarantine_root).st_dev` against
+`os.stat(Path(source_path).parent).st_dev` for the corpus root(s) in
+use, and refuse to start at all if they differ - this must be caught
+at startup, not discovered as a per-action `EXDEV` surprise partway
+through a plan. No `DUPLICATES_QUARANTINE_DIR`-style setting was added
+to `app/core/config.py` this milestone (that's implementation); the
+recommendation is to add exactly one such path setting, defaulting to
+a location verified to share a device with wherever documents are
+actually ingested from.
+
+**Retention is explicitly out of scope for the executor.** Quarantined
+files persist indefinitely; nothing in this design ever purges them.
+A future "empty the quarantine" operation is a distinct, later,
+separately-approved capability - not something the executor decides
+on its own.
+
+#### 2. Operation semantics: what `DELETE` actually means
+
+`DedupPlanActionType.DELETE` is - and remains - the plan's vocabulary
+for user intent ("remove this duplicate"), not a literal instruction
+to unlink. The executor fulfills a `DELETE`-typed action by performing
+the quarantine move described above. This is a deliberate, permanent
+mapping, not a temporary stand-in for "real" deletion: if AI_Brain
+ever adds a genuinely irreversible permanent-delete capability, it
+must be a **new, separately-named action type** (e.g. `PURGE`) with
+its own explicit authorization/audit story, never a silent
+reinterpretation of what `DELETE` does. Nothing here proposes adding
+`PURGE` - it is named only to make clear that `DELETE`-means-quarantine
+is not expected to quietly become `DELETE`-means-unlink later.
+
+#### 3. Per-action precondition checks
+
+The mandatory, immediately-before-mutation check reuses
+`check_plan_validity`'s existing six dimensions verbatim
+(`document_exists`, `path_changed`, `exists_now`, `type_matches`,
+`hash_matches`, `size_matches`) plus three new ones this design adds
+(security/link checks, below). **Not implemented this milestone, but
+specified**: a single-action variant,
+`check_action_validity(plan_id, plan_action_id)`, reusing the exact
+same comparison logic `check_plan_validity` already proves correct,
+so the executor never re-validates every OTHER action in the plan just
+to check one - `check_plan_validity` as it exists today is
+whole-plan-scoped and would make per-action revalidation
+needlessly quadratic across an n-action plan.
+
+#### 4. TOCTOU strategy
+
+The window between the final precondition check and the actual
+`rename()` call cannot be reduced to zero without a locking mechanism
+this design deliberately does not adopt (flock-style locks do not
+prevent an external `rm`, are not portable across every filesystem
+AI_Brain might run on, and would mean this system holding a lock on a
+file it does not exclusively own). **The strategy is minimize, detect,
+report - never assume.** The window is minimized by checking
+immediately before acting (not once for the whole plan, as
+established in the prior milestone); if the file changes in that
+narrow window anyway, the `rename()` call itself will typically
+surface it as an `OSError` (source vanished under us) - recorded as
+`FAILED`, a definite OS-reported outcome - and post-move verification
+(point 9) catches the remaining sliver where `rename()` succeeds but
+something is still inconsistent, recorded `UNKNOWN` rather than
+trusted blindly.
+
+#### 5. Action locking/concurrency
+
+Unchanged from the prior milestone's decision: the existing
+`UNIQUE` constraints (`dedup_executions.authorization_id`,
+`dedup_execution_action_audits.(execution_id, plan_action_id)`,
+both already verified against real Postgres) remain the sole
+concurrency guarantee - no distributed locking is introduced for
+AI_Brain's single-process, single-user architecture. Added by this
+design: **within one execution, actions are processed strictly
+sequentially, one at a time, never in parallel** - the stop-on-first-
+failure policy is inherently a linear, ordered concept, and
+parallelizing actions would require an entirely different (and
+unbuilt) failure semantics. Actions are processed in ascending
+`DedupExecutionPlanAction.id` order (their creation order at plan
+generation time) - arbitrary but deterministic, which is all that is
+actually required since no action depends on another.
+
+#### 6. Execution/audit ordering, and the complete crash-window inventory
+
+The ordering contract from the prior milestone stands: mutation
+happens, THEN the audit is persisted, never the reverse. This design
+adds the full enumeration of where a crash can land relative to that
+ordering, and what recovery sees in each case:
+
+| Window | Where the crash lands | What recovery finds | Handling |
+|---|---|---|---|
+| W1 | Before the per-action precondition re-check | No audit row; file untouched | `recover_stale_execution`: file matches plan exactly → `NOT_ATTEMPTED` |
+| W2 | After the precondition check passes, before `rename()` | No audit row; file untouched | Same as W1 - indistinguishable from it, and doesn't need to be distinguished |
+| W3 | During the `rename()` call itself | No audit row; POSIX rename is atomic on a shared device, so the file is either still at the source or fully at the destination - no partial state is possible for the file itself | Recovery sees either "unchanged" (→ `NOT_ATTEMPTED`) or "missing" (→ `UNKNOWN`, point 9's post-move verification never ran) |
+| W4 | After `rename()` returns success, before post-move verification | No audit row; file is at the destination, gone from source | Recovery sees "missing" from the source path → `UNKNOWN` (exactly the scenario in the user's own worked example: mutation occurred, crash, audit says `UNKNOWN`) |
+| W5 | After verification passes, before `record_action_result` is called or its transaction commits | Same as W4 | Same as W4 - `UNKNOWN` |
+| W6 | After one action's audit is fully committed, before the next action starts | That action's audit is correct and complete; execution is otherwise clean | `recover_stale_execution` resumes exactly where the crash left off - already-audited actions are never touched again |
+| W7 | During `complete_execution` itself, after every action already has a correct audit row | Execution stuck at `RUNNING`, but `recover_stale_execution` would find nothing unresolved | **Already handled correctly today**: `recover_stale_execution` raises "nothing to recover" in exactly this case - the correct operator action is `POST /dedup/executions/{id}/complete` directly, not `.../recover` |
+
+W4/W5 - mutation definitely happened, audit doesn't know it yet - are
+precisely why `UNKNOWN` exists and why recovery refuses to guess
+`SUCCESS` from a missing file alone: recovery cannot distinguish W4/W5
+from an entirely different story (a human deleted the file separately,
+unrelated to this execution).
+
+#### 7. Recovery/reconciliation - designed, not implemented
+
+The immutability of `DedupExecutionActionAudit` is a property worth
+keeping, not a limitation to route around - so a human's later,
+independently-verified finding about an `UNKNOWN` action (e.g.
+"I checked - `foo.txt` is gone, and the quarantine copy is present
+with a matching hash") must be recorded as a **new fact layered on
+top of history**, never as an edit to the original row. Designed
+shape for when this becomes part of an actual executor milestone:
+
+```
+DedupExecutionActionReconciliation
+    id
+    audit_id            -- FK to DedupExecutionActionAudit, UNIQUE
+                         --   (at most one reconciliation per audit -
+                         --    once verified, it's verified once)
+    verified_result      -- SUCCESS or FAILED only - NOT_ATTEMPTED
+                          --   never needed reconciliation (already
+                          --   confident) and reconciling UNKNOWN to
+                          --   UNKNOWN is a no-op not worth a row
+    verified_by           -- free text, mirrors authorized_by/
+                           --   reviewer_decision's existing convention
+    verification_method   -- free text/JSONB: HOW it was verified
+                           --   (e.g. "inspected quarantine path,
+                           --   confirmed present with matching hash")
+    verified_at
+    created_at
+```
+
+Reconciliation would be purely additive and purely forensic - it
+answers "what do we now believe happened," it does not change what
+`DedupExecution.status` was already finalized to (that stays whatever
+`complete_execution` derived at the time, `NEEDS_REVIEW` included -
+finalized status is itself a historical fact, not something a later
+reconciliation retroactively rewrites either). It also does NOT change
+re-planning behavior: the live-file-existence exclusion added in the
+prior milestone already correctly drops a genuinely-gone file from a
+future plan regardless of whether a reconciliation record exists for
+it - reconciliation exists for auditability and human confidence, not
+because anything is unsafe without it. **Not built until an actual
+executor exists to make `UNKNOWN` findings worth reconciling in
+practice.**
+
+#### 8. Executor idempotency
+
+The executor itself needs no idempotent-retry logic, because the
+architecture already forecloses the scenario that would require it:
+one execution per authorization, permanently (prior milestone), means
+there is no code path through which the SAME intended mutation could
+ever be attempted twice under the same permission. A human who wants
+to address remaining work after a crash goes through
+recover → (optionally) reconcile → a fresh plan (benefiting from
+exclusion) → a fresh authorization → a fresh execution - each step an
+explicit new decision, never a blind retry of the old one.
+
+#### 9. Verification after mutation
+
+Before ever calling `record_action_result` with `SUCCESS`, the
+executor must independently confirm, via a plain non-mutating read:
+the source path no longer exists, the destination path exists, and
+the destination's hash/size match what was expected pre-move. If
+`rename()` raised no error but this verification fails - a
+corroboration mismatch, not an OS-reported failure - the correct
+result is `UNKNOWN`, not `FAILED`: `FAILED` is reserved for a
+definite, OS-reported failure, and a rename that "succeeded" but left
+something unexplained at the destination is precisely the kind of
+finding that must not be resolved by guessing.
+
+#### 10. Result semantics, refined for this specific operation
+
+The four (five, including `UNKNOWN`) `DedupExecutionActionResult`
+values already exist; this design refines what each one means
+specifically for a same-filesystem quarantine-move executor:
+
+- **`SUCCESS`**: precondition check passed, `rename()` succeeded, AND
+  post-move verification (point 9) corroborated it.
+  `filesystem_mutation_occurred=True`.
+- **`PRECONDITION_FAILED`**: the immediately-before-mutation re-check
+  found a mismatch (hash/size/path/type/existence, or one of this
+  design's new checks - multiple hard links, a symlink, not a regular
+  file, or outside an allowed mutation root) and refused before ever
+  calling `rename()`. `filesystem_mutation_occurred=False`.
+- **`FAILED`**: `rename()` itself raised an `OSError` (permission
+  denied, `EXDEV`, or any other OS-level error). Refinement over the
+  original generic model: because this executor's ONLY operation is a
+  same-filesystem `rename()`, and POSIX same-device rename is atomic,
+  **`FAILED` for this executor always means
+  `filesystem_mutation_occurred=False`** - an atomic rename either
+  fully succeeds or has no effect, so a raised error proves nothing
+  moved. (The original model's "`FAILED` may be True or False" language
+  stays technically accurate for a hypothetical future non-atomic
+  operation type; it does not apply to this one.)
+- **`NOT_ATTEMPTED`**: stop-on-first-failure skipped this action
+  because an earlier one in the same execution failed or hit a
+  precondition failure. Unchanged from the existing model.
+- **`UNKNOWN`**: a crash left the action's fate unconfirmed (points 6
+  and 9), or the post-move verification corroboration mismatched.
+  `filesystem_mutation_occurred=None` always.
+
+#### 11. Authorization consumption
+
+Unchanged, restated for completeness: the executor calls
+`start_execution` exactly once at the beginning of a run, consuming
+the authorization (enforced by the existing unique constraint). It
+never attempts to reuse an authorization, and never itself creates a
+new one.
+
+#### 12. Behavior after partial execution
+
+Unchanged, restated for completeness: stop on the first `FAILED` or
+`PRECONDITION_FAILED`; every remaining planned action is explicitly
+recorded `NOT_ATTEMPTED` (never silently skipped); the execution
+finalizes `PARTIALLY_COMPLETED`. Addressing the remainder requires a
+fresh plan (benefiting from the prior milestone's exclusion fix), a
+fresh authorization, and a fresh execution.
+
+#### 13. Security and path safety
+
+Not previously addressed, and load-bearing before any real mutation
+capability exists:
+
+- **Allowed mutation roots**: the executor must validate that every
+  `source_path` it is asked to touch falls within a configured
+  allow-list of roots (recommended: a new setting alongside
+  `INGESTION_DIR`) before doing anything else with it - refusing
+  outright (not `PRECONDITION_FAILED`, since this is a
+  request/data-integrity problem, not staleness) if a `Document` row
+  somehow points outside the expected corpus.
+- **Canonicalization before comparison**: every path must be resolved
+  (`Path.resolve()`) before any comparison or use, to defeat
+  `..`-based traversal.
+- **The quarantine root must never overlap with any allowed mutation
+  root's ingested/scanned subtree** (point 1) - both to prevent
+  re-ingestion of quarantined files and to keep the executor's own
+  output out of the set of paths it might later be asked to act on
+  again.
+
+#### 14. Symlinks and hard links
+
+- **Symlinks are refused, never followed.** If `source_path` is a
+  symlink (`Path.is_symlink()`), or resolves through one, the
+  precondition check refuses (`PRECONDITION_FAILED`) rather than
+  silently operating on the link or its target.
+- **Hard links are refused.** If `os.stat(source_path).st_nlink > 1`,
+  quarantining this one name would not make the underlying data go
+  away (other links still reference the same inode) - exactly the
+  kind of misleading "it's gone" that would surprise a human relying
+  on the duplicate having actually been removed. Refused
+  (`PRECONDITION_FAILED`) rather than proceeding.
+
+#### 15. Directories vs. regular files
+
+The precondition check must explicitly verify `Path(source_path).
+is_file()` (a regular file - not a directory, device file, FIFO, or
+socket) before any operation, refusing (`PRECONDITION_FAILED`)
+otherwise. Documents are files by definition, but this guards against
+a corrupted or unexpected `Document.source` value rather than trusting
+that invariant blindly.
+
+#### 16. Permission errors, disk-full, and other OS failures
+
+All fall under the existing `FAILED` bucket (point 10) with the raw
+`OSError` message captured in `error_message` - no special-casing
+needed. Worth noting: because the move is same-filesystem, a
+disk-full failure during the rename itself should be exceptionally
+rare (a same-device rename is a metadata operation, not a data copy,
+so it does not need free space proportional to file size) - the more
+realistic failure modes are permission errors and `EXDEV` (point 1).
+
+#### 17. Executor identity/version
+
+`DedupExecution.executor_identity` already exists (free text, added
+two milestones ago) and needs no schema change. Recommended
+convention for when a real value is ever written:
+`"<component-name>/<version>"` (e.g. `"dedup-executor/0.1.0"`) - not
+enforced, but consistent and greppable.
+
+#### 18. What the executor is absolutely forbidden to mutate
+
+- The plan's own canonical document's file - never a mutation target;
+  only non-canonical members ever appear as plan actions.
+- Any file outside that specific execution's own plan's `source_path`
+  list.
+- Any file outside the configured allowed mutation roots (point 13).
+- Anything already sitting in the quarantine directory from an earlier
+  run - an executor run touches only the destinations it creates
+  itself, never a prior run's output.
+- Any database row beyond exactly: the one `DedupExecution` it
+  creates, one `DedupExecutionActionAudit` per action, and the two
+  fields `complete_execution` sets on the execution row. **No
+  `Document` row is ever deleted** - a document whose file has been
+  quarantined keeps its full database record and provenance chain; it
+  simply no longer resolves to a live file at its original path.
+  Filesystem state and database record are deliberately decoupled.
+
+#### Verification for this design pass
+
+This is a design-only milestone: no model, service, API, test, or
+migration changed, so there is nothing new to run against real
+Postgres or the real API. The one concrete finding produced by
+actually checking this deployment (`stat`, read-only, no mutation) -
+that `BASE_DIR` and the real corpus live on different filesystem
+devices - is recorded in point 1 above precisely because it would
+otherwise have been an easy, plausible-looking mistake to carry
+into the first real implementation attempt.
+
+**Deliberately not built this milestone**: the filesystem executor
+itself; `DedupExecutionActionReconciliation` (point 7 - fully
+designed, explicitly deferred); any new configuration setting for
+quarantine root or allowed mutation roots (recommended, not added);
+any frontend.
+
 ## Provenance chain
 The schema already links every derived fact back toward a source file
 via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,
