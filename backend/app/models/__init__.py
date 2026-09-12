@@ -1,4 +1,5 @@
 from app.models.conversation import Conversation
+from app.models.dedup_execution_plan import DedupExecutionPlan, DedupExecutionPlanAction
 from app.models.dedup_review import DuplicateReview, DuplicateReviewMember
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
@@ -9,6 +10,8 @@ from app.models.tool_call import ToolCallRecord
 
 __all__ = [
     "Conversation",
+    "DedupExecutionPlan",
+    "DedupExecutionPlanAction",
     "Document",
     "DocumentChunk",
     "DuplicateReview",

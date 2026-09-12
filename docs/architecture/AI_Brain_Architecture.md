@@ -75,7 +75,7 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist, and computes `Document.content_hash` (SHA-256, streamed) for exact-duplicate detection; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`, `DedupExecutionPlan`, `DedupExecutionPlanAction`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
 | `services/` | Implemented | `DocumentService` (persistence, `list_documents`), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection, tool-calling loop). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory, tools, dedup. |
 | `db/` | Implemented | Session/engine setup, health checks. |
@@ -85,7 +85,7 @@ master backup / source files (read-only)
 | `memory/` | Implemented | `service.MemoryService`: flat `content` + optional `confidence`/provenance store + `status` (pending/approved/rejected), no type taxonomy. `POST /memory`, `GET /memory?status=`, `POST /memory/{id}/approve`\|`/reject`, `DELETE /memory/{id}`. Review-gated write hook (`remember` tool) + read hook (approved-only) into `ChatService` — see Memory, below. |
 | `tools/` | Implemented | `registry.Tool`/`ToolRegistry` (dispatch by name, `call()` never raises, returns a structured `ToolCallResult`). `builtin.build_default_registry`: `search_knowledge_base`, `get_current_datetime`, `list_recent_documents`, `find_duplicate_documents`, `plan_duplicate_cleanup`, `read_file_content` (all read-only/dry-run), plus `remember` (proposes a `Memory`, never writes one live — see Memory, below). Exposed via `GET /tools`; driven by `ChatService._run_tool_loop`, which persists a `ToolCallRecord` audit row per call. No write/move/delete or external-network tools exist. |
 | `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
-| `dedup/` | Implemented (detection + dry-run plan + review decision layer, with API and frontend) | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. `review_service.DedupReviewService`: persists a detected finding as a `DuplicateReview` (see Deduplication, below, for the full design) and records human approve/reject decisions. Exposed via `GET /dedup/reviews`\|`/{id}` and `POST /dedup/reviews/{id}/approve`\|`/reject` (`app/api/dedup_reviews.py`), and the Dedup Review frontend view. |
+| `dedup/` | Implemented (detection + dry-run recommendation plan + review decision layer, with API and frontend + dry-run execution planning layer, API only) | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. `review_service.DedupReviewService`: persists a detected finding as a `DuplicateReview` (see Deduplication, below) and records human approve/reject decisions. Exposed via `GET /dedup/reviews`\|`/{id}` and `POST /dedup/reviews/{id}/approve`\|`/reject`, and the Dedup Review frontend view. `execution_plan_service.DedupExecutionPlanService`: turns an approved review into an immutable `DedupExecutionPlan` snapshot (real file hash/size observed at generation time) and re-verifies it against the live filesystem/Document rows on demand (see "Dry-run execution planning layer," below). Exposed via `POST /dedup/reviews/{id}/plans`, `GET /dedup/plans`\|`/{id}`\|`/{id}/validity` (`app/api/dedup_execution_plans.py`) — no frontend yet, no execution endpoint anywhere. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
 | `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor + memory review + dedup review) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Four views toggled client-side: Chat, Import Jobs (read-only, polls `GET /import-jobs`), Memory Review (human approve/reject queue over `GET /memory?status=`), and Dedup Review (human approve/reject queue over `GET /dedup/reviews?status=`). |
 
@@ -535,10 +535,157 @@ session against controlled synthetic findings. No filesystem operation
 of any kind runs anywhere in `DedupReviewService` or
 `app/api/dedup_reviews.py`.
 
-**Still deliberately not built**: any execution mechanism. There is
-still no code path anywhere in AI_Brain that deletes, moves, renames,
-quarantines, or overwrites a file - approving a review only ever
-records that a human made a decision.
+**Still deliberately not built (at the point above)**: any execution
+mechanism. There was still no code path anywhere in AI_Brain that
+deletes, moves, renames, quarantines, or overwrites a file - approving
+a review only ever recorded that a human made a decision. The next
+milestone (below) adds the DRY-RUN EXECUTION PLAN stage strictly
+between approval and any future execution - it still does not add an
+execution mechanism.
+
+### Dry-run execution planning layer
+
+The full pipeline, with this milestone's addition in context:
+
+```
+Detection -> Recommendation -> Human Review -> Approval
+    -> Dry-run Execution Plan   (this milestone)
+    -> Explicit Execution Authorization   (not built)
+    -> Filesystem Execution   (not built)
+    -> Verification   (not built)
+```
+
+**Why a new service, not an extension of `plan_exact_duplicate_cleanup`
+or `DedupReviewService`**: `DeduplicationService.plan_exact_duplicate_cleanup`
+operates on raw, un-reviewed detection output - the Recommendation
+stage, stateless, with no concept of a human decision at all. This
+milestone's input is categorically different: an already-**APPROVED**
+`DuplicateReview` carrying an explicit `human_selected_canonical_document_id`
+- the Approval stage. Extending the former to also read post-approval
+state would collapse two stages this architecture deliberately keeps
+apart (a detection heuristic and a human decision are not the same
+kind of fact). `DedupReviewService` was reused as-is, unmodified, as
+the boundary for reading review/member state - no dedup-review logic
+was duplicated.
+
+**`DedupExecutionPlan`** (`dedup_execution_plans` table): `review_id`
+(FK), `canonical_document_id` (a frozen copy of the authorizing
+review's `human_selected_canonical_document_id` at generation time -
+copied rather than only reachable via the review, so a plan is
+self-describing even though, by construction, that field can never
+change on an already-approved review anyway), the canonical's own
+observed state (`canonical_source_path`, `canonical_observed_exists`,
+`canonical_observed_content_hash`, `canonical_observed_file_size`) all
+stored directly on the plan since a plan has exactly one canonical,
+`status` (an enum with exactly one reachable value, `generated` -
+`EXECUTED`/`ABORTED` would only mean something once an executor
+exists, and inventing them now would document a lifecycle this
+codebase can't enter; extending the enum later is an ordinary
+migration), `created_at`. Deliberately no `updated_at`: a plan row is
+never mutated after insert - every regeneration is a brand-new row,
+the same non-overwriting convention `ToolCallRecord`/`Memory` already
+follow.
+
+**`DedupExecutionPlanAction`** (`dedup_execution_plan_actions`): one
+row per non-canonical member - `document_id`, `action` (an enum with
+exactly one value, `delete` - the only action type this system can
+ever propose, because no move/rename/quarantine capability exists
+anywhere in AI_Brain; adding the enum value without the capability
+would imply a promise this codebase doesn't keep), `source_path`,
+`target_document_id`/`target_path` (the canonical, duplicated onto
+every action row for the same self-description reason as above),
+`observed_exists`/`observed_content_hash`/`observed_file_size` (this
+row's own snapshot - deliberately never the whole file, just enough
+metadata to re-identify and re-verify it later), and `reason` (why
+*this specific file*, distinct from `DuplicateReview.recommendation_reason`,
+which explains the finding as a whole).
+
+**Generation reads files, but never writes anything to disk**:
+`generate_plan_for_review` computes each member's current SHA-256 and
+size via a plain streamed read (a small local `_observe_file` helper -
+deliberately not a reuse of `DocumentIngestor`'s private `_hash_file`,
+which swallows every failure into a bare `None` and never reports size
+or existence separately; staleness comparison needs all three
+distinguished). It raises `ValueError` for every case where a plan
+cannot honestly be produced: review missing (404), not `APPROVED` (409
+- a genuine state conflict, same class as an already-reviewed review),
+approved with no `human_selected_canonical_document_id` (422 - **the
+core near-duplicate safety rule**: a near-duplicate review approved
+without picking a canonical does not carry a decision sufficient to
+plan from, and a canonical is never inferred to fill the gap), or a
+canonical that somehow isn't one of the review's own members (422,
+defensive - refuses to plan against inconsistent data rather than
+guessing). A missing/unreadable file at generation time is not itself
+an error, though - the plan honestly records `observed_exists=false`
+for that member rather than crashing; a plan is allowed to describe a
+file that's already gone, precisely so that fact is visible.
+
+**Regeneration is a first-class, expected operation, not a singleton
+per review**: every call to `generate_plan_for_review` inserts a new
+row rather than updating or replacing an existing plan for the same
+review - `DedupExecutionPlanService.list_plans` returns all of them,
+newest first. This mirrors the audit-trail convention used everywhere
+else in this codebase (never overwrite history) and sidesteps an
+entire class of cache-invalidation bugs: there is no "the plan" to
+keep in sync, only an append-only sequence of point-in-time snapshots.
+Verified deterministic against real files: two plans generated back to
+back against an unchanged file record identical hashes/sizes/paths,
+while differing (correctly) in `id`.
+
+**`check_plan_validity` re-reads everything, every time - nothing here
+is ever cached or trusted from an earlier call.** Per file (the
+canonical, and each action), it independently checks: the `Document`
+row still exists (`document_exists` - a deleted document must not be
+silently skipped from the report the way a display-only join
+reasonably would be); the live `Document.source` still equals the
+plan's frozen path (`path_changed` - the plan only ever reads its own
+snapshot, so a document re-pointed elsewhere since generation must be
+flagged, not silently followed *or* silently ignored); the file still
+exists at that path (`exists_now`); its extension still matches
+`Document.source_type` (`type_matches` - a near-free extra safety
+dimension: an astronomically unlikely hash/size collision aside, this
+catches the very real case of a path being reused for an unrelated
+file); and its hash/size still match what was observed at generation
+(`hash_matches`/`size_matches`). All of these collapse into one
+`is_valid` a future executor must check - `false` means **abort: do
+not guess, do not substitute another file, do not continue partially**,
+per the design's own explicit safety requirement. Verified against
+real files: editing a "duplicate" file after plan generation flips
+`hash_matches`/`size_matches`/`is_valid` to false while the untouched
+canonical still reads valid; deleting it flips `exists_now`/`is_valid`
+to false the same way - and in both cases the check itself, confirmed
+by byte-for-byte comparison before and after, touches nothing.
+
+**API** (`app/api/dedup_execution_plans.py`): `POST
+/dedup/reviews/{review_id}/plans` (generate, 201), `GET /dedup/plans`
+(optional `?review_id=`), `GET /dedup/plans/{id}`, `GET
+/dedup/plans/{id}/validity`. Error mapping extends the same convention
+introduced for dedup reviews (not found -> 404, state conflict -> 409)
+with the same third case (insufficient/inconsistent decision -> 422).
+**No execution endpoint exists anywhere in this API.**
+
+**Auditability**: a plan answers "why was this proposed" via its own
+`reason` field per action, and "which review authorized this" via
+`review_id`/`canonical_document_id` directly on the plan row, with no
+join required back to a review whose `human_selected_canonical_document_id`
+is guaranteed frozen once approved. `evidence`/`recommendation_reason`
+on the parent `DuplicateReview` remain reachable via `review_id` for
+the fuller "why was this a duplicate at all" story. No new persisted
+audit-log table was added for verification *attempts* specifically
+(calling `check_plan_validity` is a pure, stateless read) - nothing
+consumes such a log yet, and adding one now would be exactly the kind
+of speculative infrastructure this project avoids; it's a natural
+addition once a real executor exists to require it.
+
+**Deliberately not built this milestone**: any endpoint or mechanism
+that turns a plan into a real filesystem action, any frontend view (the
+spec that produced this milestone made frontend exposure explicitly
+conditional - "if a plan is exposed in the UI" - not a requirement),
+and any persisted execution-authorization or execution-audit record,
+since none of those have anything to attach to yet. No real file was
+read for anything other than computing a hash/size, and none was
+written, moved, renamed, deleted, or overwritten anywhere in this
+milestone.
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file

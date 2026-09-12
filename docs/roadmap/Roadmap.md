@@ -272,9 +272,42 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       correct filter tab and their source Document/ImportJob rows were
       completely unmodified, and reconfirmed Chat, Import Job
       Monitoring, and Memory Review are all unaffected.
-      Still deliberately **not** built: any execution mechanism — there
-      is still no code path anywhere in AI_Brain that deletes, moves,
-      renames, quarantines, or overwrites a file.
+      Still deliberately **not** built (at the time): any execution
+      mechanism — there was still no code path anywhere in AI_Brain
+      that deletes, moves, renames, quarantines, or overwrites a file.
+- [x] Dry-run execution planning layer — the DECISION stage's natural
+      successor, and still strictly upstream of any real filesystem
+      action: `DedupExecutionPlan` + `DedupExecutionPlanAction`
+      (migration `8eebb7e854fb`), `DedupExecutionPlanService`
+      (`app/dedup/execution_plan_service.py`), `POST
+      /dedup/reviews/{id}/plans`, `GET /dedup/plans`\|`/{id}`\|`/{id}/validity`.
+      `generate_plan_for_review` only accepts an **APPROVED** review
+      that carries an explicit `human_selected_canonical_document_id`
+      (409 if not approved, 422 if approved with no canonical decision
+      — the near-duplicate "confirmed related, undecided" case) — reads
+      every member's file from disk *right now* (SHA-256 + size, a
+      plain read) and persists an immutable snapshot: what would happen
+      to which file, why, and what it looked like at that moment. Every
+      call creates a brand-new plan row; regenerating is expected, not
+      an error, matching the audit-trail convention of never
+      overwriting history. `check_plan_validity` re-reads the
+      filesystem *and* the live `Document` rows again, freshly, on
+      every call — no cached verdict is ever stored — and reports six
+      independent staleness dimensions per file (document still exists,
+      path unchanged, file still exists, type/extension matches, hash
+      matches, size matches), collapsing to one `is_valid` a future
+      executor must check before acting. Real-filesystem tests (real
+      temp files, not the corpus) proved this actually catches a file
+      edited or deleted after plan generation, and that generating a
+      plan and checking its validity never modify, move, rename, or
+      delete anything — confirmed via byte-for-byte comparison before
+      and after. Deliberately not built: any endpoint or mechanism that
+      turns a plan into a real filesystem action — that remains a later,
+      separately-approved milestone (its own explicit "execution
+      authorization" step, re-validating against this same staleness
+      check immediately before acting, is the natural next design).
+      41 new tests (unit incl. real synthetic files via `tmp_path`, API,
+      real-database + real-filesystem integration).
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
