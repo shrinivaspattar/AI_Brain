@@ -211,7 +211,7 @@ def test_list_executions() -> None:
             assert body[0]["id"] == 1
 
             service_class.return_value.list_executions.assert_called_once_with(
-                plan_id=1, authorization_id=None, status=None
+                plan_id=1, authorization_id=None, status=None, started_before=None
             )
     finally:
         app.dependency_overrides.clear()
@@ -615,5 +615,136 @@ def test_complete_execution_returns_404_for_missing() -> None:
             response = client.post("/dedup/executions/999/complete")
 
             assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+# --- recover -----------------------------------------------------------
+
+
+def test_recover_execution_succeeds() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            recovered = _execution(
+                status=DedupExecutionStatus.NEEDS_REVIEW,
+                ended_at=datetime(2026, 9, 12, 11, 0, tzinfo=UTC),
+                failure_reason="Action for plan action 2 has an unknown/indeterminate outcome",
+            )
+            service_class.return_value.recover_stale_execution.return_value = recovered
+
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/1/recover", json={"confirm": True}
+            )
+
+            assert response.status_code == 200
+            body = response.json()
+            assert body["status"] == "needs_review"
+
+            service_class.return_value.recover_stale_execution.assert_called_once_with(1)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_recover_execution_requires_confirm_true() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/1/recover", json={"confirm": False}
+            )
+
+            assert response.status_code == 422
+            service_class.return_value.recover_stale_execution.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_recover_execution_returns_404_for_missing() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            service_class.return_value.recover_stale_execution.side_effect = ValueError(
+                "Dedup execution 999 not found"
+            )
+
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/999/recover", json={"confirm": True}
+            )
+
+            assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_recover_execution_returns_409_for_non_running() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            service_class.return_value.recover_stale_execution.side_effect = ValueError(
+                "Execution 1 is not RUNNING (status=completed) - only a RUNNING "
+                "execution can be recovered"
+            )
+
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/1/recover", json={"confirm": True}
+            )
+
+            assert response.status_code == 409
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_recover_execution_returns_422_for_nothing_to_recover() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            service_class.return_value.recover_stale_execution.side_effect = ValueError(
+                "Execution 1 already has a recorded outcome for every planned "
+                "action - there is nothing to recover; call complete_execution "
+                "directly"
+            )
+
+            client = TestClient(app)
+            response = client.post(
+                "/dedup/executions/1/recover", json={"confirm": True}
+            )
+
+            assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_list_executions_passes_started_before_filter() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_executions.DedupExecutionService") as service_class:
+            service_class.return_value.list_executions.return_value = []
+
+            client = TestClient(app)
+            response = client.get(
+                "/dedup/executions",
+                params={"status": "running", "started_before": "2026-09-12T00:00:00Z"},
+            )
+
+            assert response.status_code == 200
+            call_kwargs = service_class.return_value.list_executions.call_args.kwargs
+            assert call_kwargs["started_before"] is not None
     finally:
         app.dependency_overrides.clear()

@@ -94,6 +94,49 @@ def test_generate_dedup_execution_plan() -> None:
         app.dependency_overrides.clear()
 
 
+def test_generate_dedup_execution_plan_reports_excluded_document_ids() -> None:
+    """A review member with no corresponding action in the plan (because
+    its file was missing at generation time - see
+    generate_plan_for_review) is surfaced explicitly in the response,
+    not silently dropped - this is derived by comparing the review's
+    members against the plan's actions, never a stored field."""
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.dedup_execution_plans.DedupExecutionPlanService") as service_class:
+            plan = _plan()
+            action = _action()
+            doc_dup = _document("doc-dup", "dup.txt", "/documents/dup.txt")
+            doc_missing = _document(
+                "doc-missing", "missing.txt", "/documents/missing.txt"
+            )
+            doc_canonical = _document(
+                "doc-canonical", "canonical.txt", "/documents/canonical.txt"
+            )
+
+            service_class.return_value.generate_plan_for_review.return_value = plan
+            service_class.return_value.get_plan_actions_with_documents.return_value = [
+                (action, doc_dup)
+            ]
+            service_class.return_value.review_service.get_review_members_with_documents.return_value = [
+                (None, doc_canonical),
+                (None, doc_dup),
+                (None, doc_missing),
+            ]
+
+            client = TestClient(app)
+            response = client.post("/dedup/reviews/1/plans")
+
+            assert response.status_code == 201
+            body = response.json()
+            assert body["excluded_document_ids"] == ["doc-missing"]
+
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_generate_dedup_execution_plan_returns_404_for_missing_review() -> None:
     db = MagicMock()
 

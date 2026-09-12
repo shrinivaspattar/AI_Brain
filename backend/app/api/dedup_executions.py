@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,6 +16,7 @@ from app.schemas.dedup_execution import (
     DedupExecutionActionAuditResponse,
     DedupExecutionResponse,
     RecordActionResultRequest,
+    RecoverStaleExecutionRequest,
     StartExecutionRequest,
 )
 
@@ -155,12 +157,24 @@ def list_dedup_executions(
     execution_status: DedupExecutionStatus | None = Query(
         default=None, alias="status"
     ),
+    started_before: datetime | None = Query(
+        default=None,
+        description=(
+            "Advisory filter for finding stale-execution candidates - "
+            "e.g. ?status=running&started_before=<ISO 8601 timestamp>. "
+            "AI_Brain has no process supervision, so this never asserts "
+            "a matching execution is actually stuck; it only narrows "
+            "the list for a human to investigate before deciding to "
+            "call POST .../recover."
+        ),
+    ),
 ) -> list[DedupExecutionResponse]:
     service = DedupExecutionService(db)
     executions = service.list_executions(
         plan_id=plan_id,
         authorization_id=authorization_id,
         status=execution_status,
+        started_before=started_before,
     )
     return [_build_execution_response(e) for e in executions]
 
@@ -299,6 +313,58 @@ def complete_dedup_execution(
 
     try:
         execution = service.complete_execution(execution_id)
+    except ValueError as exc:
+        _raise_for_execution_value_error(exc)
+
+    return _build_execution_response(execution)
+
+
+@router.post(
+    "/dedup/executions/{execution_id}/recover",
+    response_model=DedupExecutionResponse,
+    responses={
+        404: {"description": "Dedup execution not found"},
+        409: {"description": "The execution is not RUNNING"},
+        422: {
+            "description": (
+                "Confirmation missing/false, or every planned action "
+                "already has a recorded outcome (nothing to recover)"
+            )
+        },
+    },
+)
+def recover_dedup_execution(
+    execution_id: int,
+    request: RecoverStaleExecutionRequest,
+    db: Session = Depends(get_db),
+) -> DedupExecutionResponse:
+    """Close out a RUNNING execution that will never receive any
+    further action results (the canonical reason: its executor process
+    died). This performs NO filesystem action - only a non-mutating
+    re-read of the still-unresolved planned actions' files, exactly
+    like `check_plan_validity` already does elsewhere.
+
+    AI_Brain has no process supervision anywhere and cannot know
+    whether the execution's process is actually dead - calling this is
+    an explicit human decision, made only after independently
+    confirming that outside this system. A file confirmed unchanged
+    since the plan was generated is recorded NOT_ATTEMPTED (the
+    mutation demonstrably did not happen); anything else - a missing
+    file, or one that changed unexpectedly - is recorded UNKNOWN,
+    never guessed as SUCCESS. The execution is then finalized via the
+    same derivation `complete_execution` already uses; any UNKNOWN
+    result makes the outcome NEEDS_REVIEW.
+    """
+    if not request.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="confirm must be true to recover a stale execution",
+        )
+
+    service = DedupExecutionService(db)
+
+    try:
+        execution = service.recover_stale_execution(execution_id)
     except ValueError as exc:
         _raise_for_execution_value_error(exc)
 

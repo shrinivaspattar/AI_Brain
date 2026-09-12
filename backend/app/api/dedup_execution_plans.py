@@ -58,6 +58,21 @@ def _build_plan_response(
         for action, document in pairs
     ]
 
+    # Not stored on the plan - derived by comparing the review's own
+    # members against this plan's actions. Any non-canonical member
+    # with no corresponding action was excluded at generation time
+    # because its file no longer existed (see generate_plan_for_review).
+    member_pairs = service.review_service.get_review_members_with_documents(
+        plan.review_id
+    )
+    action_document_ids = {action.document_id for action, _document in pairs}
+    excluded_document_ids = [
+        document.id
+        for _member, document in member_pairs
+        if document.id != plan.canonical_document_id
+        and document.id not in action_document_ids
+    ]
+
     return DedupExecutionPlanResponse(
         id=plan.id,
         review_id=plan.review_id,
@@ -69,6 +84,7 @@ def _build_plan_response(
         status=plan.status.value,
         created_at=plan.created_at,
         actions=actions,
+        excluded_document_ids=excluded_document_ids,
     )
 
 

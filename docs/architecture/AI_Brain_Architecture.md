@@ -616,9 +616,16 @@ plan from, and a canonical is never inferred to fill the gap), or a
 canonical that somehow isn't one of the review's own members (422,
 defensive - refuses to plan against inconsistent data rather than
 guessing). A missing/unreadable file at generation time is not itself
-an error, though - the plan honestly records `observed_exists=false`
-for that member rather than crashing; a plan is allowed to describe a
-file that's already gone, precisely so that fact is visible.
+an error, though: **updated by the "Execution Recovery &
+Partial-Replanning Design" milestone** - a non-canonical member whose
+file is already gone at generation time is now EXCLUDED from the plan
+entirely (no action created for it at all), rather than included with
+`observed_exists=false` as originally designed. See that section below
+for why: an action generated against an already-missing file could
+never pass `check_plan_validity`, which permanently invalidated any
+*regenerated* plan that still included even one already-resolved
+member. If every non-canonical member's file is already gone, no plan
+can be produced at all (422) - there is nothing left to plan.
 
 **Regeneration is a first-class, expected operation, not a singleton
 per review**: every call to `generate_plan_for_review` inserts a new
@@ -1077,10 +1084,12 @@ concrete implementation of "revalidate immediately before every
 mutation" inside the executor's per-action loop (the mechanism exists;
 nothing calls it in a loop yet). Crash-recovery *representation* is no
 longer unmodeled - see "Executor Safety & Recovery Design" immediately
-below - but automatic crash *detection/resolution tooling* (something
-that notices a stuck `RUNNING` execution and investigates it) remains
-out of scope, since no long-running executor process exists yet to
-actually crash.
+below, and "Execution Recovery & Partial-Replanning Design" further
+below for the actual recovery mechanism and the re-planning-exclusion
+fix. Automatic crash *detection* (something that notices a stuck
+`RUNNING` execution on its own, with no human involved) remains out of
+scope by deliberate choice, not merely because nothing exists yet to
+crash - see that later section's point 1.
 
 ### Executor Safety & Recovery Design
 
@@ -1280,29 +1289,25 @@ silently the instant an execution finalizes - fully consistent with
 record" running in the other direction too: an execution finishing
 does not automatically free its authorization.
 
-**A genuine, currently-unresolved gap this design pass surfaced**:
-re-planning a *partially*-executed review's remaining work is not
-actually possible today. Once a duplicate has really been removed by
-an earlier execution, `generate_plan_for_review` has no concept of
-"already resolved" at the review-member level - it will include that
-member in any new plan regardless. Because a plan action's own
-`observed_exists` is frozen at *that* plan's generation time, and
-`check_plan_validity`'s `is_valid` requires the file to exist *now*
-for that exact action, an action generated against an already-missing
-file can never be valid - not now, not ever. This blocks authorization
-of the **entire** new plan, not just the still-outstanding part of it,
-even though the outstanding member's own file is completely untouched
-and its own action would otherwise be perfectly valid on its own.
-Verified directly (`test_replanning_after_a_successful_deletion_
-produces_a_permanently_invalid_plan`): a real successful deletion (a
-test simulating what an executor would have left behind - no AI_Brain
-code performs it) followed by a real plan regeneration reproduces
-this exactly. **Not fixed here** - resolving it needs either a way to
-mark specific review members "already resolved" (excluding them from
-a regenerated plan), or a way for validity checking to treat "file
-confirmed already gone per an earlier `COMPLETED`/`PARTIALLY_COMPLETED`
-execution" as an accepted terminal state rather than staleness.
-Deferred until partial re-execution is actually needed in practice.
+**A genuine gap this design pass surfaced, since fixed** by the later
+"Execution Recovery & Partial-Replanning Design" section: re-planning
+a *partially*-executed review's remaining work was not actually
+possible at the time this section was originally written. Once a
+duplicate had really been removed by an earlier execution,
+`generate_plan_for_review` had no concept of "already resolved" at the
+review-member level - it would include that member in any new plan
+regardless. Because a plan action's own `observed_exists` is frozen at
+*that* plan's generation time, and `check_plan_validity`'s `is_valid`
+requires the file to exist *now* for that exact action, an action
+generated against an already-missing file could never be valid - not
+now, not ever. This blocked authorization of the **entire** new plan,
+not just the still-outstanding part of it, even though the outstanding
+member's own file was completely untouched and its own action would
+otherwise have been perfectly valid on its own. Resolved by excluding
+a non-canonical member from a regenerated plan's actions entirely
+whenever its file no longer exists at generation time (a live
+re-check, not a stored "resolved" flag) - see that section for the
+full design and the worked example proving it.
 
 #### 5. Per-action locking/concurrency
 
@@ -1352,6 +1357,209 @@ consumed-authorization/explicit-revoke interaction reproduced exactly
 as documented. Cleaned up afterward with zero leftover rows. No real
 corpus file was read, created, deleted, moved, renamed, or modified at
 any point.
+
+### Execution Recovery & Partial-Replanning Design
+
+A follow-up design pass resolving the two gaps the prior milestone
+explicitly surfaced and deferred - crash detection/closure, and
+re-planning after partial execution - kept, again, deliberately
+separate from writing the executor. **Still no filesystem mutation
+capability anywhere in this codebase.** The code added here either (a)
+reads the filesystem, never writes to it (recovery re-observation,
+exactly like `check_plan_validity` already does), or (b) changes what
+gets *proposed* in a plan, never what happens to a real file.
+
+#### 1. Detecting a stale/stuck `RUNNING` execution
+
+No automatic detection - AI_Brain has no process supervision anywhere,
+so it cannot know whether a `RUNNING` execution's process is actually
+dead versus just slow. `list_executions` gained an advisory
+`started_before` filter (`GET /dedup/executions?status=running&
+started_before=<ISO 8601 timestamp>`) so a human can narrow candidates
+worth investigating - this is a convenience for finding *candidates*,
+never a judgment that a matching execution is actually stuck. No
+threshold is hard-coded or defaulted; inventing one now, with no real
+executor yet to calibrate against, would be speculative.
+
+#### 2 & 3. Generating `UNKNOWN` during recovery, and the transition to `NEEDS_REVIEW`
+
+`DedupExecutionService.recover_stale_execution(execution_id)` is an
+explicit, human-invoked action (gated by `confirm: true` at the API
+layer, the same convention as `authorize_plan`/`start_execution` - not
+a parameter on the service method itself, matching how neither of
+those accepts one either) that closes out a `RUNNING` execution. For
+every planned action with no existing audit row, it re-observes that
+file right now (reusing `_observe_file`, never duplicating the
+file-reading logic) and classifies it into exactly one of two
+outcomes - deliberately not three, and never a guess at `SUCCESS`:
+
+- **File confirmed unchanged** (still exists, hash AND size exactly
+  match the plan's pre-mutation expectation): `NOT_ATTEMPTED`,
+  `filesystem_mutation_occurred=False`. Not a guess - if the delete
+  had happened, the file could not still be sitting there with its
+  original content. Recovery cannot (and does not try to) distinguish
+  "never reached" from "attempted and failed leaving the file intact"
+  - the safe next step is identical either way, so the distinction
+  doesn't matter.
+- **Anything else** (file now missing, or present with different
+  content): `UNKNOWN`, `filesystem_mutation_occurred=None`, with
+  whatever was actually observed attached
+  (`observed_content_hash`/`observed_file_size`/`error_message`) for a
+  human's later benefit. This is the direct, tested answer to "what
+  happens if the filesystem state differs during recovery" (point 9):
+  a missing file is *consistent with* a successful delete, but
+  recovery never promotes that consistency into a claimed `SUCCESS` -
+  it cannot rule out the file having vanished for an unrelated reason
+  (a human manually deleting it, external interference), and asserting
+  success without proof is precisely what this entire design refuses
+  to do.
+
+`recover_stale_execution` then calls the EXISTING `complete_execution`
+- no new finalization logic was needed, since any `UNKNOWN` row already
+forces `NEEDS_REVIEW` (built in the prior milestone). Raises
+`ValueError` if the execution isn't `RUNNING`, or if every planned
+action already has a recorded outcome (nothing to recover - call
+`complete_execution` directly).
+
+#### 4. What a human does after `NEEDS_REVIEW`
+
+Inspect the execution's action audits (`GET
+/dedup/executions/{id}/actions`) and independently verify each
+`UNKNOWN` row's real-world outcome - AI_Brain builds no tooling for
+this investigation itself. **A genuinely unresolved question,
+deliberately not answered by inventing a mechanism for it**: once a
+human has manually confirmed a document's file really is gone, there
+is currently no supported way to convert that confirmed finding into a
+recorded `SUCCESS` fact after the fact. Audit rows are immutable by
+design (no update method exists anywhere in `DedupExecutionService`),
+and building a one-off "correct this `UNKNOWN` into a `SUCCESS`"
+mutation path felt like exactly the kind of ad-hoc workaround this
+design pass exists to avoid rather than introduce. The practical
+consequence, and why it's still safe: that document remains
+"unresolved" by point 5's exclusion rule below, so a fresh plan for
+its review will still propose it - but since the file really is gone,
+`check_plan_validity`'s existing `exists_now` check will (correctly)
+flag it, refusing authorization rather than acting on stale
+information. Point 8 below explains why the LIVE-file-existence
+exclusion added in point 5 actually makes this safer than it sounds:
+that document's file being physically absent means the exclusion
+mechanism drops it from a regenerated plan's *actions* regardless of
+whether any `SUCCESS` audit exists for it. A human is only left with
+manual work in the narrower case of an `UNKNOWN` finding they have
+NOT yet personally verified - not a lingering safety gap, but real
+remaining toil this milestone does not remove.
+
+#### 5, 6 & 8. Excluding already-resolved work from a regenerated plan
+
+**The prior milestone's documented gap is now fixed.**
+`generate_plan_for_review` (`app/dedup/execution_plan_service.py`) now
+excludes a non-canonical member from the plan's *actions* entirely if
+its file does not currently exist - a plain, live re-read at
+generation time, using the exact same `_observe_file` call the method
+already made for every member (previously used only to populate
+`observed_exists` on an action that got created regardless; now it
+gates whether that action gets created at all). If EVERY non-canonical
+member's file is already gone, `generate_plan_for_review` raises
+(422) - there is nothing left to plan.
+
+This is deliberately based on **live file existence, not on a stored
+"resolved" flag or a `SUCCESS`-audit lookup** - a smaller, more general
+fix than adding review-member-level resolution tracking would have
+been, and it closes both gaps at once:
+
+- **Point 6 (failed/never-attempted actions)**: nothing changes for
+  these - a member with a `FAILED`/`NOT_ATTEMPTED`/`UNKNOWN` result (or
+  no result at all yet) has its file still present, so it is *not*
+  excluded and is re-proposed in the new plan exactly as before, freshly
+  re-observed.
+- **Point 8 (preventing accidental re-execution of completed work)**:
+  solved for BOTH the clean-completion case (a `SUCCESS`-recorded
+  deletion leaves the file gone, live-check excludes it) AND the
+  crash-recovery case (an `UNKNOWN` finding where the file also happens
+  to be missing is excluded too, even though no `SUCCESS` audit exists
+  for it - see the worked example below). Two independent layers now
+  protect against ever re-targeting a gone file: exclusion at
+  generation time (this milestone), and `check_plan_validity`'s
+  existing `exists_now` requirement at authorization/execution time (a
+  prior milestone) as a backstop if exclusion were ever somehow
+  bypassed.
+
+A plan's API response gained a computed (never stored)
+`excluded_document_ids` field - the set difference between the
+review's own members and the plan's actual actions - so a human
+looking at a smaller-than-expected plan can see *which* members were
+left out, without the response claiming to know *why* (a missing file
+is equally consistent with "an earlier execution succeeded" and "a
+human deleted it separately" - the field doesn't guess between them).
+
+**Worked example, verified against real Postgres and the real running
+API**: a review with two duplicates, one execution partially
+completes - one duplicate's file is deleted for real (test-simulated,
+recorded `SUCCESS`) and the other is left unresolved with its file
+still present. `recover_stale_execution` correctly records the
+unresolved one as `NOT_ATTEMPTED` (file unchanged). Regenerating the
+plan produces exactly one action - the still-outstanding, untouched
+duplicate - with `excluded_document_ids` correctly naming the resolved
+one. That new plan is immediately, fully valid and authorizes
+successfully in one call. A second scenario proves the general-purpose
+nature of the exclusion rule: when BOTH duplicates' files are made to
+disappear (one via a recorded `SUCCESS`, one via an `UNKNOWN` recovery
+finding), regenerating the plan excludes both and correctly refuses
+with "no plannable work left," rather than silently producing an empty
+or partially-doomed plan.
+
+#### 7. Whether a new authorization is required after recovery/re-planning
+
+Yes, unconditionally, and unchanged from the existing architecture -
+zero new code was needed for this. `DedupPlanAuthorization` is bound
+1:1 to a specific `plan_id`; a regenerated plan is a brand-new row
+with a brand-new `plan_id`, so it always requires its own fresh
+`authorize_plan` call, which itself re-runs `check_plan_validity`
+against current reality. Recovery and re-planning do not, and could
+not, retroactively authorize anything.
+
+#### 9. Filesystem state differing during recovery
+
+Answered directly in points 2 & 3 above: anything other than an exact
+match to the plan's pre-mutation expectation - a missing file, or a
+present file with different content - is recorded `UNKNOWN`, never
+interpreted further. Recovery does not attempt to distinguish *why*
+the state differs (successful deletion vs. external interference vs.
+something else) - only a human, investigating outside this system, can
+do that.
+
+#### 10. Testing and verification for this design pass
+
+19 new tests: unit (8, covering `recover_stale_execution`'s
+classification logic, the `started_before` filter, and the plan
+generation exclusion/raise behavior), API (6, the recovery endpoint
+and the `started_before` query parameter through the HTTP layer), and
+real-database integration (5): the two recovery classification
+outcomes against real Postgres, `recover_stale_execution` refusing a
+non-`RUNNING` execution, the `started_before` filter against real data,
+and the full recovery-then-replan flow proving the exclusion mechanism
+handles a mixed `SUCCESS`+`UNKNOWN` scenario correctly. One existing
+test (`test_generate_plan_records_missing_source_honestly`) was
+rewritten, and one existing integration test
+(originally documenting the now-fixed gap) was rewritten to prove the
+fix instead of the gap - both intentional, understood consequences of
+this milestone's behavior change, not incidental breakage. Full suite:
+487 tests, run three consecutive times with zero flakiness. Verified
+against the real running API and the real `aibrain` database: a
+three-document review's plan generated with `excluded_document_ids`
+correctly empty, one action recorded `SUCCESS` (with the file really
+deleted), the execution recovered via `POST .../recover` correctly
+classifying the untouched second action as `NOT_ATTEMPTED`, a
+regenerated plan correctly excluding only the resolved document and
+authorizing successfully in one call - then fully cleaned up with zero
+leftover rows. No real corpus file was read, created, deleted, moved,
+renamed, or modified at any point.
+
+**Deliberately not built this milestone**: the filesystem executor
+itself; any automatic stale-execution detection/trigger (point 1 is
+advisory only); any mechanism to convert a human-confirmed `UNKNOWN`
+finding into a `SUCCESS` fact (point 4's documented, deliberately
+unresolved question); any frontend.
 
 ## Provenance chain
 The schema already links every derived fact back toward a source file

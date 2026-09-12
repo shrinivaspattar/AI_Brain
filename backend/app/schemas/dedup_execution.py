@@ -22,6 +22,21 @@ class StartExecutionRequest(BaseModel):
     )
 
 
+class RecoverStaleExecutionRequest(BaseModel):
+    # Must be explicitly True - mirrors StartExecutionRequest.confirm.
+    # AI_Brain has no process supervision anywhere: it cannot know
+    # whether the execution's process is actually dead, so this is an
+    # explicit human decision, not something inferred from a timeout.
+    confirm: bool = Field(
+        description=(
+            "Must be true. Confirms the caller has independently "
+            "determined this execution's process will not progress "
+            "further - this call itself performs no filesystem action, "
+            "only a non-mutating re-read of the relevant files."
+        )
+    )
+
+
 class RecordActionResultRequest(BaseModel):
     plan_action_id: int
     result: str = Field(

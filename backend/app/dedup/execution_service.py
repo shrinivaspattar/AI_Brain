@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.dedup.authorization_service import DedupPlanAuthorizationService
-from app.dedup.execution_plan_service import DedupExecutionPlanService
+from app.dedup.execution_plan_service import DedupExecutionPlanService, _observe_file
 from app.models.dedup_authorization import DedupPlanAuthorizationStatus
 from app.models.dedup_execution import (
     DedupExecution,
@@ -417,6 +417,129 @@ class DedupExecutionService:
             self.db.rollback()
             raise
 
+    def recover_stale_execution(self, execution_id: int) -> DedupExecution:
+        """Close out a RUNNING execution that will never receive any
+        further action results - the canonical reason being that its
+        executor process died. This performs NO filesystem action; it
+        only reads the current filesystem state (a plain, non-mutating
+        observation, exactly like `check_plan_validity` already does)
+        to decide, per unresolved planned action, what CAN honestly be
+        recorded about it - then finalizes the execution via the
+        existing `complete_execution`.
+
+        **AI_Brain has no process supervision anywhere** - it cannot
+        know whether the execution's process is actually dead. Calling
+        this method is an explicit human decision, made after the
+        human has independently determined, outside this system, that
+        the execution truly will not progress further (the API layer
+        requires an explicit `confirm: true`, the same convention used
+        for `authorize_plan`/`start_execution` - `confirm` is not a
+        parameter here, matching how neither of those services accepts
+        it either; it is purely a request-body safeguard at the API
+        boundary). There is no automatic trigger anywhere that calls
+        this - see `list_executions(status=RUNNING, started_before=...)`
+        for a way to find *candidates* to investigate, which is advice,
+        not a judgment.
+
+        For each of the execution's planned actions with NO existing
+        audit row, the current file is re-observed and classified into
+        exactly one of two outcomes - never a guess at SUCCESS, per
+        the explicit rule this design exists to enforce:
+
+        - **File confirmed unchanged** (still exists, hash AND size
+          exactly match what the plan expected before any mutation):
+          recorded as `NOT_ATTEMPTED`
+          (`filesystem_mutation_occurred=False`). This is not a guess -
+          if the delete had happened, the file could not still be
+          there with its original content; the mutation demonstrably
+          did not occur, whether it was never reached or was attempted
+          and failed leaving the file untouched (recovery cannot tell
+          those two apart, and doesn't need to: the safe next step is
+          identical either way).
+        - **Anything else** - the file is now missing, or exists with
+          different content than expected: recorded as `UNKNOWN`
+          (`filesystem_mutation_occurred=None`), with whatever was
+          observed attached for a human's later benefit via
+          `observed_content_hash`/`observed_file_size`/`error_message`.
+          A missing file is consistent with a successful delete, but
+          recovery never promotes that consistency into a claimed
+          `SUCCESS` - it cannot rule out the file having vanished for
+          an unrelated reason (manual deletion, external
+          interference), and asserting success without proof is
+          exactly what this design refuses to do.
+
+        Raises ValueError if the execution does not exist, is not
+        currently RUNNING, or already has a recorded outcome for every
+        planned action (nothing to recover - call `complete_execution`
+        directly instead).
+        """
+        execution = self._get_execution_or_raise(execution_id)
+
+        if execution.status != DedupExecutionStatus.RUNNING:
+            raise ValueError(
+                f"Execution {execution_id} is not RUNNING "
+                f"(status={execution.status.value}) - only a RUNNING "
+                "execution can be recovered"
+            )
+
+        plan_actions = list(
+            self.db.scalars(
+                select(DedupExecutionPlanAction).where(
+                    DedupExecutionPlanAction.plan_id == execution.plan_id
+                )
+            )
+        )
+        existing_audit_plan_action_ids = {
+            audit.plan_action_id for audit in self.get_action_audits(execution_id)
+        }
+        unresolved = [
+            pa for pa in plan_actions if pa.id not in existing_audit_plan_action_ids
+        ]
+
+        if not unresolved:
+            raise ValueError(
+                f"Execution {execution_id} already has a recorded outcome "
+                "for every planned action - there is nothing to recover; "
+                "call complete_execution directly"
+            )
+
+        for plan_action in unresolved:
+            observation = _observe_file(plan_action.source_path)
+
+            file_confirmed_unchanged = (
+                observation.exists
+                and plan_action.observed_exists
+                and observation.content_hash == plan_action.observed_content_hash
+                and observation.file_size == plan_action.observed_file_size
+            )
+
+            if file_confirmed_unchanged:
+                self.record_action_result(
+                    execution_id,
+                    plan_action.id,
+                    DedupExecutionActionResult.NOT_ATTEMPTED,
+                )
+            else:
+                self.record_action_result(
+                    execution_id,
+                    plan_action.id,
+                    DedupExecutionActionResult.UNKNOWN,
+                    observed_content_hash=observation.content_hash,
+                    observed_file_size=observation.file_size,
+                    filesystem_mutation_occurred=None,
+                    error_message=(
+                        "Recovery found the source file missing - consistent "
+                        "with a successful delete, but not provably caused "
+                        "by this action; manual verification required."
+                        if not observation.exists
+                        else "Recovery found the source file present but not "
+                        "matching the plan's expected pre-mutation state "
+                        "exactly; manual verification required."
+                    ),
+                )
+
+        return self.complete_execution(execution_id)
+
     def get_execution(self, execution_id: int) -> DedupExecution | None:
         return self.db.get(DedupExecution, execution_id)
 
@@ -425,8 +548,17 @@ class DedupExecutionService:
         plan_id: int | None = None,
         authorization_id: int | None = None,
         status: DedupExecutionStatus | None = None,
+        started_before: datetime | None = None,
         limit: int = DEFAULT_LIST_LIMIT,
     ) -> list[DedupExecution]:
+        """`started_before` is a plain, non-judgmental filter - "started
+        earlier than this timestamp" - not an assertion that a matching
+        RUNNING execution is actually stuck. AI_Brain has no process
+        supervision anywhere, so it cannot know whether a RUNNING
+        execution's process is still alive; this filter only helps a
+        human narrow candidates (e.g. `status=running,
+        started_before=<some threshold you choose>`) for their own
+        judgment before deciding to call `recover_stale_execution`."""
         statement = (
             select(DedupExecution)
             .order_by(DedupExecution.started_at.desc())
@@ -441,6 +573,8 @@ class DedupExecutionService:
             )
         if status is not None:
             statement = statement.where(DedupExecution.status == status)
+        if started_before is not None:
+            statement = statement.where(DedupExecution.started_at < started_before)
 
         return list(self.db.scalars(statement))
 

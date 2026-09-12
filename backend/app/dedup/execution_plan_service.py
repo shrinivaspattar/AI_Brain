@@ -140,12 +140,36 @@ class DedupExecutionPlanService:
         an approved review's finding, and persist it as a new plan.
 
         Every call creates a brand-new row - regenerating a plan (e.g.
-        after an earlier one went stale) is expected, not an error.
-        Raises ValueError for every case where a plan cannot honestly
-        be produced: review missing, not approved, approved without an
-        explicit canonical choice (the near-duplicate "no decision yet"
-        case), or a canonical that somehow isn't a member of its own
-        review.
+        after an earlier one went stale, or after an earlier execution
+        against this same review partially completed) is expected, not
+        an error. Raises ValueError for every case where a plan cannot
+        honestly be produced: review missing, not approved, approved
+        without an explicit canonical choice (the near-duplicate "no
+        decision yet" case), a canonical that somehow isn't a member
+        of its own review, or every non-canonical member's file
+        already being gone (see below).
+
+        A non-canonical member whose file does not currently exist is
+        EXCLUDED from the plan entirely - no `DedupExecutionPlanAction`
+        is created for it at all, rather than being included with
+        `observed_exists=False`. This is a deliberate change from this
+        service's original behavior (see the "Execution Recovery &
+        Partial-Replanning Design" section of AI_Brain_Architecture.md
+        for the full reasoning): a plan action generated against an
+        already-missing file can never pass `check_plan_validity`
+        (`is_valid` requires `exists_now` for that exact action), which
+        meant regenerating a plan for a review with even one
+        already-resolved member produced a plan that could NEVER be
+        authorized - not just for that member, but in its entirety.
+        Excluding such members instead means a regenerated plan only
+        ever proposes work that is still actually possible, whether the
+        file is gone because an earlier execution genuinely deleted it,
+        or for any other reason (manual deletion, external
+        interference) - this makes no claim about *why* the file is
+        gone, only that there is nothing left to safely propose against
+        it. If EVERY non-canonical member's file is already gone, no
+        plan can be produced at all (ValueError, 422) - there is
+        nothing left to plan.
         """
         review = self.review_service.get_review(review_id)
         if review is None:
@@ -187,6 +211,31 @@ class DedupExecutionPlanService:
                 "against inconsistent data"
             )
 
+        non_canonical_documents = [
+            document
+            for document in documents_by_id.values()
+            if document.id != canonical_document.id
+        ]
+        observations = {
+            document.id: _observe_file(document.source)
+            for document in non_canonical_documents
+        }
+        excluded_document_ids = {
+            document_id
+            for document_id, observation in observations.items()
+            if not observation.exists
+        }
+
+        if excluded_document_ids and len(excluded_document_ids) == len(
+            non_canonical_documents
+        ):
+            raise ValueError(
+                f"Duplicate review {review_id} has no plannable work left - "
+                "every non-canonical member's file is already gone (deleted "
+                "by an earlier execution, or otherwise missing). Nothing "
+                "remains to plan."
+            )
+
         canonical_observation = _observe_file(canonical_document.source)
 
         plan = DedupExecutionPlan(
@@ -201,11 +250,11 @@ class DedupExecutionPlanService:
         self.db.add(plan)
         self.db.flush()
 
-        for document in documents_by_id.values():
-            if document.id == canonical_document.id:
+        for document in non_canonical_documents:
+            if document.id in excluded_document_ids:
                 continue
 
-            observation = _observe_file(document.source)
+            observation = observations[document.id]
 
             self.db.add(
                 DedupExecutionPlanAction(

@@ -508,6 +508,67 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       through real Postgres, the consumed-authorization/explicit-
       revoke interaction reproduced exactly as documented — then fully
       cleaned up with zero leftover rows.
+- [x] Execution Recovery & Partial-Replanning Design — resolves the two
+      gaps the prior milestone explicitly surfaced and deferred (crash
+      closure, and re-planning after partial execution), kept
+      deliberately separate from the executor itself. **Still no
+      filesystem mutation capability anywhere in this codebase** —
+      every change here either reads the filesystem without writing to
+      it, or changes what a plan *proposes*, never what happens to a
+      real file. `DedupExecutionService.recover_stale_execution` closes
+      out a `RUNNING` execution that will never progress further (an
+      explicit, human-confirmed action — AI_Brain has no process
+      supervision and cannot know a process is actually dead; a
+      `started_before` filter on `GET /dedup/executions` helps a human
+      find *candidates*, never asserts one is stuck). For every
+      unresolved planned action, it re-observes the file and picks
+      between exactly two outcomes, never a third that guesses success:
+      a file confirmed byte-identical to the plan's pre-mutation
+      expectation is `NOT_ATTEMPTED` (the mutation demonstrably did not
+      happen — if it had, the file couldn't still be there unchanged);
+      anything else (missing, or changed) is `UNKNOWN`, with what was
+      observed attached for a human to investigate — a missing file is
+      *consistent with* success but is never promoted into a claimed
+      one, since recovery cannot rule out the file vanishing for an
+      unrelated reason. Recovery then finalizes through the *existing*
+      `complete_execution` — no new state-machine logic was needed,
+      since any `UNKNOWN` row already forces `NEEDS_REVIEW`.
+      **The prior milestone's re-planning gap is fixed**:
+      `generate_plan_for_review` now excludes a non-canonical member
+      from a regenerated plan's actions entirely if its file no longer
+      exists at generation time — a live re-check (reusing the same
+      file read the method already performed), not a stored "resolved"
+      flag or a `SUCCESS`-audit lookup. That's deliberately more
+      general than tracking resolution history: it correctly excludes
+      both a cleanly-`SUCCESS`-recorded deletion AND a crash-recovered
+      `UNKNOWN` case where the file also happens to be gone, closing
+      the loop for the messier scenario too. If every non-canonical
+      member is already gone, the whole call now raises (422) — nothing
+      to plan. A plan's API response gained a computed (never stored)
+      `excluded_document_ids` field so a human sees which members were
+      left out of a smaller-than-expected plan, without the field
+      guessing why. Answered, requiring zero new code: a regenerated
+      plan always needs its own fresh authorization (plans and
+      authorizations are already bound 1:1). Left deliberately
+      unresolved, and documented as such rather than papered over: once
+      a human manually confirms an `UNKNOWN` finding really was a
+      successful deletion, there is still no supported way to convert
+      that into a recorded `SUCCESS` fact after the fact (audit rows
+      are immutable by design) — safe in practice, since the
+      live-file-existence exclusion above still drops that document
+      from a future plan once its file is actually gone, but not smooth
+      until a real executor makes this scenario worth resolving
+      further. 19 new tests (8 unit, 6 API, 5 real-database
+      integration) plus two existing tests intentionally rewritten to
+      prove fixed behavior rather than document a since-resolved gap.
+      Full suite: 487 tests, three consecutive runs, zero flakiness.
+      Verified against the real running API and `aibrain`: a
+      partially-executed review recovered via `POST
+      /dedup/executions/{id}/recover`, correctly classifying an
+      untouched action `NOT_ATTEMPTED`, then a regenerated plan
+      correctly excluding only the genuinely-resolved document and
+      authorizing successfully in a single call — then fully cleaned up
+      with zero leftover rows.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

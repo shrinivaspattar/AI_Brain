@@ -317,7 +317,55 @@ def test_generate_plan_handles_multiple_duplicate_members(tmp_path) -> None:
     assert {a.document_id for a in added_actions} == {"doc-dup1", "doc-dup2"}
 
 
-def test_generate_plan_records_missing_source_honestly(tmp_path) -> None:
+def test_generate_plan_excludes_member_whose_file_is_already_missing(tmp_path) -> None:
+    """A non-canonical member whose file is already gone is EXCLUDED
+    from the plan entirely - no action is created for it at all. This
+    replaced an earlier design where such a member was still included
+    with observed_exists=False: that action could never pass
+    check_plan_validity (which requires exists_now for that exact
+    action), permanently invalidating any plan that contained it. See
+    "Execution Recovery & Partial-Replanning Design" in
+    AI_Brain_Architecture.md."""
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello")
+    present_file = tmp_path / "present.txt"
+    present_file.write_text("hello")
+    missing_path = str(tmp_path / "does-not-exist.txt")
+
+    review = _review(
+        1,
+        DuplicateMatchType.EXACT,
+        DuplicateReviewStatus.APPROVED,
+        human_selected_canonical_document_id="doc-canonical",
+    )
+    pairs = [
+        (
+            _member(1, "doc-canonical", DuplicateReviewMemberRole.RECOMMENDED_CANONICAL),
+            _document("doc-canonical", "canonical.txt", str(canonical_file)),
+        ),
+        (
+            _member(1, "doc-present", DuplicateReviewMemberRole.DUPLICATE),
+            _document("doc-present", "present.txt", str(present_file)),
+        ),
+        (
+            _member(1, "doc-missing", DuplicateReviewMemberRole.DUPLICATE),
+            _document("doc-missing", "missing.txt", missing_path),
+        ),
+    ]
+
+    db = MagicMock()
+    service = _service_for(db, review, pairs)
+
+    service.generate_plan_for_review(1)
+
+    added_actions = [
+        call.args[0] for call in db.add.call_args_list if hasattr(call.args[0], "action")
+    ]
+    assert len(added_actions) == 1
+    assert added_actions[0].document_id == "doc-present"
+
+
+def test_generate_plan_raises_when_every_non_canonical_member_is_missing(tmp_path) -> None:
     canonical_file = tmp_path / "canonical.txt"
     canonical_file.write_text("hello")
     missing_path = str(tmp_path / "does-not-exist.txt")
@@ -342,14 +390,13 @@ def test_generate_plan_records_missing_source_honestly(tmp_path) -> None:
     db = MagicMock()
     service = _service_for(db, review, pairs)
 
-    service.generate_plan_for_review(1)
+    with pytest.raises(ValueError, match="no plannable work left"):
+        service.generate_plan_for_review(1)
 
     added_actions = [
         call.args[0] for call in db.add.call_args_list if hasattr(call.args[0], "action")
     ]
-    assert added_actions[0].observed_exists is False
-    assert added_actions[0].observed_content_hash is None
-    assert added_actions[0].observed_file_size is None
+    assert added_actions == []
 
 
 # --- generate_plan_for_review: near duplicate with explicit canonical -----

@@ -727,6 +727,167 @@ def test_list_executions_filters_by_plan_id_and_status() -> None:
     assert "dedup_executions.status" in compiled
 
 
+def test_list_executions_filters_by_started_before() -> None:
+    db = MagicMock()
+    service = DedupExecutionService(db)
+
+    service.list_executions(started_before=datetime(2026, 9, 12, tzinfo=UTC))
+
+    statement = db.scalars.call_args.args[0]
+    compiled = str(statement.compile(compile_kwargs={"literal_binds": False}))
+    assert "dedup_executions.started_at <" in compiled
+
+
+# --- recover_stale_execution ---------------------------------------------
+
+
+def test_recover_stale_execution_raises_for_missing_execution() -> None:
+    db = MagicMock()
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=None)
+
+    with pytest.raises(ValueError, match="not found"):
+        service.recover_stale_execution(999)
+
+
+def test_recover_stale_execution_raises_for_non_running_execution() -> None:
+    db = MagicMock()
+    execution = _execution(status=DedupExecutionStatus.COMPLETED)
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+
+    with pytest.raises(ValueError, match="is not RUNNING"):
+        service.recover_stale_execution(1)
+
+
+def test_recover_stale_execution_raises_when_nothing_to_recover() -> None:
+    db = MagicMock()
+    execution = _execution()
+    plan_action = _plan_action()
+    audit = _audit(plan_action_id=plan_action.id)
+    service = DedupExecutionService(db)
+    service.get_execution = MagicMock(return_value=execution)
+    service.get_action_audits = MagicMock(return_value=[audit])
+    db.scalars.return_value = [plan_action]
+
+    with pytest.raises(ValueError, match="nothing to recover"):
+        service.recover_stale_execution(1)
+
+
+def test_recover_stale_execution_records_not_attempted_for_unchanged_file(
+    tmp_path,
+) -> None:
+    """The one case recovery can confidently classify without a guess:
+    a file that still exists with exactly the hash/size the plan
+    expected before any mutation could not possibly have been deleted -
+    the mutation demonstrably did not happen."""
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("hello world")
+    import hashlib
+
+    content_hash = hashlib.sha256(b"hello world").hexdigest()
+
+    execution = _execution()
+    plan_action = _plan_action()
+    plan_action.source_path = str(dup_file)
+    plan_action.observed_exists = True
+    plan_action.observed_content_hash = content_hash
+    plan_action.observed_file_size = 11
+
+    service = DedupExecutionService(db := MagicMock())
+    service.get_execution = MagicMock(return_value=execution)
+    service.get_action_audits = MagicMock(return_value=[])
+    db.scalars.return_value = [plan_action]
+    service.record_action_result = MagicMock()
+    service.complete_execution = MagicMock(return_value="finalized")
+
+    result = service.recover_stale_execution(1)
+
+    service.record_action_result.assert_called_once_with(
+        1, plan_action.id, DedupExecutionActionResult.NOT_ATTEMPTED
+    )
+    service.complete_execution.assert_called_once_with(1)
+    assert result == "finalized"
+
+
+def test_recover_stale_execution_records_unknown_for_missing_file(tmp_path) -> None:
+    missing_path = str(tmp_path / "gone.txt")
+
+    execution = _execution()
+    plan_action = _plan_action()
+    plan_action.source_path = missing_path
+    plan_action.observed_exists = True
+    plan_action.observed_content_hash = "hash-a"
+    plan_action.observed_file_size = 11
+
+    service = DedupExecutionService(db := MagicMock())
+    service.get_execution = MagicMock(return_value=execution)
+    service.get_action_audits = MagicMock(return_value=[])
+    db.scalars.return_value = [plan_action]
+    service.record_action_result = MagicMock()
+    service.complete_execution = MagicMock(return_value="finalized")
+
+    service.recover_stale_execution(1)
+
+    call = service.record_action_result.call_args
+    assert call.args == (1, plan_action.id, DedupExecutionActionResult.UNKNOWN)
+    assert call.kwargs["filesystem_mutation_occurred"] is None
+    assert call.kwargs["observed_content_hash"] is None
+    assert "missing" in call.kwargs["error_message"]
+
+
+def test_recover_stale_execution_records_unknown_for_changed_file(tmp_path) -> None:
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("something completely different")
+
+    execution = _execution()
+    plan_action = _plan_action()
+    plan_action.source_path = str(dup_file)
+    plan_action.observed_exists = True
+    plan_action.observed_content_hash = "hash-a"
+    plan_action.observed_file_size = 11
+
+    service = DedupExecutionService(db := MagicMock())
+    service.get_execution = MagicMock(return_value=execution)
+    service.get_action_audits = MagicMock(return_value=[])
+    db.scalars.return_value = [plan_action]
+    service.record_action_result = MagicMock()
+    service.complete_execution = MagicMock(return_value="finalized")
+
+    service.recover_stale_execution(1)
+
+    call = service.record_action_result.call_args
+    assert call.args == (1, plan_action.id, DedupExecutionActionResult.UNKNOWN)
+    assert call.kwargs["filesystem_mutation_occurred"] is None
+    assert call.kwargs["observed_content_hash"] is not None
+    assert "not matching" in call.kwargs["error_message"]
+
+
+def test_recover_stale_execution_only_recovers_unresolved_actions(tmp_path) -> None:
+    """An action that already has a recorded outcome is left alone -
+    recovery only fills in the gaps, never touches an existing row."""
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("hello world")
+
+    execution = _execution()
+    already_resolved = _plan_action(action_id=1)
+    unresolved = _plan_action(action_id=2)
+    unresolved.source_path = str(dup_file)
+    existing_audit = _audit(plan_action_id=1, result=DedupExecutionActionResult.SUCCESS)
+
+    service = DedupExecutionService(db := MagicMock())
+    service.get_execution = MagicMock(return_value=execution)
+    service.get_action_audits = MagicMock(return_value=[existing_audit])
+    db.scalars.return_value = [already_resolved, unresolved]
+    service.record_action_result = MagicMock()
+    service.complete_execution = MagicMock(return_value="finalized")
+
+    service.recover_stale_execution(1)
+
+    service.record_action_result.assert_called_once()
+    assert service.record_action_result.call_args.args[1] == unresolved.id
+
+
 def test_get_action_audits_returns_empty_for_no_audits() -> None:
     db = MagicMock()
     db.scalars.return_value = []

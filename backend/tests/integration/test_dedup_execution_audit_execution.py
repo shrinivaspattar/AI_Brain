@@ -18,7 +18,7 @@ created, deleted, moved, renamed, or modified by any call in this
 service.
 """
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
@@ -1050,26 +1050,18 @@ def test_reauthorizing_a_plan_after_execution_requires_explicit_revoke(tmp_path)
 # --- idempotency / restart: re-planning after partial execution -----------
 
 
-def test_replanning_after_a_successful_deletion_produces_a_permanently_invalid_plan(
+def test_replanning_after_a_successful_deletion_excludes_the_resolved_member(
     tmp_path,
 ) -> None:
-    """Documents and locks in a genuine, currently-unresolved gap this
-    design pass surfaced (see AI_Brain_Architecture.md's "Executor
-    Safety & Recovery Design" section): once a duplicate has actually
-    been removed by an earlier (real or, here, test-simulated)
-    execution, `generate_plan_for_review` has no concept of "already
-    resolved" at the review-member level and will include that member
-    in any NEW plan anyway. Because a plan action's own
-    `observed_exists` is frozen at ITS generation time, and
-    `check_plan_validity`'s `is_valid` requires the file to exist NOW
-    for that exact action, an action generated against an
-    already-missing file can never be valid - which means the WHOLE
-    new plan can never be authorized, not just the still-outstanding
-    part of it. This test does not fix that gap - it proves the
-    documentation describing it is accurate. No AI_Brain code performs
-    the file deletion below; the test does it directly, purely to
-    stand in for what an earlier successful execution would have left
-    behind.
+    """The re-planning gap from the prior milestone, now resolved:
+    once a duplicate has actually been removed by an earlier (real or,
+    here, test-simulated) execution, `generate_plan_for_review`
+    excludes that member from a regenerated plan entirely rather than
+    including a permanently-invalid action for it - so the new plan,
+    covering only the still-outstanding work, CAN be authorized. No
+    AI_Brain code performs the file deletion below; the test does it
+    directly, purely to stand in for what an earlier successful
+    execution would have left behind.
     """
     canonical_file = tmp_path / "canonical.txt"
     canonical_file.write_text("hello world")
@@ -1126,51 +1118,339 @@ def test_replanning_after_a_successful_deletion_produces_a_permanently_invalid_p
             assert review_row.status == DuplicateReviewStatus.APPROVED
 
             # Generating a NEW plan for the still-outstanding work does
-            # NOT fail - a missing source file is honestly recorded,
-            # never rejected at generation time.
+            # NOT fail, and does NOT include an action for the
+            # already-resolved (now-missing) member at all.
             new_plan = plan_service.generate_plan_for_review(review.id)
             plan_ids.append(new_plan.id)
 
             new_resolved_action = _plan_action_for_document(
                 db, new_plan.id, dup_docs[0].id
             )
-            assert new_resolved_action.observed_exists is False
+            assert new_resolved_action is None
 
-            # But the new plan can NEVER be valid, because the
-            # already-resolved action's file is (correctly) recorded
-            # as missing, and is_valid requires exists_now for THAT
-            # SAME action to be True - which it structurally cannot be.
+            new_outstanding_action = _plan_action_for_document(
+                db, new_plan.id, dup_docs[1].id
+            )
+            assert new_outstanding_action is not None
+
+            # The new plan - covering only the still-outstanding work -
+            # is fully valid and CAN be authorized.
             validity = plan_service.check_plan_validity(new_plan.id)
-            assert validity.is_valid is False
-            resolved_validity = next(
-                a for a in validity.actions if a.action_id == new_resolved_action.id
-            )
-            assert resolved_validity.exists_now is False
-            assert resolved_validity.is_valid is False
+            assert validity.is_valid is True
+            assert len(validity.actions) == 1
+            assert validity.actions[0].document_id == dup_docs[1].id
 
-            # This blocks authorization of the ENTIRE new plan - even
-            # though the outstanding duplicate's file is completely
-            # untouched and the outstanding action itself would
-            # otherwise be perfectly valid.
-            outstanding_validity = next(
-                a
-                for a in validity.actions
-                if a.document_id == dup_docs[1].id
-            )
-            assert outstanding_validity.is_valid is True
+            new_authorization = auth_service.authorize_plan(new_plan.id)
+            authorization_ids.append(new_authorization.id)
+            assert new_authorization.plan_id == new_plan.id
 
-            try:
-                auth_service.authorize_plan(new_plan.id)
-                raise AssertionError(
-                    "Expected authorization of the new plan to be refused - "
-                    "this is the documented, currently-unresolved gap"
-                )
-            except ValueError as exc:
-                assert "no longer valid" in str(exc)
-
-            # The still-outstanding file is completely untouched.
+            # The still-outstanding file is completely untouched -
+            # authorizing the new plan performs no filesystem action.
             assert dup_file_outstanding.read_text() == "hello world"
             assert canonical_file.read_text() == "hello world"
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=plan_ids,
+                authorization_ids=authorization_ids,
+                execution_ids=execution_ids,
+            )
+
+
+# --- recover_stale_execution (Execution Recovery & Partial-Replanning) ----
+
+
+def test_recover_stale_execution_unchanged_file_is_not_attempted(tmp_path) -> None:
+    """The confident-classification case: a crashed execution left one
+    action unresolved, but its file is still there with exactly the
+    hash/size the plan expected - recovery can safely conclude the
+    mutation never happened, without guessing."""
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello world")
+    dup_files = [tmp_path / "dup0.txt", tmp_path / "dup1.txt"]
+    for f in dup_files:
+        f.write_text("hello world")
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, plan, authorization = _setup_authorized_plan(
+            db, canonical_file, dup_files, "recovery-plan-test-hash-1"
+        )
+        execution_service = DedupExecutionService(db)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            plan_action_0 = _plan_action_for_document(db, plan.id, dup_docs[0].id)
+            plan_action_1 = _plan_action_for_document(db, plan.id, dup_docs[1].id)
+
+            # Action 0 succeeded cleanly; action 1's process "crashed"
+            # before ever attempting it - the file is untouched.
+            execution_service.record_action_result(
+                execution.id,
+                plan_action_0.id,
+                DedupExecutionActionResult.SUCCESS,
+                observed_content_hash=plan_action_0.observed_content_hash,
+                observed_file_size=plan_action_0.observed_file_size,
+                filesystem_mutation_occurred=True,
+            )
+
+            recovered = execution_service.recover_stale_execution(execution.id)
+
+            assert recovered.status == DedupExecutionStatus.PARTIALLY_COMPLETED
+            audits = execution_service.get_action_audits(execution.id)
+            assert len(audits) == 2
+            action_1_audit = next(
+                a for a in audits if a.plan_action_id == plan_action_1.id
+            )
+            assert action_1_audit.result == DedupExecutionActionResult.NOT_ATTEMPTED
+            assert action_1_audit.filesystem_mutation_occurred is False
+
+            # Recovery is a pure read - nothing was touched.
+            assert canonical_file.read_text() == "hello world"
+            for f in dup_files:
+                assert f.read_text() == "hello world"
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_recover_stale_execution_missing_file_is_unknown_and_needs_review(
+    tmp_path,
+) -> None:
+    """The genuinely ambiguous case: after a "crash," the file is gone
+    - consistent with a successful delete, but recovery never promotes
+    that into a claimed SUCCESS. It stays UNKNOWN, and the execution is
+    correctly classified NEEDS_REVIEW, not COMPLETED."""
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello world")
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("hello world")
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, plan, authorization = _setup_authorized_plan(
+            db, canonical_file, [dup_file], "recovery-plan-test-hash-2"
+        )
+        execution_service = DedupExecutionService(db)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            # Simulate what a real, successful DELETE would have left
+            # behind - NOT performed by any AI_Brain code. Recovery
+            # must not simply infer SUCCESS from this.
+            dup_file.unlink()
+
+            recovered = execution_service.recover_stale_execution(execution.id)
+
+            assert recovered.status == DedupExecutionStatus.NEEDS_REVIEW
+            audits = execution_service.get_action_audits(execution.id)
+            assert len(audits) == 1
+            assert audits[0].result == DedupExecutionActionResult.UNKNOWN
+            assert audits[0].filesystem_mutation_occurred is None
+            assert "missing" in audits[0].error_message
+
+            assert canonical_file.read_text() == "hello world"
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_recover_stale_execution_raises_for_non_running(tmp_path) -> None:
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello world")
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("hello world")
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, plan, authorization = _setup_authorized_plan(
+            db, canonical_file, [dup_file], "recovery-plan-test-hash-3"
+        )
+        execution_service = DedupExecutionService(db)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+            plan_action = _plan_action_for_document(db, plan.id, dup_docs[0].id)
+            execution_service.record_action_result(
+                execution.id,
+                plan_action.id,
+                DedupExecutionActionResult.SUCCESS,
+                observed_content_hash=plan_action.observed_content_hash,
+                observed_file_size=plan_action.observed_file_size,
+                filesystem_mutation_occurred=True,
+            )
+            execution_service.complete_execution(execution.id)
+
+            try:
+                execution_service.recover_stale_execution(execution.id)
+                raise AssertionError(
+                    "Expected ValueError recovering an already-finalized execution"
+                )
+            except ValueError as exc:
+                assert "is not RUNNING" in str(exc)
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+def test_list_executions_started_before_filter_against_real_data(tmp_path) -> None:
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello world")
+    dup_file = tmp_path / "dup.txt"
+    dup_file.write_text("hello world")
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, plan, authorization = _setup_authorized_plan(
+            db, canonical_file, [dup_file], "recovery-plan-test-hash-4"
+        )
+        execution_service = DedupExecutionService(db)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            far_future = datetime(2099, 1, 1, tzinfo=UTC)
+            far_past = datetime(2000, 1, 1, tzinfo=UTC)
+
+            found = execution_service.list_executions(
+                status=DedupExecutionStatus.RUNNING, started_before=far_future
+            )
+            assert execution.id in {e.id for e in found}
+
+            not_found = execution_service.list_executions(
+                status=DedupExecutionStatus.RUNNING, started_before=far_past
+            )
+            assert execution.id not in {e.id for e in not_found}
+
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
+                execution_ids=execution_ids,
+            )
+
+
+# --- full recovery -> re-plan flow ---------------------------------------
+
+
+def test_full_recovery_then_replan_excludes_confirmed_success_only(tmp_path) -> None:
+    """End to end: a partial "crash" leaves one action genuinely
+    resolved (SUCCESS) and one action's fate ambiguous (missing file,
+    recorded UNKNOWN by recovery, never promoted to SUCCESS). A fresh
+    plan for the review must exclude the SUCCESS-and-now-missing member
+    (its file is gone) but STILL include the UNKNOWN member if its file
+    also happens to be missing (exclusion is based on live file
+    existence, not on a "confirmed" audit trail) - proving the
+    exclusion mechanism is general-purpose, not narrowly tied to
+    SUCCESS bookkeeping. A brand-new authorization is required for the
+    new plan, since authorization is bound to one specific plan_id."""
+    canonical_file = tmp_path / "canonical.txt"
+    canonical_file.write_text("hello world")
+    dup_file_success = tmp_path / "dup-success.txt"
+    dup_file_success.write_text("hello world")
+    dup_file_unknown = tmp_path / "dup-unknown.txt"
+    dup_file_unknown.write_text("hello world")
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, plan, authorization = _setup_authorized_plan(
+            db,
+            canonical_file,
+            [dup_file_success, dup_file_unknown],
+            "recovery-plan-test-hash-5",
+        )
+        plan_service = DedupExecutionPlanService(db)
+        auth_service = DedupPlanAuthorizationService(db)
+        execution_service = DedupExecutionService(db)
+        plan_ids = [plan.id]
+        authorization_ids = [authorization.id]
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+
+            success_action = _plan_action_for_document(db, plan.id, dup_docs[0].id)
+            unknown_action = _plan_action_for_document(db, plan.id, dup_docs[1].id)
+
+            # Real deletions simulating what an executor would have
+            # done - NOT performed by any AI_Brain code.
+            dup_file_success.unlink()
+            dup_file_unknown.unlink()
+
+            execution_service.record_action_result(
+                execution.id,
+                success_action.id,
+                DedupExecutionActionResult.SUCCESS,
+                observed_content_hash=success_action.observed_content_hash,
+                observed_file_size=success_action.observed_file_size,
+                filesystem_mutation_occurred=True,
+            )
+            # unknown_action is left unresolved - recovery will handle it.
+
+            recovered = execution_service.recover_stale_execution(execution.id)
+            assert recovered.status == DedupExecutionStatus.NEEDS_REVIEW
+
+            unknown_audit = next(
+                a
+                for a in execution_service.get_action_audits(execution.id)
+                if a.plan_action_id == unknown_action.id
+            )
+            assert unknown_audit.result == DedupExecutionActionResult.UNKNOWN
+
+            # Both files are now gone - a fresh plan for the review
+            # excludes BOTH (live-file-existence exclusion, not
+            # SUCCESS-audit-based), leaving nothing plannable.
+            try:
+                plan_service.generate_plan_for_review(review.id)
+                raise AssertionError(
+                    "Expected no plannable work left - both members' "
+                    "files are gone"
+                )
+            except ValueError as exc:
+                assert "no plannable work left" in str(exc)
 
         finally:
             _cleanup(

@@ -36,6 +36,15 @@ class DedupExecutionPlanResponse(BaseModel):
     status: str
     created_at: datetime
     actions: list[DedupExecutionPlanActionResponse]
+    # Non-canonical review members that were left OUT of `actions`
+    # because their file no longer existed at generation time (see
+    # "Execution Recovery & Partial-Replanning Design" in
+    # AI_Brain_Architecture.md) - computed by comparing the review's
+    # own members against this plan's actions, not a stored field.
+    # Transparency for a human reading a smaller-than-expected plan:
+    # this tells them WHY, without claiming to know whether it's
+    # because an earlier execution succeeded or for some other reason.
+    excluded_document_ids: list[str] = []
 
     model_config = ConfigDict(from_attributes=True)
 
