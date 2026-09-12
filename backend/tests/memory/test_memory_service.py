@@ -180,6 +180,56 @@ def test_delete_memory_removes_existing_memory() -> None:
     db.commit.assert_called_once_with()
 
 
+def test_approve_memory_on_already_rejected_memory_overwrites_status() -> None:
+    """Documents current, deliberate behavior: approve_memory/reject_memory
+    do not guard on the memory's current status - either can be called
+    from any state, and the last call wins. The frontend review queue
+    only ever shows Approve/Reject buttons for a PENDING memory, so this
+    path isn't reachable through the UI, but the service itself places
+    no restriction on it.
+    """
+    db = MagicMock()
+    memory = Memory(id=1, content="test", status=MemoryStatus.REJECTED)
+    db.get.return_value = memory
+
+    service = MemoryService(db)
+    result = service.approve_memory(1)
+
+    assert result.status == MemoryStatus.APPROVED
+
+
+def test_reject_memory_on_already_approved_memory_overwrites_status() -> None:
+    db = MagicMock()
+    memory = Memory(id=1, content="test", status=MemoryStatus.APPROVED)
+    db.get.return_value = memory
+
+    service = MemoryService(db)
+    result = service.reject_memory(1)
+
+    assert result.status == MemoryStatus.REJECTED
+
+
+def test_conflicting_sequential_review_calls_last_write_wins() -> None:
+    """There is no optimistic-locking/version column on Memory, so two
+    conflicting review requests processed one after another (as real
+    concurrent HTTP requests would be, serialized by the database) both
+    succeed without raising - whichever is applied last determines the
+    final status. This documents that behavior rather than changing it.
+    """
+    db = MagicMock()
+    memory = Memory(id=1, content="test", status=MemoryStatus.PENDING)
+    db.get.return_value = memory
+
+    service = MemoryService(db)
+
+    approved = service.approve_memory(1)
+    assert approved.status == MemoryStatus.APPROVED
+
+    rejected = service.reject_memory(1)
+    assert rejected.status == MemoryStatus.REJECTED
+    assert rejected is approved  # same row, mutated in place
+
+
 def test_delete_memory_raises_for_missing_memory() -> None:
     db = MagicMock()
     db.get.return_value = None

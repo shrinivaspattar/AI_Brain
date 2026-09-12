@@ -13,6 +13,7 @@
       <nav id="view-nav">
         <button id="nav-chat-btn" class="nav-btn" type="button" aria-pressed="true">Chat</button>
         <button id="nav-import-jobs-btn" class="nav-btn" type="button" aria-pressed="false">Import Jobs</button>
+        <button id="nav-memory-btn" class="nav-btn" type="button" aria-pressed="false">Memory Review</button>
       </nav>
       <button id="new-conversation-btn" type="button" title="Start a new conversation">New conversation</button>
     </header>
@@ -37,6 +38,20 @@
         <span id="import-jobs-status-line"></span>
       </div>
       <div id="import-jobs-list" aria-live="polite"></div>
+    </section>
+
+    <section id="memory-view" hidden>
+      <div id="memory-toolbar">
+        <div id="memory-filter-tabs">
+          <button class="filter-tab" data-status="pending" type="button">Pending</button>
+          <button class="filter-tab" data-status="approved" type="button">Approved</button>
+          <button class="filter-tab" data-status="rejected" type="button">Rejected</button>
+          <button class="filter-tab" data-status="" type="button">All</button>
+        </div>
+        <button id="refresh-memory-btn" type="button">Refresh</button>
+        <span id="memory-status-line"></span>
+      </div>
+      <div id="memory-list" aria-live="polite"></div>
     </section>
   </div>
 

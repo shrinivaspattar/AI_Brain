@@ -132,6 +132,14 @@ def test_list_memories_filters_by_status() -> None:
         app.dependency_overrides.clear()
 
 
+def test_list_memories_rejects_invalid_status_filter() -> None:
+    client = TestClient(app)
+
+    response = client.get("/memory", params={"status": "bogus"})
+
+    assert response.status_code == 422
+
+
 def test_approve_memory() -> None:
     db = MagicMock()
 

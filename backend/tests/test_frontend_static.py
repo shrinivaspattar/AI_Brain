@@ -46,6 +46,14 @@ def test_root_index_includes_import_jobs_nav() -> None:
     assert "Import Jobs" in response.text
 
 
+def test_root_index_includes_memory_review_nav() -> None:
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert "Memory Review" in response.text
+
+
 def test_chat_route_with_path_param_not_shadowed_by_static_mount() -> None:
     """A path-param API route (/chat/{conversation_id}) must still reach
     the real FastAPI handler and return its JSON error shape, not a

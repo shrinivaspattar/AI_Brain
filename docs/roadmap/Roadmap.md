@@ -293,8 +293,54 @@ machine.
       raises for those cases. It now returns a clean `422` with
       `detail` matching the job's own `error_message` — see "Import job
       execute error handling," below.
-- [ ] Memory review queue, dedup review — not started; each remains its
-      own later frontend slice, not bundled into this one.
+- [x] Memory review queue: a third view (`nav-memory-btn`) reusing the
+      existing `GET /memory?status=`, `POST /memory/{id}/approve`, and
+      `POST /memory/{id}/reject` endpoints verbatim — no new backend
+      endpoints, no memory business logic duplicated in JS. Filter tabs
+      (Pending/Approved/Rejected/All) map straight to the existing
+      `status` query param. Each candidate shows its content, confidence
+      (or "not scored"), created timestamp, and a status badge; Approve/
+      Reject buttons only appear for `pending` memories, matching the
+      one-way candidate → review → approved/rejected flow (the backend
+      itself doesn't enforce this - see below).
+      Provenance: `conversation_id`/`message_id` are always shown as raw
+      references; when a `message_id` exists, an on-demand "View source
+      message" toggle fetches the existing `GET /chat/{conversation_id}`
+      endpoint (no new endpoint - see the "Design trade-off" note below)
+      and displays a truncated snippet of that specific message plus its
+      citations, so a human reviewer can see exactly what grounded the
+      proposal without a full document dump.
+      Safety: approve/reject require an explicit two-click in-page
+      confirmation (arm, then confirm within 4s) rather than a native
+      `window.confirm()` - found during browser verification that native
+      dialogs are unreliable to interact with via browser automation and
+      are visually inconsistent with the rest of the app anyway; the
+      in-page pattern is more robust and equally explicit. No bulk-approve
+      exists anywhere in the UI.
+      Verified end-to-end in a real browser against the real database and
+      a real chat turn: asked the real model to remember a synthetic fact,
+      confirmed the resulting PENDING memory appeared with correct
+      provenance (including the `message_id` backfill that only completes
+      once the turn fully finishes), approved one candidate and rejected
+      another, confirmed both moved between filter tabs correctly and
+      their source Message/Conversation rows were completely unmodified
+      afterward, and reconfirmed Chat and Import Job Monitoring both
+      still work unaffected.
+      **Design trade-off, deliberately not addressed**: reusing
+      `GET /chat/{conversation_id}` to find one specific message means
+      fetching the whole conversation's history client-side rather than
+      a single message - acceptable for now (personal-scale conversation
+      lengths, and it's an on-demand fetch, not eager), but a dedicated
+      `GET /messages/{id}` endpoint would be more precise if this becomes
+      a real cost.
+      **Also found, not changed**: `approve_memory`/`reject_memory` have
+      no guard against reviewing an already-reviewed memory - either can
+      be called from any status and the last call wins. The UI never
+      exposes this path (buttons only show for `pending`), but the API
+      itself permits it; documented and tested (both service- and
+      HTTP-level), not fixed, since nothing in this milestone's scope
+      needed it changed.
+- [ ] Dedup review — not started; its own later frontend slice.
 - [ ] No conversation list/switcher yet — only ever one active
       conversation per browser (`localStorage`), matching the
       chat-only scope of the original slice.

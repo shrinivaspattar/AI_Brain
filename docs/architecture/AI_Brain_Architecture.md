@@ -64,8 +64,9 @@ master backup / source files (read-only)
         │
         ▼
    browser (frontend/, served at "/") ↔ POST /chat, GET /chat/{id},
-   GET /import-jobs — chat view + read-only import job monitor, no
-   build step   [implemented]
+   GET /import-jobs, GET /memory + approve|reject — chat, read-only
+   import job monitor, and human memory review queue, no build step
+   [implemented]
 ```
 
 ## Backend module layout (`backend/app/`)
@@ -85,7 +86,7 @@ master backup / source files (read-only)
 | `files/` | Implemented | `service.FileAccessService.read_file(path)`: the one tool with real filesystem access, scoped to paths under a COMPLETED `ImportJob.source_path` (path-traversal-safe via `Path.resolve()` + `is_relative_to`, same pattern as `ArchiveExtractor`). Reuses `ingestion.text_extractor.extract_text`; truncates at `MAX_FILE_READ_LENGTH`. Read-only — no write, move, or delete capability. Exposed via the `read_file_content` tool. |
 | `dedup/` | Implemented | `service.DeduplicationService`: `find_exact_duplicates` (groups by `Document.content_hash`), `find_near_duplicate_documents` (pgvector cosine similarity on first-chunk embeddings), `plan_exact_duplicate_cleanup` (Best Copy Arbitration + dry-run plan: keeps the oldest copy per exact-duplicate group by `created_at`/`id`, proposes deleting the rest — computing a plan never deletes, moves, or quarantines anything). Exposed via `GET /dedup/exact`\|`/near`\|`/exact/plan` and the `find_duplicate_documents`/`plan_duplicate_cleanup` tools. |
 | `provenance/` | Implemented | `service.ProvenanceService.trace_document(document_id)`: walks the existing FK chain (`ImportJob` → `Document.import_job_id` → `DocumentChunk.document_id`, plus every `Message` whose denormalized `citations` names the document) into one queryable trace. Read-only, no new source of truth. Exposed via `GET /documents/{id}/provenance`. |
-| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Two views toggled client-side: Chat and Import Jobs (read-only, polls `GET /import-jobs`). |
+| `frontend/` (repo root, not under `backend/app/`) | Implemented (chat + import job monitor + memory review) | Plain `index.html`/`style.css`/`app.js`, no build step, no framework. Mounted by FastAPI at `"/"` via `StaticFiles(..., html=True)` (see Frontend, below), so the whole app is one process on one port. Three views toggled client-side: Chat, Import Jobs (read-only, polls `GET /import-jobs`), and Memory Review (human approve/reject queue over `GET /memory?status=`). |
 
 ## Archive extraction
 `ArchiveExtractor.extract(files, destination)` (`app/ingestion/archive.py`)
@@ -563,6 +564,62 @@ Memory retrieval is "most recent N", not similarity-ranked like document
 retrieval; revisit if the store grows large enough that recency stops
 being a good proxy for relevance.
 
+`approve_memory`/`reject_memory` place no guard on the memory's current
+`status` - either can be called regardless of what it currently is, and
+whichever call lands last wins (there's no optimistic-locking/version
+column). This is deliberate-by-omission rather than a bug: nothing in
+the service or API layer has ever needed a stricter state machine, and
+the one caller that matters - the frontend review queue, below - never
+exposes a path to re-review something already decided (Approve/Reject
+only render for a `pending` memory). Documented and tested at both the
+service and real-HTTP level rather than changed.
+
+### Memory Review view (frontend)
+A third frontend view (`nav-memory-btn`, alongside Chat and Import
+Jobs), reusing `GET /memory?status=`, `POST /memory/{id}/approve`, and
+`POST /memory/{id}/reject` verbatim - no new backend endpoints, no
+memory business logic (status transitions, scoring) duplicated in
+JavaScript. Filter tabs (Pending/Approved/Rejected/All) map directly to
+the existing `status` query parameter; Approve/Reject buttons render
+only for `pending` memories, so the one-way candidate → review →
+approved/rejected flow is a frontend-level restriction, not a backend
+one (see above).
+
+Provenance display: `conversation_id`/`message_id` are always shown as
+plain references (free - no extra fetch). When a `message_id` exists,
+an on-demand "View source message" toggle fetches the *existing*
+`GET /chat/{conversation_id}` endpoint and finds the matching message
+client-side, showing a truncated (300-char) snippet of its content plus
+any citations - the same citation shape already used in Chat. This
+reuses an existing endpoint rather than adding a new single-message
+one; the trade-off (fetching a whole conversation's history to find one
+message) is called out in the Roadmap as something to revisit only if
+it becomes a real cost - personal-scale conversation lengths make it a
+non-issue today, and it's fetched on demand, not eagerly for every
+listed candidate.
+
+Confirmation: Approve/Reject use a two-click in-page pattern (`createConfirmableActionButton`
+in `app.js`) - first click arms the button ("Confirm Approve?"), a
+second click within 4 seconds performs the action, anything else
+disarms it. This replaced an initial native `window.confirm()` design:
+browser verification for this milestone found that native JS dialogs
+aren't reliably interactable through browser automation tooling, and
+they're visually inconsistent with the rest of the app regardless - the
+in-page pattern is more robust and no less explicit a confirmation.
+There is no bulk-approve/bulk-reject control anywhere in the UI.
+
+Verified end-to-end in a real browser against the real database and a
+real chat turn: asked the real `qwen3:8b` model to remember a synthetic
+test fact, confirmed the resulting `PENDING` memory appeared with
+correct provenance - including its `message_id` starting `null` and
+correctly backfilling once the turn fully completed, the same timing
+behavior described above - approved one candidate and rejected another,
+confirmed both moved to the correct filter tab afterward, confirmed via
+direct query that the source `Message`/`Conversation` rows they were
+derived from were completely unmodified by either action, and
+reconfirmed Chat (with citations) and Import Job Monitoring both still
+work unaffected by this addition.
+
 ## Import job lifecycle
 `ImportJob.status` is a state machine (`app/models/import_job.py`):
 
@@ -618,8 +675,8 @@ unchanged.
   `document_chunks` migration are applied on this host, but neither step
   is automated yet — a fresh machine needs both done manually before
   `EmbeddingService` will work.
-- Frontend covers chat and read-only import job monitoring (see
-  Frontend, above) — no memory review or dedup review UI yet, and no
+- Frontend covers chat, read-only import job monitoring, and memory
+  review (see Frontend, above) — no dedup review UI yet, and no
   job-creation form (creating/running import jobs stays API/curl-only);
   those remain future frontend slices.
 - See [`docs/backlog.md`](../backlog.md) for prioritized future work

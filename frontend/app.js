@@ -16,8 +16,24 @@ const refreshImportJobsBtn = document.getElementById("refresh-import-jobs-btn");
 const importJobsListEl = document.getElementById("import-jobs-list");
 const importJobsStatusLineEl = document.getElementById("import-jobs-status-line");
 
+const memoryViewEl = document.getElementById("memory-view");
+const navMemoryBtn = document.getElementById("nav-memory-btn");
+const refreshMemoryBtn = document.getElementById("refresh-memory-btn");
+const memoryListEl = document.getElementById("memory-list");
+const memoryStatusLineEl = document.getElementById("memory-status-line");
+const memoryFilterTabs = document.querySelectorAll(".filter-tab");
+
+const MEMORY_EMPTY_MESSAGES = {
+  pending: "No pending memories to review.",
+  approved: "No approved memories yet.",
+  rejected: "No rejected memories.",
+  "": "No memories yet.",
+};
+const SOURCE_SNIPPET_MAX_LENGTH = 300;
+
 let conversationId = localStorage.getItem(CONVERSATION_ID_KEY);
 let importJobsPollTimer = null;
+let currentMemoryFilter = "pending";
 
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -332,29 +348,355 @@ async function fetchImportJobs() {
   }
 }
 
-function showChatView() {
-  chatViewEl.hidden = false;
-  importJobsViewEl.hidden = true;
-  navChatBtn.classList.add("active");
-  navChatBtn.setAttribute("aria-pressed", "true");
-  navImportJobsBtn.classList.remove("active");
-  navImportJobsBtn.setAttribute("aria-pressed", "false");
+const VIEWS = {
+  chat: { section: chatViewEl, navBtn: navChatBtn },
+  importJobs: { section: importJobsViewEl, navBtn: navImportJobsBtn },
+  memory: { section: memoryViewEl, navBtn: navMemoryBtn },
+};
+
+function showView(name) {
+  Object.entries(VIEWS).forEach(([key, { section, navBtn }]) => {
+    const isActive = key === name;
+    section.hidden = !isActive;
+    navBtn.classList.toggle("active", isActive);
+    navBtn.setAttribute("aria-pressed", String(isActive));
+  });
+  // Only one view is ever on screen - anything that polls in the
+  // background must stop the moment its view isn't the visible one.
   stopImportJobsPolling();
 }
 
+function showChatView() {
+  showView("chat");
+}
+
 function showImportJobsView() {
-  chatViewEl.hidden = true;
-  importJobsViewEl.hidden = false;
-  navImportJobsBtn.classList.add("active");
-  navImportJobsBtn.setAttribute("aria-pressed", "true");
-  navChatBtn.classList.remove("active");
-  navChatBtn.setAttribute("aria-pressed", "false");
+  showView("importJobs");
   fetchImportJobs();
+}
+
+function showMemoryView() {
+  showView("memory");
+  fetchMemories(currentMemoryFilter);
 }
 
 navChatBtn.addEventListener("click", showChatView);
 navImportJobsBtn.addEventListener("click", showImportJobsView);
+navMemoryBtn.addEventListener("click", showMemoryView);
 refreshImportJobsBtn.addEventListener("click", fetchImportJobs);
+
+// --- Memory Review view --------------------------------------------------
+// Human review queue for candidate memories (Memory.status == "pending"),
+// proposed by the model via the `remember` tool. Reuses the existing
+// GET /memory, POST /memory/{id}/approve, POST /memory/{id}/reject
+// endpoints verbatim - no memory review/business logic lives here, only
+// display and the explicit approve/reject action itself.
+
+function renderMemoryEmptyState() {
+  memoryListEl.innerHTML = "";
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  empty.textContent =
+    MEMORY_EMPTY_MESSAGES[currentMemoryFilter] ?? "No memories found.";
+  memoryListEl.appendChild(empty);
+}
+
+async function fetchSourceMessage(sourceConversationId, messageId) {
+  const response = await fetch(`/chat/${sourceConversationId}`);
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const history = await response.json();
+  const message = history.find((m) => m.id === messageId);
+
+  if (!message) {
+    throw new Error("source message no longer available");
+  }
+
+  return message;
+}
+
+function renderSourceSnippet(container, message) {
+  container.innerHTML = "";
+
+  const snippet = document.createElement("div");
+  snippet.className = "memory-source-snippet";
+
+  const roleLabel = document.createElement("div");
+  roleLabel.textContent = `[${message.role}]`;
+  snippet.appendChild(roleLabel);
+
+  const text = document.createElement("div");
+  text.textContent =
+    message.content.length > SOURCE_SNIPPET_MAX_LENGTH
+      ? `${message.content.slice(0, SOURCE_SNIPPET_MAX_LENGTH)}...`
+      : message.content;
+  snippet.appendChild(text);
+
+  if (message.citations && message.citations.length > 0) {
+    const citationsEl = document.createElement("div");
+    citationsEl.className = "citations";
+
+    const label = document.createElement("div");
+    label.textContent = "Sources:";
+    citationsEl.appendChild(label);
+
+    const list = document.createElement("ol");
+    message.citations.forEach((citation) => {
+      const item = document.createElement("li");
+      item.textContent = `${citation.document_title} (${citation.document_source})`;
+      list.appendChild(item);
+    });
+    citationsEl.appendChild(list);
+    snippet.appendChild(citationsEl);
+  }
+
+  container.appendChild(snippet);
+}
+
+function buildProvenanceBlock(memory) {
+  const provenance = document.createElement("div");
+  provenance.className = "memory-provenance";
+
+  if (!memory.conversation_id) {
+    const ref = document.createElement("div");
+    ref.textContent = "No provenance recorded (written directly).";
+    provenance.appendChild(ref);
+    return provenance;
+  }
+
+  const ref = document.createElement("div");
+  ref.textContent = memory.message_id
+    ? `From conversation ${memory.conversation_id}, message #${memory.message_id}`
+    : `From conversation ${memory.conversation_id}`;
+  provenance.appendChild(ref);
+
+  if (!memory.message_id) {
+    return provenance;
+  }
+
+  const snippetContainer = document.createElement("div");
+  snippetContainer.hidden = true;
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "memory-provenance-toggle";
+  toggle.textContent = "View source message";
+
+  toggle.addEventListener("click", async () => {
+    if (!snippetContainer.hidden) {
+      snippetContainer.hidden = true;
+      toggle.textContent = "View source message";
+      return;
+    }
+
+    toggle.disabled = true;
+
+    try {
+      const sourceMessage = await fetchSourceMessage(
+        memory.conversation_id,
+        memory.message_id
+      );
+      renderSourceSnippet(snippetContainer, sourceMessage);
+      toggle.textContent = "Hide source message";
+    } catch (err) {
+      snippetContainer.innerHTML = "";
+      const errorEl = document.createElement("div");
+      errorEl.className = "memory-review-error";
+      errorEl.textContent = `Could not load source message: ${err.message}`;
+      snippetContainer.appendChild(errorEl);
+      toggle.textContent = "Hide source message";
+    } finally {
+      toggle.disabled = false;
+      snippetContainer.hidden = false;
+    }
+  });
+
+  provenance.appendChild(toggle);
+  provenance.appendChild(snippetContainer);
+  return provenance;
+}
+
+async function reviewMemory(memoryId, action, cardEl) {
+  const buttons = cardEl.querySelectorAll(
+    ".memory-approve-btn, .memory-reject-btn"
+  );
+  buttons.forEach((btn) => (btn.disabled = true));
+
+  try {
+    const response = await fetch(`/memory/${memoryId}/${action}`, {
+      method: "POST",
+    });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = body && body.detail ? body.detail : `HTTP ${response.status}`;
+      throw new Error(detail);
+    }
+
+    // A reviewed memory no longer belongs in the Pending list (the only
+    // filter that ever shows these buttons) - remove it rather than
+    // re-fetch the whole list.
+    cardEl.remove();
+    if (memoryListEl.children.length === 0) {
+      renderMemoryEmptyState();
+    }
+  } catch (err) {
+    buttons.forEach((btn) => (btn.disabled = false));
+
+    let errorEl = cardEl.querySelector(".memory-review-error");
+    if (!errorEl) {
+      errorEl = document.createElement("div");
+      errorEl.className = "memory-review-error";
+      cardEl.appendChild(errorEl);
+    }
+    errorEl.textContent = `Could not ${action} memory: ${err.message}`;
+  }
+}
+
+const CONFIRM_RESET_DELAY_MS = 4000;
+
+// Explicit human confirmation for approve/reject, without a native
+// browser confirm() dialog (jarring next to the rest of the app's UI,
+// and not reliably scriptable by browser automation/testing tools).
+// First click arms the button ("Confirm Approve?"); a second click
+// within CONFIRM_RESET_DELAY_MS actually performs the action. Clicking
+// anything else, or waiting past the delay, disarms it automatically.
+function createConfirmableActionButton(label, className, onConfirm) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.textContent = label;
+
+  let armed = false;
+  let resetTimer = null;
+
+  function disarm() {
+    armed = false;
+    btn.textContent = label;
+    if (resetTimer !== null) {
+      clearTimeout(resetTimer);
+      resetTimer = null;
+    }
+  }
+
+  btn.addEventListener("click", () => {
+    if (!armed) {
+      armed = true;
+      btn.textContent = `Confirm ${label}?`;
+      resetTimer = setTimeout(disarm, CONFIRM_RESET_DELAY_MS);
+      return;
+    }
+
+    disarm();
+    onConfirm();
+  });
+
+  return btn;
+}
+
+function renderMemoryCard(memory) {
+  const card = document.createElement("div");
+  card.className = "memory-card";
+
+  const header = document.createElement("div");
+  header.className = "memory-card-header";
+
+  const content = document.createElement("div");
+  content.className = "memory-content";
+  content.textContent = memory.content;
+
+  const badge = document.createElement("span");
+  badge.className = statusBadgeClass(memory.status);
+  badge.textContent = memory.status;
+
+  header.appendChild(content);
+  header.appendChild(badge);
+  card.appendChild(header);
+
+  const meta = document.createElement("div");
+  meta.className = "memory-meta";
+  const confidenceText =
+    memory.confidence === null || memory.confidence === undefined
+      ? "not scored"
+      : `${Math.round(memory.confidence * 100)}% confidence`;
+  meta.textContent = `${confidenceText} — created ${formatTimestamp(memory.created_at)}`;
+  card.appendChild(meta);
+
+  card.appendChild(buildProvenanceBlock(memory));
+
+  if (memory.status === "pending") {
+    const actions = document.createElement("div");
+    actions.className = "memory-actions";
+
+    actions.appendChild(
+      createConfirmableActionButton("Approve", "memory-approve-btn", () =>
+        reviewMemory(memory.id, "approve", card)
+      )
+    );
+    actions.appendChild(
+      createConfirmableActionButton("Reject", "memory-reject-btn", () =>
+        reviewMemory(memory.id, "reject", card)
+      )
+    );
+    card.appendChild(actions);
+  }
+
+  return card;
+}
+
+function renderMemories(memories) {
+  memoryListEl.innerHTML = "";
+
+  if (memories.length === 0) {
+    renderMemoryEmptyState();
+    return;
+  }
+
+  memories.forEach((memory) => memoryListEl.appendChild(renderMemoryCard(memory)));
+}
+
+async function fetchMemories(filter) {
+  refreshMemoryBtn.disabled = true;
+
+  try {
+    const url = filter ? `/memory?status=${encodeURIComponent(filter)}` : "/memory";
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const memories = await response.json();
+    renderMemories(memories);
+    memoryStatusLineEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    memoryListEl.innerHTML = "";
+    const error = document.createElement("div");
+    error.className = "message error";
+    error.textContent = `Could not load memories: ${err.message}`;
+    memoryListEl.appendChild(error);
+    memoryStatusLineEl.textContent = "";
+  } finally {
+    refreshMemoryBtn.disabled = false;
+  }
+}
+
+memoryFilterTabs.forEach((tab) => {
+  if (tab.dataset.status === currentMemoryFilter) {
+    tab.classList.add("active");
+  }
+
+  tab.addEventListener("click", () => {
+    currentMemoryFilter = tab.dataset.status;
+    memoryFilterTabs.forEach((t) => t.classList.toggle("active", t === tab));
+    fetchMemories(currentMemoryFilter);
+  });
+});
+
+refreshMemoryBtn.addEventListener("click", () => fetchMemories(currentMemoryFilter));
 
 showChatView();
 
