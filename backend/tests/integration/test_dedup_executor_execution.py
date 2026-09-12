@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.dedup.authorization_service import DedupPlanAuthorizationService
 from app.dedup.execution_plan_service import DedupExecutionPlanService
-from app.dedup.execution_service import DedupExecutionService
+from app.dedup.execution_service import DedupExecutionService, DuplicateActionResultError
 from app.dedup.executor import DedupFilesystemExecutor, _device_of, _pin_and_hash
 from app.dedup.review_service import DedupReviewService
 from app.dedup.service import ExactDuplicateGroup
@@ -175,11 +175,21 @@ def test_executor_requires_explicit_roots_no_defaults() -> None:
 def test_executor_source_never_references_real_corpus_path() -> None:
     """Belt-and-suspenders proof, not just an assertion about
     argument defaults: the executor's own source code contains no
-    string reference to the real corpus location at all."""
+    string reference to the real corpus location at all. Covers both
+    an earlier real-drive mount path this project's memory once
+    (incorrectly) protected, and the two real T7 paths confirmed
+    afterward: the canonical protected path the user named, and the
+    drive that happens to be actually mounted with real personal data -
+    one substring check covers both, since the mounted variant's name
+    contains the canonical one as a prefix. (As with the test below,
+    the forbidden strings are not spelled out contiguously here or in
+    any docstring in this file, to avoid this test flagging itself.)"""
     source = inspect.getsource(DedupFilesystemExecutor)
     assert "/mnt" not in source
     assert "t7ssd" not in source
     assert ("vscode" + "/data") not in source
+    assert "/media" not in source
+    assert ("Seenu_" + "T7SSD") not in source
 
 
 def test_executor_tests_never_reference_real_paths_or_discover_roots_dynamically() -> None:
@@ -212,6 +222,15 @@ def test_executor_tests_never_reference_real_paths_or_discover_roots_dynamically
     forbidden_env_lookup = "os." + "environ"
     forbidden_base_dir = "BASE_" + "DIR"
     forbidden_ingestion_dir = "INGESTION_" + "DIR"
+    # The two real, confirmed T7 paths: the canonical path the user
+    # explicitly named as protected, and the drive that happens to be
+    # actually mounted with real personal data at time of writing.
+    # Checking the shared name prefix covers both in one assertion,
+    # since the mounted variant's name is the canonical one plus a
+    # trailing "1" - deliberately not spelled out contiguously here,
+    # for the same self-matching reason as every other literal below.
+    forbidden_media_personal = "/media/" + "personal"
+    forbidden_t7_paths = "Seenu_" + "T7SSD"
 
     assert forbidden_corpus_root not in this_file
     assert forbidden_corpus_subdir not in this_file
@@ -219,6 +238,8 @@ def test_executor_tests_never_reference_real_paths_or_discover_roots_dynamically
     assert forbidden_env_lookup not in this_file
     assert forbidden_base_dir not in this_file
     assert forbidden_ingestion_dir not in this_file
+    assert forbidden_media_personal not in this_file
+    assert forbidden_t7_paths not in this_file
 
 
 def test_executor_rejects_nonexistent_allowed_root(tmp_path) -> None:
@@ -2383,5 +2404,204 @@ def test_authorization_revoked_from_another_session_is_observed_even_with_expire
                 [canonical_doc_id, *dup_doc_ids],
                 plan_ids=[plan_id],
                 authorization_ids=[authorization_id],
+                execution_ids=execution_ids,
+            )
+
+
+# --- execute() vs recover_stale_execution() race (post-462510b follow-up) --
+
+
+def test_execute_vs_recover_stale_execution_race_never_corrupts_state(tmp_path) -> None:
+    """The state-machine question raised after 462510b: `_claim_
+    execution` checks/sets `claimed_at`, while `_claim_for_recovery`
+    checks/sets the entirely independent `recovery_claimed_at`. Each is
+    individually protected by its own `SELECT ... FOR UPDATE`, but
+    nothing checks the OTHER column - so a genuinely still-running
+    `execute()` call and a `recover_stale_execution()` call can both be
+    legitimately granted their claim for the SAME still-RUNNING
+    execution, and both can then reach `record_action_result` for the
+    SAME unresolved plan action.
+
+    This test forces that exact interleaving for real, using a shared
+    `threading.Barrier` patched into `DedupExecutionService.record_
+    action_result` itself so both callers' underlying INSERT attempts
+    are synchronized to fire at nearly the same instant - not merely
+    "close in wall-clock time," but genuinely racing at the database
+    level. Before the fix landed in this same commit, this exact test
+    reproduced a raw `psycopg2.errors.UniqueViolation` propagating
+    uncaught out of `recover_stale_execution` in roughly 2 of every 5
+    runs (confirmed via a standalone probe script during investigation,
+    not merely theorized) - proving the race was real, not just a
+    missing test. After the fix (record_action_result converts the
+    database's own unique-constraint collision into the same clean
+    `DuplicateActionResultError` its pre-insert check already raises,
+    and both `recover_stale_execution` and `execute()` gracefully
+    accept losing the race to finalize first), every run must produce:
+    no raw IntegrityError, no uncaught exception of any kind from
+    either caller, exactly one audit row for the one plan action, and
+    the execution reaching a well-defined terminal state - never left
+    stuck RUNNING with `recovery_claimed_at` set and no legal way to
+    call `recover_stale_execution` again."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as setup_db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(setup_db, allowed_root)
+        )
+        execution = DedupExecutionService(setup_db).start_execution(authorization.id)
+        execution_id = execution.id
+        # Captured as plain values before this `with` block closes
+        # setup_db - accessing ORM attributes on a detached instance
+        # afterward raises DetachedInstanceError.
+        review_id = review.id
+        canonical_doc_id = canonical_doc.id
+        dup_doc_ids = [d.id for d in dup_docs]
+        plan_id = plan.id
+        authorization_id = authorization.id
+
+    db_execute = Session(engine)
+    db_recover = Session(engine)
+
+    executor = DedupFilesystemExecutor(db_execute, allowed_root, quarantine_root)
+    recovery_service = DedupExecutionService(db_recover)
+
+    barrier = threading.Barrier(2)
+    real_record_action_result = DedupExecutionService.record_action_result
+
+    def synced_record_action_result(self, *args, **kwargs):
+        # timeout=1: the barrier is only meant to synchronize each
+        # thread's FIRST record_action_result call for the one plan
+        # action in this test. A second, incidental call from either
+        # side's own fallback error-handling (e.g. execute()'s
+        # last-resort UNKNOWN-recording attempt) arrives alone, after
+        # the other party has already finished entirely - a short
+        # timeout keeps that harmless case fast instead of stalling the
+        # whole test for no benefit.
+        try:
+            barrier.wait(timeout=1)
+        except threading.BrokenBarrierError:
+            pass
+        return real_record_action_result(self, *args, **kwargs)
+
+    results = {}
+    errors = {}
+
+    def run_execute():
+        try:
+            results["execute"] = executor.execute(execution_id, confirm=True)
+        except Exception as exc:  # noqa: BLE001 - capturing for assertion below
+            errors["execute"] = exc
+
+    def run_recover():
+        try:
+            results["recover"] = recovery_service.recover_stale_execution(execution_id)
+        except Exception as exc:  # noqa: BLE001 - capturing for assertion below
+            errors["recover"] = exc
+
+    thread_execute = threading.Thread(target=run_execute)
+    thread_recover = threading.Thread(target=run_recover)
+
+    try:
+        with patch.object(
+            DedupExecutionService, "record_action_result", synced_record_action_result
+        ):
+            thread_execute.start()
+            thread_recover.start()
+            thread_execute.join(timeout=15)
+            thread_recover.join(timeout=15)
+
+        assert not thread_execute.is_alive() and not thread_recover.is_alive(), (
+            "a thread did not finish - possible deadlock"
+        )
+
+        # Never a raw IntegrityError, and never any uncaught exception
+        # at all - both callers must gracefully tolerate losing the
+        # race, not merely fail "cleanly."
+        assert not errors, f"expected zero exceptions from either caller, got {errors}"
+        assert len(results) == 2, f"expected both callers to return, got {results}"
+
+        with Session(engine) as verify_db:
+            final_execution = verify_db.get(DedupExecution, execution_id)
+            assert final_execution.status != DedupExecutionStatus.RUNNING, (
+                "execution left stuck RUNNING after the execute-vs-recover race"
+            )
+            audits = DedupExecutionService(verify_db).get_action_audits(execution_id)
+            assert len(audits) == 1, (
+                f"expected exactly one audit for the one plan action, got "
+                f"{len(audits)}"
+            )
+            # Both callers must agree on the SAME final execution state -
+            # not two different objects with two different answers.
+            assert results["execute"].status == final_execution.status
+            assert results["recover"].status == final_execution.status
+    finally:
+        db_execute.close()
+        db_recover.close()
+        with Session(engine) as cleanup_db:
+            _cleanup(
+                cleanup_db,
+                review_id,
+                [canonical_doc_id, *dup_doc_ids],
+                plan_ids=[plan_id],
+                authorization_ids=[authorization_id],
+                execution_ids=[execution_id],
+            )
+
+
+def test_record_action_result_duplicate_error_is_a_value_error(tmp_path) -> None:
+    """Backward-compatibility guarantee for the new
+    `DuplicateActionResultError`: every existing `except ValueError`/
+    `pytest.raises(ValueError, ...)` call site continues to work
+    unchanged, since it is still a `ValueError` - only distinguishable
+    by type for code that specifically needs to react to "someone else
+    already recorded this," like `recover_stale_execution`."""
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+
+    engine = _engine()
+
+    with Session(engine) as db:
+        review, canonical_doc, dup_docs, canonical_file, dup_files, plan, authorization = (
+            _setup_authorized_plan(db, allowed_root)
+        )
+        execution_service = DedupExecutionService(db)
+        execution_ids: list[int] = []
+
+        try:
+            execution = execution_service.start_execution(authorization.id)
+            execution_ids.append(execution.id)
+            plan_action = _plan_actions_ordered(db, plan.id)[0]
+
+            execution_service.record_action_result(
+                execution.id,
+                plan_action.id,
+                DedupExecutionActionResult.NOT_ATTEMPTED,
+            )
+
+            with pytest.raises(ValueError, match="already has a recorded result"):
+                execution_service.record_action_result(
+                    execution.id,
+                    plan_action.id,
+                    DedupExecutionActionResult.NOT_ATTEMPTED,
+                )
+
+            with pytest.raises(DuplicateActionResultError):
+                execution_service.record_action_result(
+                    execution.id,
+                    plan_action.id,
+                    DedupExecutionActionResult.NOT_ATTEMPTED,
+                )
+        finally:
+            _cleanup(
+                db,
+                review.id,
+                [canonical_doc.id, *[d.id for d in dup_docs]],
+                plan_ids=[plan.id],
+                authorization_ids=[authorization.id],
                 execution_ids=execution_ids,
             )

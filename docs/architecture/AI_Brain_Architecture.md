@@ -2566,6 +2566,94 @@ for reconciliation itself (documented residual, see point 2); any
 frontend. **The real corpus was not read, mutated, or referenced by any
 code or test added in this milestone.**
 
+### execute() vs recover_stale_execution() race - closed, not merely deferred
+
+Immediately after the reconciliation/TOCTOU milestone above, review of
+its own documented residual ("`recover_stale_execution` does not itself
+take a `SELECT ... FOR UPDATE` claim... unlike a still-alive original
+executor") surfaced a sharper question: `_claim_execution` checks/sets
+`claimed_at`; `_claim_for_recovery` checks/sets the entirely
+independent `recovery_claimed_at`. Each is individually protected by
+its own row lock, but **nothing checks the other column** - so a
+genuinely still-running `execute()` call and a `recover_stale_
+execution()` call can both be legitimately granted their claim for the
+SAME still-`RUNNING` execution, and both can then reach `record_
+action_result` for the SAME unresolved plan action.
+
+**Proven, not just reasoned about**: a synchronized two-thread probe
+(both callers' `record_action_result` calls gated behind a shared
+`threading.Barrier` so their underlying INSERTs genuinely race at the
+database level, not merely close in wall-clock time) reproduced a raw
+`psycopg2.errors.UniqueViolation` `IntegrityError` propagating
+**uncaught** out of `recover_stale_execution` in roughly 2 of 5 runs
+before this fix - confirming the gap was real, exactly the "raw
+IntegrityError as the normal concurrency outcome" failure mode the
+entire hardening effort exists to eliminate.
+
+**Why this can't be closed by a stronger claim predicate**: making
+`_claim_for_recovery` require `claimed_at IS NOT NULL` does not help -
+that is true in essentially every realistic call to `recover_stale_
+execution` (the whole point is recovering an execution that already
+started), so it would not prevent the dangerous case, only the
+harmless one. Genuinely preventing the overlap would require knowing
+whether the original `execute()` caller is still alive - process
+supervision or a lease/heartbeat mechanism this codebase deliberately
+does not have, and introducing one would be a real architecture
+expansion, not a "smallest correction."
+
+**The fix actually applied**: make the CONSEQUENCE of the overlap
+always safe, rather than trying to make the overlap itself impossible.
+Two new exception types in `execution_service.py`, both still
+`ValueError` subclasses (every existing `except ValueError`/
+`pytest.raises(ValueError, ...)` call site keeps working unchanged):
+
+- `DuplicateActionResultError` - `record_action_result` now catches the
+  database's own `IntegrityError` around its commit and converts it
+  into this SAME exception its pre-insert check already raises for the
+  "checked and found existing" case, so every caller sees one
+  consistent, well-typed failure regardless of which layer caught the
+  collision.
+- `AlreadyFinalizedError` - `complete_execution`'s existing "not
+  RUNNING" precondition now raises this specific subclass.
+
+`recover_stale_execution`'s per-action loop now tolerates `Duplicate
+ActionResultError` on any single action (a concurrent caller already
+recorded that one first - not this call's problem to solve, so it
+moves on to the next unresolved action rather than aborting the whole
+attempt), and its final `complete_execution` call tolerates `Already
+FinalizedError` (a concurrent `execute()` already finalized this
+execution first - a success from recovery's own perspective too, since
+the execution DID reach a terminal state; it returns that
+already-finalized execution rather than raising). `DedupFilesystem
+Executor.execute`'s own final `complete_execution` call is made
+symmetric for the same reason. Neither caller can be left permanently
+stuck `RUNNING` with its claim column set and no legal way to retry.
+
+**Verified**: the exact synchronized-barrier probe that reproduced the
+raw `IntegrityError` before the fix now completes cleanly on every
+run - zero exceptions from either caller, exactly one audit row for
+the one plan action, and both callers' returned `DedupExecution`
+objects agreeing on the same final status - across 10 consecutive
+isolated runs plus every run of the full suite. This is now a
+permanent regression test
+(`test_execute_vs_recover_stale_execution_race_never_corrupts_state`).
+
+**Corpus hygiene guard updated**: the source-scan tests now also check
+for the two real, confirmed T7 paths (the canonical path the user
+named as protected, and the drive that happens to be actually mounted
+with real personal data - one substring check covers both, since the
+mounted variant's name is the canonical one plus a trailing "1"),
+alongside the earlier `/mnt/t7ssd`-based reference this project's
+memory once incorrectly protected. Neither T7 path was scanned,
+listed, or accessed to verify this - the checks are pure string
+containment against this project's own source files.
+
+**Deliberately not built this pass**: any process-supervision or
+lease/heartbeat mechanism (the only way to prevent the underlying claim
+overlap itself, as opposed to making its consequences safe - explicitly
+out of scope, not silently deferred); any API/UI exposure; any
+real-corpus execution.
+
 ## Provenance chain
 The schema already links every derived fact back toward a source file
 via foreign keys - `Document.import_job_id`, `DocumentChunk.document_id`,

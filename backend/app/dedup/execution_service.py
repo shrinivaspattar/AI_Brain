@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.dedup.authorization_service import DedupPlanAuthorizationService
@@ -15,6 +16,30 @@ from app.models.dedup_execution import (
 from app.models.dedup_execution_plan import DedupExecutionPlanAction
 
 DEFAULT_LIST_LIMIT = 100
+
+
+class DuplicateActionResultError(ValueError):
+    """Raised by `record_action_result` when another caller already
+    recorded an outcome for this exact `(execution_id, plan_action_id)`
+    pair - whether caught by the method's own pre-insert check, or only
+    by the database's unique constraint at commit time. Still a
+    `ValueError` (every existing `except ValueError`/`pytest.raises(
+    ValueError, ...)` call site keeps working unchanged), but
+    distinguishable by type where a caller needs to react specifically
+    to "someone else already resolved this" - see
+    `recover_stale_execution`, which treats this as a benign skip
+    rather than an abort when it loses a race against a genuinely
+    still-running `execute()` call."""
+
+
+class AlreadyFinalizedError(ValueError):
+    """Raised by `complete_execution` when the execution is no longer
+    RUNNING - still a `ValueError` for backward compatibility, but
+    distinguishable by type where a caller needs to react specifically
+    to "someone else already finished this" rather than treating it as
+    a generic precondition failure. See `recover_stale_execution` and
+    `DedupFilesystemExecutor.execute`, both of which can lose a race to
+    finalize the same execution to a concurrent caller."""
 
 # Results that, by definition, can never involve a filesystem mutation:
 # a precondition check runs strictly before any mutation is attempted,
@@ -227,7 +252,7 @@ class DedupExecutionService:
             .where(DedupExecutionActionAudit.plan_action_id == plan_action_id)
         )
         if existing is not None:
-            raise ValueError(
+            raise DuplicateActionResultError(
                 f"Execution {execution_id} already has a recorded result for "
                 f"plan action {plan_action_id} (audit {existing.id}) - an "
                 "action's outcome is recorded exactly once per execution"
@@ -290,6 +315,27 @@ class DedupExecutionService:
             self.db.commit()
             self.db.refresh(audit)
             return audit
+        except IntegrityError:
+            # The pre-insert check above (`existing is not None`) is not
+            # itself locked - under real concurrency (a genuinely
+            # still-running execute() racing a recover_stale_execution()
+            # call, since their claims are on independent columns and
+            # neither blocks the other - see _claim_execution/
+            # _claim_for_recovery) both callers' pre-checks can pass
+            # before either commits, and the database's own unique
+            # constraint on (execution_id, plan_action_id) is what
+            # actually catches the collision. Converted to the SAME
+            # DuplicateActionResultError the pre-check raises, so every
+            # caller sees one consistent, well-typed exception regardless
+            # of which layer caught the duplicate - never a raw
+            # IntegrityError as the normal concurrency outcome.
+            self.db.rollback()
+            raise DuplicateActionResultError(
+                f"Execution {execution_id} already has a recorded result for "
+                f"plan action {plan_action_id} - a concurrent caller committed "
+                "one first. An action's outcome is recorded exactly once per "
+                "execution."
+            ) from None
         except Exception:
             self.db.rollback()
             raise
@@ -333,7 +379,7 @@ class DedupExecutionService:
         execution = self._get_execution_or_raise(execution_id)
 
         if execution.status != DedupExecutionStatus.RUNNING:
-            raise ValueError(
+            raise AlreadyFinalizedError(
                 f"Execution {execution_id} is not RUNNING "
                 f"(status={execution.status.value}) - it has already been "
                 "finalized and cannot be finalized again"
@@ -555,6 +601,30 @@ class DedupExecutionService:
         planned action (nothing to recover - call `complete_execution`
         directly instead), or is already being recovered by another
         concurrent call (see `_claim_for_recovery`).
+
+        **Execute-vs-recover race, made safe rather than merely
+        prevented**: `_claim_for_recovery`'s row lock only guarantees
+        exclusivity among concurrent `recover_stale_execution` calls -
+        it checks `recovery_claimed_at`, entirely independent of
+        `claimed_at`, so it grants a valid claim even while a genuinely
+        still-running `execute()` call (which claimed via a DIFFERENT
+        column) is actively working through the same execution. Nothing
+        in either claim predicate makes the two mutually exclusive, and
+        closing that gap for real would require process supervision or
+        a lease/heartbeat mechanism this codebase deliberately does not
+        have. Given that, this method is instead made SAFE under that
+        overlap rather than pretending it cannot occur: each per-action
+        write below tolerates `DuplicateActionResultError` (another
+        caller already recorded this exact action - not this method's
+        problem to solve, so it moves on to the next unresolved action
+        rather than aborting the whole recovery attempt), and the final
+        `complete_execution` call tolerates `AlreadyFinalizedError` (a
+        concurrent `execute()` already finalized this execution first -
+        that is a success from recovery's own perspective too, since
+        the execution DID reach a terminal state). Neither case can
+        ever surface as a raw `IntegrityError`, and neither can leave
+        this execution permanently stuck `RUNNING` with `recovery_
+        claimed_at` set and no legal way to call this method again.
         """
         execution = self._claim_for_recovery(execution_id)
 
@@ -589,32 +659,54 @@ class DedupExecutionService:
                 and observation.file_size == plan_action.observed_file_size
             )
 
-            if file_confirmed_unchanged:
-                self.record_action_result(
-                    execution_id,
-                    plan_action.id,
-                    DedupExecutionActionResult.NOT_ATTEMPTED,
-                )
-            else:
-                self.record_action_result(
-                    execution_id,
-                    plan_action.id,
-                    DedupExecutionActionResult.UNKNOWN,
-                    observed_content_hash=observation.content_hash,
-                    observed_file_size=observation.file_size,
-                    filesystem_mutation_occurred=None,
-                    error_message=(
-                        "Recovery found the source file missing - consistent "
-                        "with a successful delete, but not provably caused "
-                        "by this action; manual verification required."
-                        if not observation.exists
-                        else "Recovery found the source file present but not "
-                        "matching the plan's expected pre-mutation state "
-                        "exactly; manual verification required."
-                    ),
-                )
+            try:
+                if file_confirmed_unchanged:
+                    self.record_action_result(
+                        execution_id,
+                        plan_action.id,
+                        DedupExecutionActionResult.NOT_ATTEMPTED,
+                    )
+                else:
+                    self.record_action_result(
+                        execution_id,
+                        plan_action.id,
+                        DedupExecutionActionResult.UNKNOWN,
+                        observed_content_hash=observation.content_hash,
+                        observed_file_size=observation.file_size,
+                        filesystem_mutation_occurred=None,
+                        error_message=(
+                            "Recovery found the source file missing - consistent "
+                            "with a successful delete, but not provably caused "
+                            "by this action; manual verification required."
+                            if not observation.exists
+                            else "Recovery found the source file present but not "
+                            "matching the plan's expected pre-mutation state "
+                            "exactly; manual verification required."
+                        ),
+                    )
+            except DuplicateActionResultError:
+                # A concurrent caller (see the execute-vs-recover race
+                # documented above) already recorded this exact action's
+                # outcome first. That outcome is now a permanent fact,
+                # exactly as intended - recovery has nothing useful to
+                # add for THIS action, so it moves on to the next
+                # unresolved one rather than aborting the whole attempt.
+                continue
 
-        return self.complete_execution(execution_id)
+        try:
+            return self.complete_execution(execution_id)
+        except AlreadyFinalizedError:
+            # Symmetric to the per-action handling above: a concurrent
+            # execute() already finalized this execution before recovery
+            # reached this point. The execution DID reach a terminal
+            # state - just via the other caller - so return it rather
+            # than raising.
+            already_finalized = self.get_execution(execution_id)
+            if already_finalized is not None and (
+                already_finalized.status != DedupExecutionStatus.RUNNING
+            ):
+                return already_finalized
+            raise
 
     def get_execution(self, execution_id: int) -> DedupExecution | None:
         return self.db.get(DedupExecution, execution_id)

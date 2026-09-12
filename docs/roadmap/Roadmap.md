@@ -875,6 +875,54 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       authorization, no permanent deletion — the real corpus was not
       read, mutated, or referenced by any code or test in this
       milestone.**
+- [x] execute() vs recover_stale_execution() race — closed, not
+      deferred. Follow-up review of the milestone above's own
+      documented residual asked the sharper question directly:
+      `_claim_execution` and `_claim_for_recovery` check/set
+      independent columns (`claimed_at` vs `recovery_claimed_at`), so
+      nothing prevents BOTH from being granted for the same
+      still-RUNNING execution — a genuinely still-running `execute()`
+      and a `recover_stale_execution()` call can both reach
+      `record_action_result` for the same unresolved action. **Proven
+      real, not theoretical**: a synchronized two-thread probe (a
+      shared `threading.Barrier` gating both callers' `record_action_
+      result` INSERTs so they genuinely race at the database level)
+      reproduced a raw `psycopg2.errors.UniqueViolation` propagating
+      uncaught out of `recover_stale_execution` in ~2 of 5 runs before
+      the fix. **Why a stronger claim predicate can't close this**:
+      requiring `claimed_at IS NOT NULL` for recovery would block the
+      normal, intended use of recovery (recovering an execution that
+      already started), not the dangerous case; truly preventing the
+      overlap needs process supervision or a lease/heartbeat this
+      codebase deliberately doesn't have — out of scope as a "smallest
+      correction." **Fix actually applied**: make the consequence
+      always safe instead. Two new `ValueError` subclasses (backward
+      compatible with every existing `except ValueError` call site) —
+      `DuplicateActionResultError` (record_action_result now catches
+      the database's own `IntegrityError` and converts it to this,
+      matching what its pre-insert check already raises) and
+      `AlreadyFinalizedError` (complete_execution's existing "not
+      RUNNING" case). `recover_stale_execution`'s per-action loop now
+      tolerates a duplicate on any one action and moves to the next
+      rather than aborting the whole attempt; its final
+      `complete_execution` call tolerates losing the finalize race and
+      returns the already-finalized execution instead of raising.
+      `DedupFilesystemExecutor.execute`'s own final call made
+      symmetric. **Verified**: the same probe that reproduced the raw
+      IntegrityError now completes cleanly every time — zero
+      exceptions from either caller, exactly one audit row, both
+      callers agreeing on the final status — across 10 isolated runs
+      plus every full-suite run. Permanent regression test:
+      `test_execute_vs_recover_stale_execution_race_never_corrupts_
+      state`. **Also added**: the corpus hygiene guard now checks for
+      both real, confirmed T7 paths (the canonical protected path and
+      the drive actually mounted with real data) alongside the earlier
+      reference this project's memory once incorrectly protected —
+      neither path was scanned or accessed to make this change, it's
+      pure string containment against this project's own source.
+      Deliberately not built: any process-supervision/lease mechanism
+      (the only way to prevent the claim overlap itself, not just its
+      consequences); any API/UI exposure; any real-corpus execution.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

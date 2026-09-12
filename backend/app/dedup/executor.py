@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.dedup.authorization_service import DedupPlanAuthorizationService
 from app.dedup.execution_plan_service import DedupExecutionPlanService, _observe_file
-from app.dedup.execution_service import DedupExecutionService
+from app.dedup.execution_service import AlreadyFinalizedError, DedupExecutionService
 from app.models.dedup_authorization import DedupPlanAuthorizationStatus
 from app.models.dedup_execution import (
     DedupExecution,
@@ -341,7 +341,23 @@ class DedupFilesystemExecutor:
             if not outcome.should_continue:
                 stop = True
 
-        return self.execution_service.complete_execution(execution_id)
+        # Execute-vs-recover race, made safe (see `recover_stale_
+        # execution`'s own docstring for the full account): _claim_
+        # execution and _claim_for_recovery check independent columns,
+        # so a genuinely concurrent recover_stale_execution() call can
+        # legitimately finalize this same execution before this loop
+        # reaches its own completion call. That is a success from this
+        # call's perspective too - the execution DID reach a terminal
+        # state - so return it rather than raising.
+        try:
+            return self.execution_service.complete_execution(execution_id)
+        except AlreadyFinalizedError:
+            already_finalized = self.execution_service.get_execution(execution_id)
+            if already_finalized is not None and (
+                already_finalized.status != DedupExecutionStatus.RUNNING
+            ):
+                return already_finalized
+            raise
 
     def _claim_execution(self, execution_id: int) -> DedupExecution:
         """Acquire exclusive ownership of this execution before any
