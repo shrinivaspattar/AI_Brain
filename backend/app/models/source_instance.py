@@ -10,6 +10,43 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.session import Base
 
 
+class SourceCategory(str, Enum):
+    """Strictly physical - what IS the observed path, never a workload
+    or processing-capability judgment. A `.rar`/`.gz` file remains
+    ARCHIVE even though `ArchiveExtractor` cannot open it today - that
+    is a separate processing-capability fact (see
+    `app.classification.policy_evaluator.is_extractable_archive_suffix`),
+    not a reason to relabel its physical shape. Backup/sync/snapshot
+    naming is a separate, explicitly deferred contextual signal (frozen
+    architecture, Round 4), never a peer of this enum. `SPECIAL` is
+    reserved for a genuinely non-standard physical shape not yet
+    concretely encountered by this classifier - not currently returned
+    by any suffix mapping."""
+
+    LOOSE_FILE = "loose_file"
+    ARCHIVE = "archive"
+    SPECIAL = "special"
+
+
+class WorkloadCategory(str, Enum):
+    TEXT_DOCUMENT = "text_document"
+    STRUCTURED_DATA = "structured_data"
+    MEDIA = "media"
+    CODE = "code"
+    SOFTWARE = "software"
+    ENCRYPTED = "encrypted"
+    # An archive's own row - never itself content (frozen invariant).
+    CONTAINER = "container"
+    UNKNOWN = "unknown"
+
+
+class RiskTierEstimated(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    EXTREME = "extreme"
+
+
 class CanonicalStatus(str, Enum):
     # The default and starting state for every SourceInstance in every
     # group, including one where every instance agrees byte-for-byte
@@ -110,6 +147,25 @@ class SourceInstance(Base):
     from legitimately re-observing the same `root_t7_path` (a different
     `classification_run_id` value is a different row in this
     constraint's key, by design).
+
+    CLASSIFICATION FIELDS (added per "Scaled Real-T7 Ingestion -
+    Implementation Milestone 2", correcting an earlier draft that
+    stored these only inside `evidence_snapshot`): `source_category`,
+    `workload_category`, and `risk_tier_estimated` are DEDICATED,
+    QUERYABLE, structured SourceInstance state - the frozen
+    architecture's actual model, not a JSONB-only representation.
+    NULLABLE because the many existing SourceInstance-creation call
+    sites unrelated to batch selection (identity resolution, archive-
+    member discovery) do not compute them. IMMUTABLE once set, same
+    contract as `evidence_snapshot` - set exactly once, at creation,
+    by `BatchCreationService`, never updated afterward.
+    `evidence_snapshot` remains reserved for immutable, historical
+    SUPPORTING evidence (e.g. D0's declared size, a D1 duplicate-group
+    id) - never a second, shadow copy of the classification decision
+    itself, which would create two sources of truth for the same fact.
+    `risk_tier_actual` (the post-extraction counterpart) is deliberately
+    NOT added yet - nothing in this codebase computes it until a future
+    archive-extraction milestone exists to produce real evidence for it.
     """
 
     __tablename__ = "source_instances"
@@ -170,6 +226,19 @@ class SourceInstance(Base):
     # creation - a correction is a new ClassificationRun, not an edit
     # here (matches DuplicateReview.evidence / Message.citations).
     evidence_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    # Dedicated, queryable classification state - see class docstring.
+    # NULLABLE (many existing call sites don't compute these), set
+    # exactly once at creation, never updated afterward.
+    source_category: Mapped[SourceCategory | None] = mapped_column(
+        SQLEnum(SourceCategory, name="source_category"), nullable=True
+    )
+    workload_category: Mapped[WorkloadCategory | None] = mapped_column(
+        SQLEnum(WorkloadCategory, name="workload_category"), nullable=True
+    )
+    risk_tier_estimated: Mapped[RiskTierEstimated | None] = mapped_column(
+        SQLEnum(RiskTierEstimated, name="risk_tier_estimated"), nullable=True
+    )
 
     canonical_status: Mapped[CanonicalStatus] = mapped_column(
         SQLEnum(CanonicalStatus, name="canonical_status"),
