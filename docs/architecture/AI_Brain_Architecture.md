@@ -3563,6 +3563,519 @@ verification (already confirmed clean by D2's own final checks and not
 repeated here). This follow-up is documentation and a synthetic
 regression test only.
 
+## T7 → AI_Brain Ingestion & Representation Design (design pass, APPROVED and frozen — no implementation yet)
+
+A fourth T7 gate, opened after D2 (`62e943f`) and its safety follow-up
+(`48fb4a7`) were both formally closed. Scope, stated explicitly by the
+user at authorization: **design only**. No T7 access of any kind
+(read-only included), no schema migration, no code change, no
+ingestion. This section proposes answers to nine user-posed questions,
+mapped onto the codebase as it exists today rather than a parallel
+design disconnected from it, and went through three review rounds
+(conflation corrections, then two targeted clarifications) before
+being approved. **Status: the direction is frozen** — the next gate
+is a schema/model design milestone (not yet authorized), settling the
+exact representation of `SourceInstance → ProvenanceLink →
+ContentIdentityGroup → Document → DocumentChunk` while still leaving
+logical-document/version semantics (identity layers 3/4, below)
+deferred.
+
+### Grounding: what already exists
+
+Ingestion machinery already exists, built for the personal-corpus
+import path (not yet run against the T7):
+
+- `SourceScanner.scan()` (`app/ingestion/scanner.py`) — recursive,
+  non-recursive-into-archives discovery, returns `DiscoveredFile(path,
+  relative_path, size)`.
+- `ArchiveExtractor.extract()` (`app/ingestion/archive.py`) — handles
+  `.zip`/`.7z` only, one level deep (does not recurse into an archive
+  extracted from another archive), with real safety limits already in
+  place: path-traversal rejection, disk-space reserve, expansion-ratio
+  zip-bomb guard, and (7z only) outright symlink-member rejection.
+- `DocumentIngestor.ingest()` (`app/ingestion/document_ingestor.py`) —
+  orchestrates scan → extract → persist; skips archive container files
+  themselves, hashes every other file's content (`_hash_file`, SHA-256)
+  and creates one `Document` row per file. **Gap worth naming now**: a
+  single file that fails to extract or hash aborts the whole batch —
+  there is no per-file catch-and-continue.
+- `Document` (`app/models/document.py`) — flat: `id`, `title`, `source`
+  (the on-disk path *after* extraction, not the original archive-
+  relative location), `source_type`, `content_hash` (nullable,
+  deliberately non-unique — duplicates are exactly what it's for),
+  `import_job_id`. No archive-membership field, no version/grouping
+  concept.
+- `DocumentChunk` (`app/models/document_chunk.py`) — `document_id`,
+  `chunk_index`, `content`, `embedding` (pgvector). Chunking itself is
+  `chunk_text()` (`app/embeddings/chunker.py`), a plain character
+  sliding window (1000/200 overlap).
+- `ImportJob` (`app/models/import_job.py`) — `status`, `progress`,
+  `files_discovered`, `files_processed`, `error_message`. Counters
+  only: nothing records *which* files were processed, so there is no
+  safe resume point below "the whole job" today.
+- `ProvenanceService.trace_document()` (`app/provenance/service.py`) —
+  already walks `ImportJob → Document → DocumentChunk → Message`
+  (citations are a denormalized JSONB snapshot on `Message`, matched by
+  scanning, not a foreign key) — read-only, adds no new source of
+  truth. This is the hop this design extends one step further back.
+- `FileAccessService` (`app/files/service.py`) — the only file-write-
+  capable-adjacent surface in the whole codebase is deliberately a
+  read; it will only read a path that falls under the `source_path` of
+  a **COMPLETED** `ImportJob` — the master backup (and, by the same
+  reasoning, the T7) stays out of reach of every AI-facing tool unless
+  it was explicitly imported first. This is an existing enforcement
+  point this design relies on, not a new one.
+- [0001-file-first](../decisions/0001-file-first.md) — files on disk
+  are the source of truth; Postgres is a derived, rebuildable index.
+- [0002-master-backup-is-read-only](../decisions/0002-master-backup-is-read-only.md)
+  — ingestion only ever *reads* from the master backup; `INGESTION_DIR`
+  (where archives are expanded) is always a separate location. **The T7
+  is architecturally just another instance of "master backup" under
+  this existing decision** — no new read-only rule is being invented
+  here, this design treats 0002 as already covering it.
+
+### Revision note (review round 1)
+
+The first draft of this section conflated several distinct concepts —
+treating a D1 directory-structural match as equivalent evidence to a
+D1 exact-content match, inferring canonical authority from the mere
+absence of a review flag, and describing `archive_chain` and
+`Document.content_hash` more casually than their actual semantics
+support. A review pass caught this before commit (nothing below was
+ever implemented or committed — this remains a design-only document)
+and the design was restructured around four explicit **identity
+layers**, from which the answers to the nine questions are re-derived.
+This is the same discipline as D2's own pre-commit review: the
+correction is written into the design itself, not patched around it.
+
+### Identity layers — what this design distinguishes, and what it defers
+
+Four different questions get asked about the same piece of matter, and
+this design keeps them separate rather than letting one silently stand
+in for another:
+
+1. **Physical source occurrence** — "a specific file or archive member
+   was observed at a specific path at a specific point in time."
+   Represented by `SourceInstance` (below). **Modeled in this pass.**
+2. **Content identity** — "these bytes are identical to those bytes,"
+   an equivalence class established purely by a matching hash, no
+   interpretation involved. **Modeled in this pass**, but only where a
+   hash actually proves it (see Hash semantics) — never inferred from
+   directory-level structural similarity.
+3. **Logical document identity** — "this represents the same
+   intellectual document," which can span multiple *different*
+   content-identity classes (a re-saved PDF, an edited draft). This is
+   exactly what D2's provenance analysis gathered evidence toward and
+   explicitly declined to assert (`inference_code`, not a fact). **Not
+   modeled in this pass** — D2's evidence is available as future input,
+   but no schema or algorithm for this layer is proposed now.
+4. **Document / version** — "which version of a logical document is
+   this, and where does it sit in time relative to the others,"
+   requiring the layer above to exist first plus temporal ordering.
+   **Not modeled in this pass**, for the same reason as layer 3.
+
+Everything below builds only on layers 1 and 2. Nothing in this design
+requires layers 3 or 4 to exist, and nothing here should be read as a
+disguised attempt to build them under a different name.
+
+### Hash semantics — which hash, at which stage
+
+Four distinct hashes exist or could exist in this pipeline; the first
+draft blurred them into one. None of this is implemented yet — it is
+the vocabulary the eventual implementation must keep straight:
+
+| Name | What it hashes | Where it's computed today |
+|---|---|---|
+| **source file hash** | Raw bytes of a file exactly as it sits in the T7 (or any pre-extraction source). For an archive *itself* (e.g. a `.zip`), this hashes the archive's own bytes — not anything inside it. | D1 (`duplicate_analysis.py`, `_hash_file`), for size-collision candidates only. Never touches archive interiors — D1 never opens an archive. |
+| **archive member hash** | Raw bytes of one member's *decompressed* content, after extraction. Distinct from the source file hash of the archive that contained it. | Not computed anywhere today. Would be computed post-extraction, during ingestion. |
+| **extracted document content hash** | Raw bytes of the on-disk working copy at ingestion time. For a loose file this happens to equal its source file hash. For an archive member, this is the archive member hash — never the enclosing archive's own hash. | `DocumentIngestor._hash_file`, stored as `Document.content_hash` today. |
+| **normalized-content hash** | A hash of *extracted text* (post `extract_text()`), which could match content across different container formats or after normalization. | Does not exist anywhere. Explicitly a future idea, not proposed for implementation now. |
+
+The corrected statement of Q7 (duplicate work) follows directly from
+this table: **`Document.content_hash` cannot serve as a pre-extraction
+dedup check for anything that lives inside an archive**, because no
+hash exists for an archive member until after it has been extracted —
+D1 only ever hashed things `os.walk` could reach directly. A
+loose file's already-known D1 source file hash *can* gate extraction
+before it happens; an archive member cannot. The design does not
+paper over this with one unified "content_hash, checked early"
+gate — it names the two cases separately (see Q7, revised, below).
+
+### Archive provenance — a structural chain, not an opaque string list
+
+The first draft's `archive_chain: list[str]` was flagged as too
+opaque to support ancestry queries later ("which documents came from
+this specific archive," "how deeply nested is this member"). Revised
+to a linked structure instead of a flat list:
+
+```
+ProvenanceLink
+  kind: "t7_file" | "archive_member"
+  path: path at this level (T7 path for a t7_file link; member path
+        within its immediate parent for an archive_member link)
+  parent: the ProvenanceLink this one was found inside (null for the
+          root t7_file link)
+```
+
+A loose T7 file is a single `t7_file` link with no parent. A file two
+archives deep is a three-link chain: `t7_file` (the outer archive as
+found on the T7) → `archive_member` (the inner archive, as a member of
+the outer one) → `archive_member` (the actual file, as a member of the
+inner one). This is a schema *shape*, not a migration — the exact
+table design (a self-referential table vs. a materialized path column
+vs. something else) is left to the implementation gate, but the shape
+is chosen now specifically so "all documents that passed through
+archive X" or "nesting depth of this instance" are answerable by
+walking or querying `parent`, not by parsing a string.
+
+### `SourceInstance` — physical occurrence only
+
+Corrected scope, per review: `SourceInstance` represents **one
+physical observed occurrence** and nothing more. It carries:
+- the T7 original path (or, for an archive member, resolved via its
+  `ProvenanceLink` chain rather than a flat path string) — recorded as
+  inert metadata, never dereferenced again as a live filesystem path
+  after classification runs;
+- its `ProvenanceLink` chain (above);
+- whatever D0/D1/D2 evidence already exists about it (size, source
+  file hash if D1 computed one, D2 `inference_code`/`confidence` if it
+  was part of a D2 group);
+- a reference to a content-identity value (a hash — see table above)
+  it shares with zero or more *other* `SourceInstance`s.
+
+It does **not** carry canonical status, does **not** imply a `Document`
+exists yet, and does **not** imply anything about logical-document or
+version identity (layers 3/4, explicitly deferred). Multiple
+`SourceInstance`s referencing the same content-identity hash are
+simply that — physically-separate occurrences of identical bytes —
+until something else (see Canonical status, below) decides what, if
+anything, gets ingested from that group.
+
+### Canonical status — a relationship, not a property of a file
+
+Round 2 correction: round 1 left two things unstated that a reviewer
+correctly flagged as ambiguity waiting to happen. First, *which object
+owns `canonical_status`*. Second, what `NON_CANONICAL` actually means.
+Both are settled now.
+
+**Where it lives.** Introduce `ContentIdentityGroup` as a first-class
+object: the set of all `SourceInstance`s that share one proven content-
+identity hash (layer 2). `canonical_status` is not an intrinsic
+property of a `SourceInstance` or of a file — it is a property of the
+**relationship between a `SourceInstance` and the specific
+`ContentIdentityGroup` it belongs to**:
+
+```
+ContentIdentityGroup
+    ├── SourceInstance A → UNRESOLVED
+    ├── SourceInstance B → CANONICAL
+    └── SourceInstance C → NON_CANONICAL
+```
+
+Because every `SourceInstance` belongs to exactly one
+`ContentIdentityGroup` (its content-identity hash is single-valued),
+this can still be implemented as one field on `SourceInstance` without
+a separate join table — but it must always be *documented and reasoned
+about* as scoped to that instance's group, never as "is this file
+canonical," full stop. "Canonical for which content-identity group" is
+the only question that has a real answer; "canonical everywhere" is
+not a question this design lets get asked.
+
+**The three states, corrected:**
+- `UNRESOLVED` — the default and starting state for every
+  `SourceInstance` in every group, including a group where every
+  instance agrees byte-for-byte and D2 raised no concerns at all.
+  Unresolved is a **valid, expected, and common end state**, not an
+  error or a TODO.
+- `CANONICAL` — this specific `SourceInstance` has been explicitly
+  marked as the authoritative physical occurrence within its group, by
+  a human decision or a future, separately-justified, narrowly-scoped
+  automated policy. No such policy is defined here.
+- `NON_CANONICAL` — corrected: this is **not** "whichever instances
+  weren't picked" and does **not** follow automatically from another
+  instance in the same group being marked `CANONICAL`. It requires its
+  own explicit evidence or decision (e.g. "this copy is truncated,"
+  "this copy is a known-stale backup fragment," a human said so) —
+  exactly the same evidentiary bar as `CANONICAL` itself, just pointed
+  the other way. Marking B `CANONICAL` leaves every other instance in
+  the group at `UNRESOLVED` unless something *separately* justifies
+  moving one of them to `NON_CANONICAL`. A group can therefore
+  legitimately sit at "one `CANONICAL`, N `UNRESOLVED`" forever, with
+  zero `NON_CANONICAL` instances — that is a normal, not a partial,
+  state.
+
+Critically, **ingestion (extraction/chunking/embedding) does not wait
+for `CANONICAL` status and does not operate on `SourceInstance`s or
+`canonical_status` at all — it operates on `ContentIdentityGroup`s**
+(see Ingestion idempotency key, below). Canonical status governs which
+`SourceInstance`'s path is *displayed* as the reference location for a
+piece of already-ingested knowledge — it never governs *whether* that
+knowledge gets ingested. This is what lets a `ContentIdentityGroup`
+sit at all-`UNRESOLVED` forever without that ever being confused for a
+disposition decision D2 was careful never to make.
+
+### D1 directory-structural matches — context, not content proof
+
+Corrected per review point 1: a D1 directory-structural match is **not
+of the same evidential weight as a D1 exact-content match**, and does
+not drive any content-identity decision on its own. D1's own report
+already keeps `exact_duplicate_reclaimable_bytes` and
+`directory_duplicate_reclaimable_bytes` separate for exactly this
+reason (documented in D1's docstring: never sum them). This design
+carries that same separation forward: every individual file inside a
+directory-structural match still goes through its *own* content-
+identity determination independently (it may land in a D1 exact-
+duplicate group of its own, or be unique, or have no source file hash
+computed at all, depending on what D1 actually hashed). The directory-
+level match itself is preserved only as **contextual provenance**
+attached to the `SourceInstance`s inside both trees — e.g. "this
+occurrence sits inside a directory that structurally matches another
+directory at path Y" — informative to a human or to layer-3/4 work
+later, but never itself the reason a `Document` gets created or a
+canonical selection gets made.
+
+### Ingestion idempotency key
+
+Round 2 addition, making explicit what round 1 only implied. The unit
+that triggers the extraction/normalization/chunking pipeline is
+`ContentIdentityGroup` (above) — not `SourceInstance`:
+
+```
+physical SourceInstance
+        |
+        v
+content identity  (ContentIdentityGroup)
+        |
+        v
+one extraction / normalization / chunking pipeline run
+        |
+        v
+multiple provenance references (every SourceInstance in the group
+points at the one resulting Document)
+```
+
+Stated plainly: **once a `ContentIdentityGroup`'s pipeline has run,
+additional physical occurrences discovered later that join the same
+group do not independently re-trigger extraction, normalization, or
+chunking** — they attach as new `SourceInstance`s (new provenance
+references) against the `Document` that already exists for that group.
+
+The archive caveat from Hash semantics applies here without exception,
+and is worth restating as its own chain because it is the one place
+this idempotency key cannot short-circuit work, only downstream cost:
+
+```
+T7 archive
+   |
+   v
+archive member
+   |
+   v
+member hash becomes known only AFTER reading/extracting the member
+```
+
+A member's content identity is unknowable before it is read. So
+archive-aware deduplication can prevent *downstream* work once the
+member's hash is known (skip chunk/embed if that hash already has a
+`Document`) — it cannot prevent the extraction/read of a not-yet-
+identified member. The idempotency key is content identity, and
+content identity for an archive member does not exist until after the
+one unavoidable read that produces it.
+
+### Ingestion state — its own lifecycle, not Chain 1's
+
+Corrected per review point 6: this design reuses the *durability
+principle* behind Chain 1's dedup executor (one durable, idempotent
+row per processed item is the resume checkpoint — see Q8) but
+explicitly does **not** reuse Chain 1's actual state machine
+(`DedupExecutionAction`'s `PLANNED/AUTHORIZED/EXECUTING/SUCCEEDED/
+FAILED/RECONCILED` lifecycle, its inode-pinning TOCTOU closure, its
+post-move verification). That machine exists to make a specific
+promise about *authorized mutation of real files on the T7* — a
+promise ingestion, which never mutates the T7 and never even mutates
+existing extracted copies once written, does not need and should not
+inherit undigested. Ingestion needs its own lifecycle, sketched (not
+implemented) as: `DISCOVERED → CLASSIFIED → EXTRACTING → EXTRACTED →
+NORMALIZED → CHUNKED → EMBEDDED → INGESTED`, with terminal
+`QUARANTINED` (defined precisely below) and `NEEDS_REVIEW` (D2
+flagged, unresolved) states reachable from `CLASSIFIED`. Retry
+semantics (what "extracting" failing mid-way means, whether it's safe
+to retry from `CLASSIFIED` or must resume from a partial-extraction
+cleanup step) are **not** designed in this pass — named as a real
+question for the implementation gate, not answered here by assumption.
+
+**`QUARANTINED`, defined precisely — a different word for a different
+thing.** This project already has a "quarantine" with a specific,
+load-bearing meaning: Chain 1's dedup executor quarantine, which
+*reversibly relocates a real file the T7-adjacent filesystem holds*, as
+one step of an authorized, auditable mutation plan. Ingestion's
+`QUARANTINED` state means something categorically different and must
+never be read as a synonym: **an ingestion artifact — the working copy
+in the extraction workspace, or the classification record for a file
+that could not be processed — is rejected or set aside within
+`documents/imports/<job_id>/`,** because its archive was corrupt, its
+format is unsupported, or it exceeded a size/expansion limit. It is not
+a T7 source file being moved anywhere; the T7 item that produced a
+`QUARANTINED` ingestion record has not been touched, renamed, or
+relocated, and no such capability is proposed here. Future
+implementers must keep these two "quarantine" concepts named clearly
+enough (e.g. `IngestionState.QUARANTINED` vs. the dedup executor's
+`QuarantineAction`/whatever it is currently called) that neither is
+ever mistaken for the other in code, logs, or documentation.
+
+### The pipeline, mapped onto that machinery
+
+```
+T7 source (read-only, forever)
+   |
+   v
+discovery        <- ALREADY DONE: D0 corpus_inventory.py output
+   |                 (619,087 files, ~669GB, knowledge/t7_discovery/inventory.json)
+   v
+classification   <- NEW STAGE. Reads D0 + D1 + D2 JSON reports only.
+   |                 Establishes content-identity groupings (layer 2)
+   |                 and creates SourceInstance + ProvenanceLink records
+   |                 (layer 1). Does NOT decide canonical status (stays
+   |                 UNRESOLVED) and does NOT collapse a directory-
+   |                 structural match into one instance. Zero T7 access.
+   v
+archive handling <- ArchiveExtractor, extended: recursive (archive-
+   |                 inside-archive, depth-limited, threading the
+   |                 ProvenanceLink chain through each hop), per-item
+   |                 errors caught and quarantined rather than aborting
+   |                 the job.
+   v
+document extraction <- DocumentIngestor + text_extractor.py, unchanged
+   |                     in kind, run once per content-identity group
+   |                     (not once per SourceInstance).
+   v
+normalization    <- existing extract_text() dispatch; no change proposed.
+   v
+provenance       <- SourceInstance + ProvenanceLink records already
+   |                 created at classification are attached to the
+   |                 resulting Document; never re-derived from the T7.
+   v
+chunking         <- chunk_text(), unchanged.
+   v
+embeddings       <- EmbeddingClient, unchanged.
+   v
+AI_Brain knowledge (Document + DocumentChunk, queried by RetrievalService)
+```
+
+The load-bearing property of this shape is unchanged from the first
+draft: classification is the only stage that has to think about the
+T7's scale, and it does so entirely off already-collected JSON,
+without touching the T7 itself. What changed is *what classification
+is allowed to decide* — content-identity grouping and provenance
+recording, yes; canonical authority or directory-level content
+equivalence, no.
+
+### Answering the nine questions (revised)
+
+**1. What gets ingested?** One `Document` per **content-identity**
+group (layer 2) — proven by a matching hash, per the table above — not
+per D1 duplicate group indiscriminately. A D1 exact-duplicate group
+*is* a content-identity group (D1 proved it via hash) and ingests as
+one `Document`. A D1 directory-structural match is not, by itself — the
+files inside it are ingested (or not) individually based on their own
+content identity, with the directory relationship preserved only as
+context (see above). A content-identity group where D2 flagged
+`requires_human_review=True` still gets ingested as ONE `Document`
+(ingestion doesn't wait on canonical resolution — see Canonical
+status) but its `SourceInstance`s stay `UNRESOLVED` and the review flag
+carries forward for a human to look at later.
+
+**2. What stays archived (cataloged, never content-ingested)?** `.c9r`
+Cryptomator chunks (ciphertext, established by D2); any file
+classification quarantines (corrupted archive, unsupported format,
+over a size/expansion limit); a `SourceInstance` that duplicates a
+content-identity group already ingested (it is recorded, but its bytes
+are not re-extracted, re-chunked, or re-embedded a second time).
+
+**3. How are archives represented?** Via the `ProvenanceLink` chain
+(above), not a flat string list — `t7_file → archive_member →
+archive_member → ...`, queryable, not just displayable. `Document.
+source` keeps meaning the on-disk working-copy path (unchanged, per
+0001/0002); the `ProvenanceLink` chain is separate metadata, never a
+live filesystem path once classification has run.
+
+**4. How are versions represented?** Not represented in this pass —
+this is layer 4 (document/version), explicitly deferred (see Identity
+layers). What *is* represented: `SourceInstance` records every
+physical occurrence with whatever date/keyword signal D2 already
+recorded for it, which is the raw material a future layer-4 design
+would consume. The target capability the user named — "I had three
+copies of this document, which versions existed over time" — is not
+answered by this design pass; it requires layer 3/4 work not yet begun,
+and this document does not claim otherwise.
+
+**5. How is provenance preserved / 9. how does an answer trace back to
+the T7?** Extends `ProvenanceService.trace_document()`'s existing walk
+(`ImportJob → Document → DocumentChunk → Message`) one hop earlier via
+`SourceInstance` and its `ProvenanceLink` chain, giving the full
+`answer → chunk → document → archive member(s) → source file → T7
+path` trace as a read-only query over existing + proposed tables, not
+a new subsystem.
+
+**6. Where do extracted artifacts live?** Unchanged from the first
+draft: a workspace outside both T7 mount points and outside
+`knowledge/t7_discovery/`, consistent with the existing `documents/
+imports/<job_id>/` layout, e.g. `documents/imports/<job_id>/extracted/`
+mirroring each item's `ProvenanceLink` chain + relative path. Retention
+policy for non-canonical or non-ingested working copies remains an
+**open question**, deliberately unresolved — a Track 2 concern once
+real disk-usage numbers exist.
+
+**7. How do we prevent duplicate work?** Revised per the hash-semantics
+correction above — this is now two genuinely different cases, not one
+gate:
+- **Loose T7 files**: D1's already-computed source file hash (where it
+  exists — D1 only hashed size-collision candidates) can gate
+  extraction *before* it happens, exactly as the first draft described.
+- **Archive members**: no hash exists before extraction (D1 never
+  opened archives). These must be extracted first; the resulting
+  archive-member hash is then checked against already-ingested content
+  identities, and a match means the *extraction was necessary but the
+  chunk/embed step is skipped* — the redundant work saved is chunking
+  and embedding, not extraction, and this design says so plainly rather
+  than implying extraction itself is always avoidable.
+- At the corpus level, in both cases: classification consumes D0/D1/D2's
+  already-computed JSON instead of re-scanning or re-hashing the T7 —
+  the ~104 minutes of D0+D1+D2 runtime is spent exactly once regardless.
+
+**8. How does ingestion resume after interruption?** `ImportJob`'s
+counters cannot answer "which ones" today. Proposal unchanged in
+principle: each classified item gets its own durable `SourceInstance`
+row at classification time, before extraction; resume is "the
+classification manifest minus items with a durable row," combined with
+whatever `NEEDS_REVIEW`/`QUARANTINED`/lifecycle state (above) that row
+already carries. This reuses Chain 1's *durability principle* only —
+not its state machine (see Ingestion state, above).
+
+### What this design pass explicitly does NOT decide or build
+- The exact `SourceInstance` / `ProvenanceLink` schema (column types,
+  indexes, migration, whether `ProvenanceLink` is a real table or a
+  materialized-path column) — sketched at the concept/shape level only.
+- Logical document identity or document/version modeling (layers 3/4)
+  — named and deliberately deferred, not sketched even at concept
+  level beyond noting D2's evidence as future input.
+- Any canonical-copy *selection policy* — canonical status stays a
+  three-state field with no algorithm proposed to populate it beyond
+  "a human decided." The pre-existing "Best Copy Arbitration" backlog
+  item remains where that eventually lives.
+- Retention policy for working copies (Q6's open question).
+- Resource limits, backpressure, job scheduling, or a worker queue —
+  Track 2, out of scope here.
+- Ingestion's retry/partial-failure semantics beyond naming the states
+  involved (see Ingestion state, above).
+- Recursive-archive depth limit, per-item quarantine error taxonomy,
+  and the classification stage's actual code — all implementation,
+  deferred to whatever gate follows review of this document.
+- Any T7 access. This entire section, including this revision, was
+  written from the D0/D1/D2 reports already on disk and the existing
+  ingestion codebase; no new scan, hash, or read of either T7 path
+  occurred to produce it or this correction.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

@@ -1151,6 +1151,84 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       today. Full suite: 633 tests. **Zero T7 access of any kind during
       this follow-up**, including read-only re-verification (already
       confirmed clean by D2's own checks, not repeated here).
+- [x] T7 → AI_Brain Ingestion & Representation Design — design pass
+      only, no implementation, no T7 access of any kind, three review
+      rounds, APPROVED and frozen. Round 1 answered nine user-posed
+      questions with a
+      proposed pipeline (`discovery → classification → archive
+      handling → document extraction → normalization → provenance →
+      chunking → embeddings → AI_Brain knowledge`) mapped onto the
+      existing ingestion codebase. Round 2 (this revision) corrected
+      several conflations the first draft made, restructured around
+      four explicit **identity layers** — physical source occurrence,
+      content identity, logical document identity, document/version —
+      of which only the first two are modeled now; the latter two are
+      named and deliberately deferred. Key corrections: a D1
+      directory-structural match no longer drives any content-identity
+      or canonical decision (only a proven hash match does — D1's own
+      report already keeps exact vs. directory-structural
+      reclaimable-bytes separate for this exact reason); canonical
+      status is now an explicit three-state field
+      (`UNRESOLVED`/`CANONICAL`/non-canonical) that defaults to
+      `UNRESOLVED` and is never inferred from "no open review flag" —
+      D2 deliberately never decided physical-copy authority, and
+      ingestion (extraction/chunk/embed) is gated by content identity
+      alone, not by canonical resolution; `archive_chain` became a
+      structural `ProvenanceLink` chain (`t7_file`/`archive_member`
+      nodes with a `parent` reference) instead of an opaque path list,
+      so archive-ancestry queries are possible later; four distinct
+      hash types (source file / archive member / extracted document
+      content / normalized-content) are now named explicitly, and
+      `Document.content_hash` is documented as usable for a
+      pre-extraction dedup check only for loose T7 files — D1 never
+      opened archives, so an archive member has no hash until *after*
+      it is extracted, meaning a content match found post-extraction
+      saves the chunk/embed step, not the extraction itself; ingestion
+      gets its own lifecycle sketch (`DISCOVERED → CLASSIFIED →
+      EXTRACTING → EXTRACTED → NORMALIZED → CHUNKED → EMBEDDED →
+      INGESTED`, plus `QUARANTINED`/`NEEDS_REVIEW`), reusing only Chain
+      1's *durability principle* (one durable row per item = resume
+      checkpoint) and explicitly not its `PLANNED/AUTHORIZED/EXECUTING/
+      .../RECONCILED` state machine, which exists specifically for
+      authorized T7 mutation that ingestion never performs. The T7
+      remains treated as an instance of the master backup under the
+      existing [0002](../decisions/0002-master-backup-is-read-only.md)
+      decision. Still explicitly deferred: exact schema/migration for
+      `SourceInstance`/`ProvenanceLink`, any layer-3/4 modeling, any
+      canonical-copy selection algorithm, working-copy retention
+      policy, resource limits/backpressure/scheduling (Track 2), and
+      ingestion's retry/partial-failure semantics.
+
+      **Round 3 (final clarifications, design APPROVED and frozen)**:
+      `canonical_status` is explicitly a relationship, not a property
+      of a file — it lives on the (`SourceInstance`, new first-class
+      `ContentIdentityGroup`) pair, documented as "canonical within
+      this content-identity group," never "canonical" unqualified.
+      `NON_CANONICAL` was corrected to require its own explicit
+      evidence/decision, exactly like `CANONICAL` does — it no longer
+      follows automatically from a sibling instance being marked
+      `CANONICAL`; a group can sit at "one `CANONICAL`, N
+      `UNRESOLVED`, zero `NON_CANONICAL`" indefinitely as a normal
+      state. An explicit **ingestion idempotency key** was defined:
+      `SourceInstance → ContentIdentityGroup → one extraction/
+      normalization/chunking pipeline run → multiple provenance
+      references`, restating the archive caveat as its own chain
+      (`T7 archive → archive member → member hash known only after
+      reading/extracting it`) — archive-aware dedup can only save
+      downstream chunk/embed work, never the initial read of an
+      unidentified member. `QUARANTINED` was defined precisely as an
+      ingestion-workspace concept (an artifact rejected/isolated under
+      `documents/imports/<job_id>/`) and explicitly distinguished from
+      Chain 1's dedup-executor quarantine (a reversible T7-adjacent
+      filesystem relocation) — the two must never be conflated in
+      code, logs, or docs. See `AI_Brain_Architecture.md`'s "T7 →
+      AI_Brain Ingestion & Representation Design" section for the
+      full, frozen proposal. **Next gate, not yet authorized**: a
+      schema/model design milestone settling the exact representation
+      of `SourceInstance → ProvenanceLink → ContentIdentityGroup →
+      Document → DocumentChunk`, still leaving logical-document/version
+      semantics (identity layers 3/4) deferred — not immediate
+      extraction.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
