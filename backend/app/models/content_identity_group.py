@@ -93,6 +93,27 @@ class ContentIdentityGroup(Base):
     success. This asymmetry is inherited from the already-frozen enum,
     not introduced by this schema-extension gate - documented here so
     it is never mistaken for an oversight.
+
+    GENERATION-FENCED RESERVATION PRIMITIVES (added per "Scaled Real-T7
+    Ingestion - Implementation Design Pass", `2fab4b3`, Rounds 2-3 -
+    schema/model milestone only, no reservation lifecycle implemented
+    yet): `claim_generation` increments by exactly 1 every time
+    `WorkerClaimService.claim_content_identity_group` grants a claim on
+    this row - whether that claim is fresh or a stale-reclaim. A caller
+    holds the generation value returned by its own claim for the
+    lifetime of its attempt. `reserved_embeddings` records how many
+    embeddings a claim has reserved against this row's batch-level
+    budget. Both fields exist so a FUTURE reservation lifecycle can
+    fence every reserve/consume/release/recover operation to
+    `claim_generation = :my_generation` - closing a real ABA/zombie-
+    worker race where a delayed (not merely crashed) worker could
+    otherwise mistake a later generation's live reservation for its own
+    stale one. Recovery is authorized because it reads this row fresh,
+    under the same `SELECT ... FOR UPDATE` lock the claim query already
+    takes - never because of a special-cased caller identity. Neither
+    field is read or written by any service in this codebase yet; only
+    the claim/reclaim increment described above is wired up in this
+    milestone.
     """
 
     __tablename__ = "content_identity_groups"
@@ -136,6 +157,14 @@ class ContentIdentityGroup(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # Generation-fenced reservation primitives - see class docstring.
+    # Schema/model only in this milestone; no reservation lifecycle
+    # reads/writes reserved_embeddings yet.
+    claim_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    reserved_embeddings: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -67,6 +67,14 @@ class WorkerClaimService:
         enum has no NORMALIZING/CHUNKING/EMBEDDING equivalent and this
         schema-extension gate does not add one.
 
+        `claim_generation` is incremented by exactly 1 on every grant of
+        this claim, fresh or reclaim - the fencing token a future
+        embedding-reservation lifecycle uses to prove a delayed worker
+        from an old generation can never act on a newer generation's
+        state (see "Scaled Real-T7 Ingestion - Implementation Design
+        Pass", `2fab4b3`, Rounds 2-3). The caller reads the returned
+        row's `claim_generation` to learn the value it now holds.
+
         Returns None if no eligible, unclaimed-or-stale row exists.
         """
         stale_before = datetime.now(UTC) - lease_duration
@@ -89,6 +97,7 @@ class WorkerClaimService:
         values: dict = {
             "claimed_by": worker_id,
             "claimed_at": datetime.now(UTC),
+            "claim_generation": ContentIdentityGroup.claim_generation + 1,
         }
         if claiming_pipeline_state is not None:
             values["pipeline_state"] = claiming_pipeline_state

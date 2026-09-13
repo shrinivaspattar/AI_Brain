@@ -3,7 +3,7 @@ from enum import Enum
 
 from sqlalchemy import CheckConstraint, DateTime
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy import ForeignKey, Integer, Text
+from sqlalchemy import ForeignKey, Index, Integer, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -92,6 +92,24 @@ class SourceInstance(Base):
     claimed unit of work. Same transient-marker semantics as
     `ContentIdentityGroup.claimed_by`/`claimed_at`: cleared on every
     attempt's completion, permanent history lives in `IngestionAttempt`.
+
+    DISCOVERY-RUN-SCOPED MATERIALIZATION UNIQUENESS (added per "Scaled
+    Real-T7 Ingestion - Implementation Design Pass", `2fab4b3`): a
+    UNIQUE index on `(classification_run_id, root_t7_path,
+    COALESCE(member_path, ''))` is independent defense-in-depth against
+    ever materializing the same observation twice under one batch's
+    `ClassificationRun` - the primary safeguard is a Postgres advisory
+    lock held for the whole batch-creation transaction (see the frozen
+    design's batch-creation-transaction section), and this constraint
+    is the invariant of last resort if that lock is ever bypassed by a
+    future bug. `COALESCE(..., '')` is required because `member_path`
+    is NULL for every loose file - a plain `UNIQUE` constraint would
+    not catch duplicate loose-file rows at all, since Postgres never
+    considers two NULLs equal for uniqueness purposes. This does NOT
+    prevent a later `DiscoveryRun`'s own, different `ClassificationRun`
+    from legitimately re-observing the same `root_t7_path` (a different
+    `classification_run_id` value is a different row in this
+    constraint's key, by design).
     """
 
     __tablename__ = "source_instances"
@@ -103,6 +121,13 @@ class SourceInstance(Base):
             "AND canonical_status_decided_at IS NOT NULL"
             ")",
             name="ck_source_instances_canonical_status_requires_evidence",
+        ),
+        Index(
+            "uq_source_instances_run_path_member",
+            "classification_run_id",
+            "root_t7_path",
+            text("COALESCE(member_path, '')"),
+            unique=True,
         ),
     )
 
