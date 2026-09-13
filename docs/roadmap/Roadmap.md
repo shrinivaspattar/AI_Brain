@@ -1607,11 +1607,36 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       Main `aibrain` database completely untouched — no migration was
       even needed this gate. No T7 access of any kind at any point. See
       `AI_Brain_Architecture.md`'s "Controlled Ingestion Implementation"
-      section for the full report. **Next gate, not yet authorized**:
-      real T7 discovery-report ingestion into this pipeline, resource
-      limits/scheduling/orchestration for running multiple workers,
-      and eventually real extraction/embeddings against the actual T7 —
-      still no T7 access of any kind until each is separately opened.
+      section for the full report.
+
+      **APPROVED, with two precise corrections preserved in the
+      architecture doc**: (1) the concurrency proof's invariant is
+      stated more carefully than "every item processed exactly once" -
+      each work item is claimed by at most one ACTIVE worker at a time,
+      and retries converge idempotently to the existing durable state;
+      this is claim-ownership-plus-idempotency, never a promise of
+      global exactly-once execution (a crash can land after an
+      external side effect but before its state is recorded - claim
+      ownership and idempotency are what supply safety there, not
+      atomicity between the two). (2) The archive-crash-halfway
+      invariant is now stated explicitly, not just demonstrated: a
+      retry must deterministically identify already-existing members
+      and create only the missing ones, never duplicating their
+      `ProvenanceLink` rows and never mutating their already-recorded
+      `evidence_snapshot` - flagged for re-verification one nesting
+      level deeper before any real-T7 authorization, since archive
+      nesting is where future complexity concentrates.
+
+      **Next gate, not yet authorized**: real T7 discovery-report
+      ingestion into this pipeline, resource limits/scheduling/
+      orchestration for running multiple workers, and eventually real
+      extraction/embeddings against the actual T7 — still no T7 access
+      of any kind until each is separately opened. The user's
+      recommendation: one more synthetic-only pre-real-T7 review gate,
+      specifically verifying the integration boundary between this
+      ingestion code and the real-path/security layer (`FileAccessService`'s
+      allow-list, the `ImportJob` source-reference convention), before
+      the next authorization opens read-only real-T7 ingestion.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

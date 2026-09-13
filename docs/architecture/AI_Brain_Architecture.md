@@ -6051,8 +6051,19 @@ and verifying re-processing completed it without creating a duplicate.
    against 10 distinct files, 6 concurrent `ArchiveProcessingService`
    workers against 6 distinct archives, and 8 concurrent
    `NormalizationService` workers against 8 distinct groups - every
-   case: every work item processed exactly once, verified via a fresh
-   connection, not the ORM's local view.
+   item was claimed and completed by exactly one worker in these runs,
+   verified via a fresh connection, not the ORM's local view.
+   **The invariant this proves, stated precisely rather than
+   overclaimed**: each work item is claimed by at most one ACTIVE
+   worker at a time, and retries converge idempotently to the existing
+   durable state - this is NOT a promise of global "exactly-once
+   execution." A crash can occur after an external side effect (e.g. a
+   file already written to the workspace, or a future real embedding
+   API call already billed) but before the corresponding state is
+   recorded; what supplies safety here is claim ownership plus
+   idempotency (every operation is safe to repeat and converges to the
+   same end state), never an assumption that a side effect and its
+   durable record happen atomically together.
 3. **Worker crash → recoverable claim** - inherited directly from
    `ce50875`'s already-proven stale-claim recovery, unchanged and
    reused by every new service here (all built on `WorkerClaimService`).
@@ -6062,7 +6073,21 @@ and verifying re-processing completed it without creating a duplicate.
    second one.
 5. **Archive crash halfway → resumable without duplicate members** -
    proven by pre-creating one member's row (simulating the crash) and
-   confirming re-processing completes it without duplication.
+   confirming re-processing completes it without duplication. **The
+   invariant this test stands for, worth preserving explicitly since
+   archive nesting is where future ingestion complexity will
+   concentrate**: given an archive where some `SourceInstance` members
+   already exist after a crash, a retry must deterministically
+   identify those existing members and create only the missing ones -
+   never duplicating their `ProvenanceLink` rows, and never mutating
+   the evidence already recorded on the pre-existing member rows
+   (`evidence_snapshot` stays exactly as first written, per its own
+   immutability contract). The one synthetic scenario tested here (a
+   single flat archive, one member pre-created) demonstrates this for
+   the simplest case; a future gate that touches nested-archive resume
+   more deeply should re-verify this same invariant one level down
+   before real-T7 authorization, rather than assuming it generalizes
+   untested.
 6. **Unsupported/corrupt input → durable `FAILED`/`UNSUPPORTED`** -
    proven for both: a known-binary extension durably lands at
    `UNSUPPORTED` at identity-resolution time (never attempted); a
