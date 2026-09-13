@@ -53,3 +53,10 @@ knowledge/t7_discovery/
 # control (same reasoning as knowledge/t7_discovery/ above, but for
 # file bytes rather than names/paths).
 documents/
+
+# Real-T7 batch selection manifests - the actual real file/directory
+# names and paths a given ingestion batch run selected. Same reasoning
+# as knowledge/t7_discovery/ above: never committed to version control.
+# Committed batch scripts load their selection from one of these at
+# runtime instead of hardcoding real paths as source-code constants.
+scripts/*_selection.json

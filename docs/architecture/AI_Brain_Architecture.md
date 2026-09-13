@@ -6305,6 +6305,130 @@ control, whether it is file names/paths or file bytes.
   real T7 content - Ollama was confirmed not running; the correct
   `EMBEDDING_UNAVAILABLE` failure path was proven instead.
 
+## Controlled Real-T7 Batch Ingestion
+
+Authorized explicitly ("AUTHORIZE: CONTROLLED REAL-T7 BATCH INGESTION",
+checkpoint `5d5d1c7`) as the second real-T7 read-only ingestion gate,
+opened once the embedding-infrastructure prerequisite named after the
+first pilot was verified: Ollama running (`localhost:11434`, v0.31.2),
+`nomic-embed-text` pulled (768 dimensions, matching
+`settings.EMBEDDING_DIMENSIONS`), the raw `EmbeddingClient` verified
+with a real call, and the full `PipelineEmbeddingService.embed_next()`
+path verified synthetically end-to-end (`CHUNKED -> INGESTED` with a
+real embedded vector, rolled back afterward). Ollama was already
+running continuously before this batch started and was not restarted
+by it.
+
+### Batch composition - seven representative real cases
+
+Selected via a systematic, read-only survey of the existing D1
+`duplicate_analysis.json` report (never re-scanned) plus two direct,
+read-only T7 lookups: (1) an ordinary loose file with real, substantive
+text; (2)/(3) two real paths with byte-identical content from a
+1,127-copy D1 duplicate group; (4) a small real archive with genuine
+(non-directory) file members; (5) a real file under a known-unsupported
+suffix; (6) a real file that is genuinely invalid relative to its own
+extension - confirmed via direct inspection (`zipfile.ZipFile()`
+raising) before selection, not fabricated - a real Office "owner/lock"
+file under a `.pptx` extension; (7) the exact same real path used as
+`SourceInstance` id=1 in the first pilot, to prove reuse of a
+pre-existing PRODUCTION `ContentIdentityGroup`, not just same-run
+convergence.
+
+**Deliberately not included**: a naturally-occurring nested archive.
+42 real `.zip`/`.7z` files up to 50MB were checked (every member of
+every one, `unzip -l`/`7z l`, filtering out each listing's own
+self-referential header line) and none contained an archive member.
+Asked explicitly, the decision was to rely on the existing synthetic
+3-level nested-archive proof (`a0523b7`) rather than expand the search
+into larger archives, which would work against "small, controlled
+batch."
+
+### Result: full chain proven on real, diverse content
+
+`SourceInstance -> identity resolution -> ContentIdentityGroup -> claim
+-> extraction -> normalization -> Document -> DocumentChunk -> real
+Ollama embedding -> INGESTED`, all seven cases behaving exactly as
+designed:
+- **Already-known identity reuse**: the reused path resolved to the
+  SAME pre-existing `ContentIdentityGroup` (id=1) created by the first
+  pilot - a real production-identity reuse, not merely same-run
+  convergence.
+- **Duplicate convergence**: two distinct real paths with identical
+  bytes converged onto one new group.
+- **Archive with real members**: two real CSV members extracted,
+  correct `T7_FILE -> ARCHIVE_MEMBER` two-link provenance chains.
+- **Unsupported input**: durable `UNSUPPORTED`, zero attempt made.
+- **Corrupt input**: durable `FAILED`/`CORRUPT_INPUT` at normalization
+  (python-pptx correctly rejects the invalid package).
+- **Real embedding**: 8 real chunks across 4 groups embedded via
+  genuine Ollama calls (not skipped, not faked), all 4 reaching
+  `INGESTED`.
+- **Idempotency and no-duplicate-creation on retry**: every claim
+  method's second AND third call returned `None`; `SourceInstance`/
+  `ProvenanceLink` counts identical before/after the repeated no-op
+  calls - the bug fixed in the first pilot (`5d5d1c7`) did not recur
+  under this second, more diverse real-data run.
+
+No new defect was found in this batch - a meaningful confirmation of
+the prior fix, not just an absence of new findings.
+
+### Source integrity
+
+Every real path's filesystem metadata (size, mtime) was captured
+before any read and re-verified unchanged at four checkpoints during
+the run, plus once more independently afterward, outside the script.
+Stated precisely, per review: this is strong corroborating evidence of
+no mutation, not a cryptographic proof of byte-for-byte identity - the
+stronger safety property is that this pipeline has never had any
+write/rename/delete/quarantine capability against a source path at
+all, at any point in its history.
+
+### Database changes (main `aibrain`)
+
+`ContentIdentityGroup` 3→9, `SourceInstance` 4→13, `ProvenanceLink`
+4→15, `Document` 3→7. No migration; schema unchanged since `5d5d1c7`.
+`aibrain_test` confirmed untouched (0 rows) - this batch used only the
+main database. This is now genuine real-ingestion production data, not
+a synthetic validation artifact.
+
+### Full suite
+
+**717 passed, 0 skipped**, run three times, zero flakiness (no backend
+code changed this gate). The previously-always-skipped
+`test_import_job_execution_embeds_documents_via_real_ollama` (a
+pre-existing test on the older, unrelated personal-corpus `ImportJob`
+path, `skipif(not _ollama_reachable())`) now runs for real with Ollama
+up and passes - incidental confirmation that the original
+`EmbeddingService.embed_document()` path also works against the real
+backend, not itself part of this gate's scope.
+
+### Script sensitivity - no real paths committed to version control
+
+The batch's real T7 paths are never hardcoded in
+`scripts/t7_batch_ingestion.py` - they live in a sibling
+`scripts/t7_batch_selection.json`, gitignored via a new
+`scripts/*_selection.json` rule (same reasoning as
+`knowledge/t7_discovery/` and `documents/`: real personal file/
+directory names must never be committed). The committed script only
+knows generic case labels (`already_known_identity`, `loose_ordinary`,
+`duplicate_a`/`duplicate_b`, `archive`, `unsupported`, `corrupt`) and
+loads the actual paths from that file at runtime, erroring clearly if
+it is absent. Verified via direct `grep` of the committed file for any
+T7 path fragment or personal filename before commit.
+
+### What this batch explicitly does NOT include
+- Any expansion beyond this seven-case batch, or toward the remaining
+  ~727 GB corpus - this is a successful controlled-batch milestone,
+  not permission for broader ingestion. The next gate must be a
+  separate, deliberate decision about the size and rules of the next
+  real-T7 batch.
+- A naturally-occurring nested-archive proof against real data (see
+  above) - synthetic coverage remains authoritative for that scenario.
+- Any mutation, rename, delete, quarantine, permission/ownership/
+  timestamp change, or dedup disposition against T7.
+- Any schema or migration change - none was needed.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

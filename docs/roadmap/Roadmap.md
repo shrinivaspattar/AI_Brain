@@ -1710,6 +1710,76 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       dedup-disposition/mutation gate the authorization explicitly
       excluded.
 
+- [x] Controlled Real-T7 Batch Ingestion — the second real-T7
+      read-only gate, opened once the embedding-infrastructure
+      prerequisite named after the first pilot was verified: Ollama
+      running (v0.31.2), `nomic-embed-text` pulled (768 dimensions),
+      raw `EmbeddingClient` verified, and the full synthetic
+      `PipelineEmbeddingService` path verified end-to-end. Ollama was
+      already running before this batch and was not restarted by it.
+
+      Seven representative real cases (already-known identity reuse,
+      ordinary loose file, duplicate-content convergence, archive with
+      real members, unsupported file, corrupt input, and an item
+      reaching real embedding), selected via a systematic read-only
+      D1-report survey plus two direct T7 lookups. A naturally-
+      occurring nested archive was deliberately not included — 42 real
+      `.zip`/`.7z` files up to 50MB were checked and none contained a
+      nested member; by explicit decision, synthetic 3-level coverage
+      (`a0523b7`) remains authoritative for that scenario rather than
+      expanding the search into larger archives.
+
+      **Full chain proven on real, diverse content**: already-known
+      identity correctly reused the SAME pre-existing production
+      `ContentIdentityGroup` (id=1) from the first pilot; two distinct
+      real duplicate paths converged onto one new group; a real
+      archive's two real CSV members extracted with correct `T7_FILE →
+      ARCHIVE_MEMBER` provenance; a real unsupported file reached
+      durable `UNSUPPORTED` with zero attempt; a real corrupt file (a
+      genuine Office lock file under a `.pptx` extension, confirmed
+      invalid via direct inspection before selection) reached durable
+      `FAILED`/`CORRUPT_INPUT`; 8 real chunks across 4 groups were
+      embedded via genuine Ollama calls, all reaching `INGESTED`;
+      every claim method's second and third call returned `None` with
+      zero new `SourceInstance`/`ProvenanceLink` rows on repeated
+      no-op retries. **No new defect was found** — confirmation that
+      the claim-exclusion bug fixed after the first pilot did not
+      recur under a second, more diverse real-data run.
+
+      Source integrity verified at four checkpoints plus one
+      independent recheck: every real path's filesystem metadata
+      (size, mtime) remained unchanged throughout — stated precisely,
+      per review, as strong corroborating evidence of no mutation
+      rather than a cryptographic proof of byte-for-byte identity; the
+      stronger safety property is that this pipeline has never had any
+      write/rename/delete/quarantine capability against a source path.
+
+      Main `aibrain` database: `ContentIdentityGroup` 3→9,
+      `SourceInstance` 4→13, `ProvenanceLink` 4→15, `Document` 3→7 — no
+      schema change. This is now genuine real-ingestion data, not a
+      synthetic validation artifact. Full suite: **717 passed, 0
+      skipped**, run three times (the one previously-always-skipped
+      real-Ollama test on the older, unrelated `ImportJob` path now
+      runs and passes, incidentally).
+
+      **Pre-commit sensitivity fix**: the batch script initially
+      hardcoded real T7 paths/personal filenames as source constants.
+      Per review, refactored so the committed script contains only
+      generic case labels and loads real paths at runtime from a
+      sibling `scripts/t7_batch_selection.json`, gitignored via a new
+      `scripts/*_selection.json` rule (same reasoning as
+      `knowledge/t7_discovery/`/`documents/`) — verified via direct
+      `grep` that the committed file contains no T7 path fragment or
+      personal filename. See `AI_Brain_Architecture.md`'s "Controlled
+      Real-T7 Batch Ingestion" section for the full report.
+
+      **APPROVED as a successful controlled-batch milestone — explicitly
+      not permission for broader ingestion.** Full corpus ingestion
+      (~727 GB remaining), dedup execution/deletion/quarantine, and any
+      T7 mutation all remain closed. **Next gate, not yet authorized**:
+      a deliberate, separate decision about the size and rules of the
+      next real-T7 ingestion batch.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time
