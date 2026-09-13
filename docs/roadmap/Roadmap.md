@@ -1780,6 +1780,79 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       a deliberate, separate decision about the size and rules of the
       next real-T7 ingestion batch.
 
+- [x] Scaled Real-T7 Ingestion Design — design-only, **APPROVED and
+      frozen at the conceptual/design level** after 4 review rounds; no
+      T7 access, no schema/code written. Grounded in the current
+      codebase: no batch/envelope/
+      pause/resource-monitoring concept exists anywhere yet; the only
+      disk check anywhere is `ArchiveExtractor`'s hardcoded per-archive
+      constants.
+
+      Corrects "D0 = frozen snapshot" to "D0 = observed corpus
+      manifest; the filesystem may have drifted since." Eligibility is
+      scoped to the current `DiscoveryRun`'s own observations, not
+      "ever touched, globally" — preserving `path != physical
+      occurrence != content identity`, so a later `DiscoveryRun` can
+      legitimately re-observe a changed path as a new `SourceInstance`.
+
+      **Frozen invariants**: every `IngestionBatch` owns exactly one
+      dedicated, never-shared `ClassificationRun` — batch membership is
+      therefore just "the `SourceInstance` rows under that run,"
+      immutable once created, never re-derived by re-running selection
+      (the scaling analogue of Chain 1's immutable execution-plan
+      snapshot). A deterministic selection fingerprint (D0 hash +
+      policy/ordering versions + envelope + selected references) proves
+      exactly what was authorized.
+
+      Two independent per-`SourceInstance` classification dimensions:
+      `source_category` (strictly physical: `LOOSE_FILE`/`ARCHIVE`/
+      `SPECIAL` — backup/sync/snapshot naming is a separate, explicitly
+      deferred contextual signal, not a peer category) and
+      `workload_category` (`TEXT_DOCUMENT`/`STRUCTURED_DATA`/`MEDIA`/
+      `CODE`/`SOFTWARE`/`ENCRYPTED`/`CONTAINER`/`UNKNOWN` — an archive's
+      own row gets `CONTAINER`, never a guessed blend of its unopened
+      members). Archive admission (container-level, pre-extraction) and
+      archive member policy (post-extraction, once members are real
+      rows) are two distinct evaluation stages — unopened members never
+      affect initial batch-selection sizing. Risk tier is two-phase:
+      `risk_tier_estimated` at selection, `risk_tier_actual` honestly
+      **nullable**, populated only once real post-extraction evidence
+      exists, never fabricated on early failure.
+
+      `max_extracted_bytes` enforced via isolated per-item staging
+      directories, discarded wholesale on overflow (zero partial
+      artifacts ever become durable); `max_embeddings` enforced via the
+      same atomic-claim discipline as `WorkerClaimService` (a single
+      conditional `UPDATE`, not read-then-act, closing a real
+      concurrent-overshoot race); `max_runtime` uses a monotonic clock
+      for stop decisions, wall-clock timestamps for audit only. Batch
+      state (`IngestionBatch.status`) and work-item state
+      (`pipeline_state`) are independent axes, always reported
+      together. Completion is reported as four denominators (eligible /
+      attempted / terminal / successfully-ingested), never one
+      percentage. Host resource monitoring beyond disk/Postgres/Ollama
+      is optional and pluggable — `psutil` is deliberately not added as
+      a dependency.
+
+      New schema (not yet migrated): one `ingestion_batches` table plus
+      four new nullable columns on `SourceInstance`
+      (`source_category`/`workload_category`/`risk_tier_estimated`/
+      `risk_tier_actual`). See `AI_Brain_Architecture.md`'s "Scaled
+      Real-T7 Ingestion Design" section for the full specification.
+
+      **Not decided in this design**: numeric envelope defaults, risk-
+      tier numeric boundaries, the backup/sync context field's exact
+      structure/pattern list, and per-batch-class (the earlier "Batch
+      A–G" sketch) policy filter definitions.
+
+      **Next gate, not yet authorized**: a separate numeric/policy-
+      definition pass (batch-class inclusion/exclusion rules, size/risk
+      thresholds, archive admission thresholds, resource envelopes,
+      promotion criteria) must be completed and explicitly approved
+      before any implementation design. The real T7 remains outside the
+      ingestion gate until then — this freeze authorizes no code, no
+      schema migration, and no T7 access.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

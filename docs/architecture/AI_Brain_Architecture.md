@@ -6429,6 +6429,310 @@ T7 path fragment or personal filename before commit.
   timestamp change, or dedup disposition against T7.
 - Any schema or migration change - none was needed.
 
+## Scaled Real-T7 Ingestion Design (design pass, APPROVED and frozen — no implementation yet)
+
+Design-only, following the same freeze-before-implement discipline as
+`6491dad`. No T7 access, no schema migration, no code written for this
+gate yet. Grounded directly in the current codebase (verified, not
+assumed): there is currently no batch/envelope/pause/resource-monitoring
+concept anywhere in `app/` - `ClassificationRun` has `started_at`/
+`completed_at` but no status enum and no notion of a bounded subset of
+instances; the only disk-space check anywhere is `ArchiveExtractor`'s
+hardcoded per-archive `HARD_FREE_SPACE_BYTES`/`HARD_EXPANSION_RATIO`,
+with no batch-level cumulative tracking; `SourceInstance.id` is a plain
+autoincrement integer assigned only at creation, so it cannot serve as
+a pre-selection ordering key.
+
+### Terminology: D0 is a manifest, not a snapshot
+
+The D0 report is an immutable *artifact* describing what D0 observed -
+it is not proof the filesystem itself is unchanging. Precisely:
+```
+D0 report  = frozen description of what D0 observed
+filesystem = may have changed since D0 ran (it was not an atomic snapshot)
+```
+"D0 discovery manifest" / "observed corpus inventory" replaces "frozen
+snapshot" as the term of art throughout this design.
+
+### 1. Discovery-run-scoped eligibility
+
+The eligibility rule is **not** "no `SourceInstance` exists for this
+path anywhere, ever." That would wrongly prevent a later `DiscoveryRun`
+from ever re-observing a path whose content may have changed. The
+correct invariant:
+
+> A source path is eligible only when the *current* `DiscoveryRun`
+> contains an observation for that path that has not already been
+> materialized into a `SourceInstance` for that same observation/run.
+
+`path != physical occurrence != content identity` remains explicit: a
+later `DiscoveryRun` may create a new `SourceInstance` for the exact
+same real path, and that new instance may converge on an existing
+`ContentIdentityGroup` (bytes unchanged) or a new one (bytes changed),
+resolved independently at read time exactly as `get_or_create_group`
+already does today - no new mechanism, just a corrected scope on the
+eligibility query itself (scoped by the current batch's `DiscoveryRun`
+lineage, not global across all time).
+
+D1/D2 remain enrichment signals feeding classification/analysis, never
+the selection universe - this separation is unchanged and correct.
+
+### 2. Deterministic selection, batch ownership, immutable membership
+
+Selection sorts D0's flat path list lexicographically by relative path
+- fully reproducible from frozen report content, never live filesystem
+enumeration order.
+
+**Frozen invariant**: every `IngestionBatch` owns exactly one dedicated
+`ClassificationRun`; a `ClassificationRun` is never shared by another
+`IngestionBatch` (the existing 1:1 `IngestionBatch.classification_run_id`
+relationship enforces this). Because of this exclusivity, **batch
+membership is defined solely as "the `SourceInstance` rows materialized
+under that batch-owned `ClassificationRun`"** - never re-derived by
+re-running the selection algorithm, even if eligibility rules or code
+change later. Selection executes exactly once, synchronously, at batch
+creation. A "resume" reopens processing of the already-created rows; it
+never re-selects. This is the scaling analogue of Chain 1's immutable
+execution-plan snapshot, using existing structure rather than a new
+membership table.
+
+A deterministic **selection fingerprint** - a hash of `(D0 report
+sha256, selection_policy_version, ordering_version, envelope values,
+sorted selected source references)` - is stored on the `IngestionBatch`
+row as durable proof of exactly what was authorized/executed.
+
+### 3. Classification dimensions: source, workload, and deferred context
+
+Two independent, per-`SourceInstance` dimensions, computed once at row
+creation (pure suffix/path evidence, no file opened - extending the
+existing `classify_eligibility()` pattern rather than inventing a
+parallel classifier):
+
+```
+source_category:   LOOSE_FILE | ARCHIVE | SPECIAL          (physical - what IS it)
+workload_category: TEXT_DOCUMENT | STRUCTURED_DATA | MEDIA | CODE |
+                    SOFTWARE | ENCRYPTED | CONTAINER | UNKNOWN  (what will processing involve)
+```
+`source_category` stays strictly physical - a file under Syncthing,
+Takeout, "Archive 2", or a dated snapshot directory is still just a
+`LOOSE_FILE` or `ARCHIVE`; backup/sync/snapshot-tree naming is a
+**separate, explicitly deferred contextual signal** (its own field,
+its own versioned path-pattern list), not a peer of `source_category`.
+No literal path patterns are decided in this design pass.
+
+`CONTAINER` is the workload value for an archive's own row - it is
+never itself content (an already-established invariant), so it gets an
+explicit "this is a container" value rather than a guessed blend of
+its unopened members' eventual types.
+
+### 4. Two-stage archive policy
+
+```
+SOURCE ADMISSION POLICY  - decides whether the archive CONTAINER may
+                            enter a batch, using only pre-extraction
+                            evidence (declared size, source_category,
+                            risk_tier_estimated, compression type).
+                            Evaluated during selection, alongside loose
+                            files.
+ARCHIVE MEMBER POLICY    - applies AFTER extraction creates real member
+                            SourceInstance rows with real workload_category
+                            values. Evaluated at extraction time, inside
+                            the existing member-creation loop.
+```
+Unopened archive members never participate in the initial batch-selection
+predicate - batch envelope sizing at selection time is based solely on
+container-level rows, since members do not exist as `SourceInstance`
+rows until extraction (an execution-time event, not a selection-time
+one). This is consistent with, and reinforces, the extraction-staging
+model below.
+
+### 5. Risk tier - two-phase, honestly nullable
+
+```
+risk_tier_estimated  - selection-time. LOOSE_FILE/SPECIAL: fully knowable
+                        immediately from size + workload_category.
+                        ARCHIVE: necessarily conservative - only size and
+                        compression type are knowable pre-extraction.
+risk_tier_actual     - NULLABLE. Populated only once real evidence
+                        (member count, nesting depth, measured expansion
+                        ratio) actually exists. LOOSE_FILE/SPECIAL: set
+                        immediately, equal to the estimate. ARCHIVE: set
+                        only after extraction completes. If extraction
+                        fails BEFORE that evidence exists (malformed
+                        archive, envelope abort, T7 unavailable), 
+                        `risk_tier_actual` stays NULL - never fabricated
+                        as a stand-in value.
+```
+Values: `LOW | MEDIUM | HIGH | EXTREME`. Numeric boundaries are
+deliberately not decided here (see below).
+
+### 6. Resource envelope, extraction staging, embedding reservation, runtime accounting
+
+```
+batch_limits (stored on IngestionBatch, immutable once set):
+    max_source_instances, max_source_bytes   - enforceable at selection time
+    max_extracted_bytes, max_embeddings      - enforceable only as running
+                                                 counters, checked before
+                                                 every claim during execution
+    max_runtime_seconds
+```
+**Extraction** ("the first scaling limit should be the smallest limit
+reached", adopted verbatim): archives extract into an isolated
+per-item staging directory (`workspace_root/_staging/<source_instance_id>/`),
+never directly into the final location. Extracted bytes are monitored
+during extraction against the batch's remaining budget; if exceeded,
+the staging directory is deleted wholesale (zero partial artifacts
+survive), the claim is released **without** recording an
+`IngestionAttempt` (nothing was decided about the item - it wasn't
+corrupt, just deferred to a future batch), and the stop is recorded
+only on `IngestionBatch` (`stop_reason=EXTRACTED_BYTES_ENVELOPE_EXCEEDED`).
+
+**Embedding capacity** uses the same atomic-claim discipline already
+proven in `WorkerClaimService` - a single conditional `UPDATE`, not
+read-then-act:
+```sql
+UPDATE ingestion_batches
+SET embeddings_reserved = embeddings_reserved + :n
+WHERE id = :batch_id AND embeddings_reserved + :n <= max_embeddings
+RETURNING embeddings_reserved
+```
+No returned row = reservation denied = release the claim without
+embedding (same disposition as extraction overflow). A reservation is
+released back symmetrically if the underlying embedding call then
+fails anyway.
+
+**Runtime** budget is measured via `time.monotonic()` for stop
+decisions (immune to NTP/clock adjustment); durable wall-clock
+`started_at`/`completed_at` remain for audit only. Because a batch can
+pause and resume across process restarts, consumed runtime accumulates
+durably in `monotonic_runtime_seconds_consumed`, updated at each
+pause/stop from that session's monotonic delta.
+
+### 7. Batch state and work-item state are independent axes
+
+`IngestionBatch.status` (`PLANNED | RUNNING | PAUSED | COMPLETED |
+ABORTED`) plus `stop_reason`/`stop_reason_detail` are entirely
+independent of any `ContentIdentityGroup.pipeline_state` or
+`SourceInstance` state. A batch can pause on a resource limit while the
+item in flight is perfectly valid; a batch can keep running while an
+unrelated item genuinely fails. A batch report must always show both.
+
+### 8. Completion reporting - four denominators, not one percentage
+
+```
+eligible_source_count        - D0-derived universe size under this batch
+                                class's policy filter, before any take
+attempted_source_count       - subset of batch membership that received
+                                >=1 real processing claim (can be less
+                                than membership if the batch stopped early)
+terminal_source_count        - subset whose ContentIdentityGroup reached
+                                a terminal pipeline_state
+successful_ingestion_count   - subset of terminal specifically INGESTED
+```
+`FAILED` counts toward "processed at least once," never toward
+"successfully ingested" - it remains indefinitely retryable by
+construction, unchanged from the existing design.
+
+### 9. Resource monitoring - required checks vs. optional extension
+
+Required, using existing primitives, no new dependency: workspace disk
+(`shutil.disk_usage`, already used by `ArchiveExtractor`), PostgreSQL
+size (`pg_database_size()`), Ollama reachability (existing
+`EmbeddingClient`). Host CPU/RAM monitoring is defined as an **optional,
+pluggable** `BatchResourceGuard` extension point - `psutil` is
+deliberately **not** added as a dependency for this design; it may be
+adopted later as an optional implementation, never a prerequisite for
+freezing this architecture.
+
+### 10. Live corpus drift - three-way outcome, source bytes always authoritative
+
+```
+OBSERVED_AT_SELECTION           - D0's declared (path, size) - evidence only
+SOURCE_PRESENT_AT_EXECUTION     - exists, metadata matches D0's declaration
+SOURCE_CHANGED_AFTER_SELECTION  - exists, metadata differs - NOT an error;
+                                    read and hash proceed normally, the
+                                    mismatch is noted informationally in
+                                    evidence_snapshot
+SOURCE_MISSING_AT_EXECUTION     - the existing T7_UNAVAILABLE path, unchanged
+```
+Frozen invariant: **the source bytes actually read at ingestion time
+are authoritative for content identity; D0 metadata is selection
+evidence, not content authority.** A genuinely changed file is properly
+re-ingested as a new observation under a later `DiscoveryRun` (per
+point 1), not merely flagged as a same-batch anomaly.
+
+### Resulting new schema: one table, `ingestion_batches`
+
+```
+id, classification_run_id (FK, 1:1, exclusive per point 2)
+status                          # PLANNED / RUNNING / PAUSED / COMPLETED / ABORTED
+stop_reason (nullable), stop_reason_detail (nullable)
+max_source_instances, max_source_bytes, max_extracted_bytes,
+  max_embeddings, max_runtime_seconds        # immutable once set
+source_instances_selected, source_bytes_selected   # set at creation, immutable
+extracted_bytes_consumed, embeddings_reserved       # atomically-updated counters
+monotonic_runtime_seconds_consumed                   # durable cross-session accumulation
+selection_fingerprint, selection_policy_version, ordering_version
+created_at, started_at, completed_at        # wall-clock, audit-only
+```
+Plus four new columns on `SourceInstance`: `source_category`,
+`workload_category`, `risk_tier_estimated`, `risk_tier_actual`
+(nullable per point 5). No other schema changes.
+
+### Frozen architectural rules (final, consolidated)
+
+```
+D0 is the batch-selection universe; D1/D2 are enrichment signals, never the universe.
+Eligibility is scoped to the current DiscoveryRun's observations, not "ever touched, globally."
+path != physical occurrence != content identity.
+Selection is deterministic and reproducible from frozen report content.
+Every IngestionBatch owns exactly one dedicated, never-shared ClassificationRun.
+Batch membership is immutable once created; resume never re-runs selection.
+Source category is strictly physical (LOOSE_FILE | ARCHIVE | SPECIAL); backup/sync/snapshot
+  context is a separate, explicitly deferred signal, not a source_category peer.
+Workload category is attached per-SourceInstance at creation time; an unopened archive's own
+  row gets CONTAINER, never a guessed blend of its members.
+Archive admission (container-level) and archive member policy (post-extraction) are two
+  distinct evaluation stages; unopened members never affect initial batch-selection sizing.
+Risk tier is two-phase: an estimate at selection, an honestly nullable actual value populated
+  only once real post-extraction evidence exists - never fabricated on early failure.
+Archive source size does not equal downstream workload size.
+max_extracted_bytes is enforced via isolated per-item staging, discarded wholesale on overflow -
+  never a partial, durable extraction artifact.
+max_embeddings is enforced via the same atomic-claim discipline as WorkerClaimService, not
+  read-then-act.
+max_runtime uses a monotonic clock for decisions; wall-clock timestamps are audit-only.
+Batch state (IngestionBatch.status) and work-item state (pipeline_state) are independent axes.
+Completion is reported as four denominators, never one percentage.
+The source bytes read at ingestion time are always authoritative for content identity over
+  any D0 metadata.
+Host resource monitoring beyond disk/Postgres/Ollama is optional and pluggable; psutil is not
+  a dependency of this design.
+```
+
+### What this design pass does NOT decide
+
+- Numeric envelope defaults (batch size, extracted-bytes ceiling,
+  embedding count, runtime budget) for any specific batch.
+- Numeric risk-tier boundaries (to be derived from D0's actual size
+  distribution once decided, not invented).
+- The backup/sync/snapshot context field's exact structure and its
+  versioned path-pattern list.
+- Per-batch-class (the earlier "Batch A-G" sketch) policy filter
+  definitions - each is its own small design decision layered on top
+  of this frozen architecture, e.g. the sketch's "Batch F - backup/
+  snapshot collections" now composes `source_category` with the
+  (still-deferred) backup/sync context signal rather than being its
+  own `source_category` value.
+- Any implementation - this architecture is approved and frozen at the
+  conceptual/design level, but no code, schema migration, or T7 access
+  is authorized by this freeze. **Next gate, not yet authorized**: a
+  separate numeric/policy-definition pass (batch-class inclusion/
+  exclusion rules, size/risk thresholds, archive admission thresholds,
+  resource envelopes, promotion criteria) must be completed and
+  explicitly approved before an implementation design, and the real T7
+  remains outside the ingestion gate until then.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
