@@ -3306,17 +3306,189 @@ face value:
   candidate_files` vs `files_hashed` counting-gap mechanism, and two
   proving the symlink fix), full suite re-run and passed unchanged.
 
+## T7 Provenance-Aware Duplicate Analysis (Phase D2) — read-only
+
+A third, separate T7 gate, opened only after Phase D1 (`64887ba`) was
+committed. Purpose: understand WHY the duplicates D1 found exist -
+which look like distinct backup/export events, which show a naming
+asymmetry consistent with (but not proof of) a current-vs-historical
+relationship, which look intentionally independent, which are simply
+ambiguous - never to decide what should be deleted.
+
+**`app/discovery/provenance_analysis.py`** - the only new production
+code. Deliberately split into two independent stages so the expensive,
+T7-touching part never needs repeating just because the classification
+logic changes: `collect_path_signals(d1_report_path)` (the ONLY stage
+that touches the filesystem - a targeted, read-only `os.lstat` on
+exactly the paths D1 already named, never a fresh directory walk) and
+`classify(raw_data)` (a PURE function over already-collected data).
+`analyze_provenance()` runs both back to back for a fresh D1 report;
+`load_raw_from_previous_report()` + `classify()` re-derives a corrected
+analysis from an ALREADY-COMPLETED D2 report's own raw per-path data,
+with ZERO filesystem access - exactly the capability this milestone's
+own review pass needed and used (see below).
+
+**Review pass, before committing - a real naming/epistemics defect
+found and corrected, not merely a style pass.** The first version's
+classification codes doubled as both "which evidence pattern fired"
+AND "what that means" - e.g. `current_plus_historical` for "one
+copy's path carries a date/keyword, the other doesn't." That name
+itself asserts a temporal claim (something IS current, something IS
+historical) that the evidence does not support: a path lacking a
+dating convention is not proof a file is in active use - it may simply
+never have been placed in a dated folder. Corrected by separating the
+concerns completely:
+
+- **`inference_code`** now names only the EVIDENCE PATTERN, never the
+  interpretation: `DIVERGENT_DATE_SIGNAL`, `PARTIAL_DATE_OR_KEYWORD_
+  SIGNAL` (was `current_plus_historical`), `UNIFORM_KEYWORD_NO_
+  FURTHER_SIGNAL` (was `same_backup_generation`), `NO_PROVENANCE_
+  SIGNAL` (was `possibly_intentionally_independent`), `STALE_
+  REFERENCE_UNVERIFIABLE` (was `insufficient_current_evidence` - itself
+  renamed again after a first review pass fix still contained the word
+  "current"). A test (`test_inference_codes_do_not_assert_current_or_
+  historical_in_their_name`) asserts none of these codes contain
+  `current`, `historical`, or unqualified `backup`.
+- **Confidence downgraded where the evidence genuinely doesn't support
+  more**: `PARTIAL_DATE_OR_KEYWORD_SIGNAL` (the exact pattern the
+  review targeted) moved from `medium` to `low`, with `requires_human_
+  review` now `True` for it - a single asymmetric naming signal is
+  meaningfully weaker than `DIVERGENT_DATE_SIGNAL`'s two independently-
+  plausible, differing calendar dates, which remains the only
+  `medium`-confidence code. On the real corpus this moved 50,970
+  groups from "medium, not flagged" to "low, flagged for review."
+- **Prose is rendered separately, never stored per group**:
+  `INFERENCE_PROSE` is a module-level lookup from `inference_code` to
+  hedged human-readable text (e.g. `PARTIAL_DATE_OR_KEYWORD_SIGNAL`'s
+  prose explicitly states "the absence of a date or keyword... is NOT
+  proof that a file is currently in active use" and "does not
+  establish which copy, if any, is 'current'"). Report generators
+  render prose on demand; the compact JSON stores only the short code.
+
+**The required distinction stays three explicit fields, never
+collapsed**: `structured_facts` (OBSERVED FACT - a `StructuredFacts`
+dataclass: counts of dated/undated/keyword-bearing paths, the actual
+distinct date strings found, depth range - aggregated rather than
+repeated per path), `inference_code` + its `INFERENCE_PROSE` rendering
+(INFERENCE), and `confidence` (`medium`/`low`, reflecting how many
+independent signals agree, never certainty).
+
+**Signals used** (all path-text or metadata, nothing content-based):
+date-like tokens (DDMMYYYY, this corpus's own convention, tried first;
+YYYYMMDD fallback for Google-Takeout-style names; both range-validated
+before acceptance), historical/backup keywords (`archive`, `backup`,
+`as a copy of`, `old`, `_duplicates_quarantine`, `.trash`, `sync-
+conflict`, `takeout-`) and current-sounding keywords (`current`,
+`latest`, `working`), and path depth (component count).
+
+**Classification rules, in priority order**, each an explicit
+INFERENCE:
+1. **`DIVERGENT_DATE_SIGNAL`** (medium): 2+ *different* date-like
+   tokens across the group's copies.
+2. **`PARTIAL_DATE_OR_KEYWORD_SIGNAL`** (low, review required): copies
+   share at most one distinct date token but at least one copy has
+   none - OR a historical keyword appears on a deeper path while a
+   shallower sibling carries none. States only that an ASYMMETRY
+   exists, never which copy is current.
+3. **`UNIFORM_KEYWORD_NO_FURTHER_SIGNAL`** (low, review required): a
+   historical keyword appears somewhere, nothing else distinguishes
+   the copies.
+4. **`NO_PROVENANCE_SIGNAL`** (low, review required): no date token and
+   no keyword anywhere - absence of a signal is weak evidence, never a
+   safety conclusion.
+5. **`STALE_REFERENCE_UNVERIFIABLE`** (low, review required): fewer
+   than two of the group's D1-named paths still existed when D2
+   checked - D1's finding can't be corroborated and no interpretation
+   is offered.
+
+**Category preserved, provenance meaning never implied to be
+identical across categories**: `group_kind` (`exact_duplicate` /
+`cryptomator_chunk_duplicate` / `directory_duplicate`) is carried on
+every `GroupProvenance` record, and the report's own JSON carries a
+`cryptomator_chunk_provenance_note` stating explicitly that `.c9r`
+matches are CIPHERTEXT chunk matches, not plaintext document matches,
+and must never be reasoned about the same way as `exact_duplicate_
+provenance` entries even when they share an `inference_code`.
+
+**Question 8 (overlap)**: `overlaps_directory_group` names the D1
+directory-group signature a file-level group's paths sit entirely
+inside, if any - connecting the file-level and directory-level
+evidence for the same underlying duplication rather than leaving them
+disconnected.
+
+**Live-corpus semantics, stated precisely, not overstated**: D1 ran
+while Syncthing was actively modifying the corpus; D2's own reads
+happened in a SEPARATE pass, roughly two hours later, while Syncthing
+remained continuously active throughout both. On the real run, all
+582,951 D1-named paths were still observable when D2 checked them
+(`paths_no_longer_existing=0`) - **this states only that path
+existence was confirmed, and must not be read as proof the corpus, or
+any specific file's content, was unchanged between D1 and D2**. A
+file's bytes could change without its mere existence changing, and
+D2's own hash-free design (see below) cannot detect that. The report's
+own `_read_this_first` field states this distinction verbatim, not
+merely as prose elsewhere.
+
+**Human review framing, stated precisely**: every `low`-confidence
+finding's role is "requires independent human provenance review,"
+never "likely safe to remove" - the report disclaimer says so
+explicitly, and no prose anywhere in `INFERENCE_PROSE` uses "safe to
+remove"/"safe to delete" language (enforced by a dedicated test).
+
+**Report size reduced 62.6%** (498.4MB → 186.6MB on the real corpus) by
+removing what the review identified as unnecessary duplication:
+per-path `mtime`/`ctime` (collected but never actually used by any
+classification rule - Syncthing's rewriting of timestamps on sync
+makes cross-copy mtime comparison unreliable on this corpus anyway),
+and the repeated inference PROSE paragraph previously stored on every
+one of 67,727 groups (now a single shared lookup table, rendered on
+demand). The remaining size is dominated by the corpus's own scale -
+582,951 individual path strings are the actual evidence and cannot be
+reduced without losing it.
+
+**Runner**: `scripts/t7_provenance_analysis.py collect <d1_report.json>
+<output.json> <summary.txt>` for a fresh run, or `... reclassify
+<previous_report.json> <d1_report.json> <output.json> <summary.txt>`
+to re-derive a corrected report from an already-completed one with
+zero filesystem access - used for real to produce this milestone's
+final corrected report from the original (pre-review) real run's raw
+data, without a second ~14-minute `os.lstat` pass over the T7.
+
+**Tests**: 34 (up from 24 after the review pass), entirely synthetic -
+date-token extraction, the naming-neutrality invariant on every
+inference code, every classification rule including the corrected
+low-confidence/review-required framing for the asymmetric-signal case,
+the "does not establish which copy is current" prose assertion, live-
+corpus divergence, Cryptomator-chunk separation (including the report-
+level ciphertext-scoping note), directory-group provenance, file/
+directory overlap detection, the compact-schema assertions (no `mtime`/
+`ctime` serialized, codes not prose stored per group), the two-stage
+pipeline's pure-function property (`classify()` needs no filesystem
+access), and `load_raw_from_previous_report`'s reconstruction (plus its
+explicit refusal when pointed at an already-compact report with
+nothing left to reconstruct).
+
+**Deliberately not built this milestone**: any deletion, move, rename,
+quarantine, or archive extraction; any invocation of `DedupFilesystem
+Executor`; any authorization creation; any automatic choice of a
+canonical/keeper file; any automatic deletion marking. **The T7 was
+only ever read via `os.lstat` for this milestone** - no file was
+opened, written to, moved, renamed, deleted, or otherwise modified. The
+real corpus was NOT re-scanned to correct the classification defect
+above - the fix was re-derived entirely from already-collected data.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
 - `knowledge/` — reserved for curated/derived knowledge artifacts
-  (future); `knowledge/t7_discovery/` holds T7 corpus inventory AND
-  duplicate-analysis reports specifically, gitignored since they
-  contain real personal file/directory names.
+  (future); `knowledge/t7_discovery/` holds T7 corpus inventory,
+  duplicate-analysis, AND provenance-analysis reports specifically,
+  gitignored since they contain real personal file/directory names.
 - `postgres/`, `redis/` — data directories for the Dockerized services.
 - `logs/`, `config/`, `prompts/` — reserved, currently empty.
-- `scripts/t7_discovery.py`, `scripts/t7_duplicate_analysis.py` — the
-  T7 Corpus Discovery and Deduplication Analysis runners (see above);
+- `scripts/t7_discovery.py`, `scripts/t7_duplicate_analysis.py`,
+  `scripts/t7_provenance_analysis.py` — the T7 Corpus Discovery,
+  Deduplication Analysis, and Provenance Analysis runners (see above);
   otherwise reserved, currently empty.
 
 ## Open/planned areas

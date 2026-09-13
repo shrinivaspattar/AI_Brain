@@ -1042,6 +1042,86 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       condition never existed on the actual T7 data — no re-scan was
       needed or performed. 3 new tests from this review pass; full
       suite 597 tests.
+- [x] T7 Provenance-Aware Duplicate Analysis (Phase D2) — read-only, a
+      third separate gate opened only after D1 (`64887ba`) was
+      committed. Purpose: understand WHY D1's duplicates exist — backup
+      generations, current-plus-historical pairs, intentionally
+      independent copies, or genuinely ambiguous cases — never to
+      decide what should be deleted. New module `app/discovery/
+      provenance_analysis.py`: `analyze_provenance()` does not re-walk
+      or re-hash the corpus — it reads D1's `duplicate_analysis.json`
+      as established fact, then performs a targeted, read-only
+      `os.lstat` on exactly the paths D1 already named. Every
+      conclusion is labeled across three explicit tiers: OBSERVED FACT
+      (path text, directory structure, a fresh `lstat`), INFERENCE
+      (what that might mean — always "this suggests," never settled
+      fact), and CONFIDENCE (high/medium/low). Classification rules in
+      priority order: differing date-like tokens across copies →
+      cross_generation_backup_copies (medium); one dated + one undated
+      copy, or a keyword on a deeper path with none on a shallower
+      sibling → current_plus_historical (medium); a shared keyword with
+      nothing further distinguishing the copies → same_backup_
+      generation (low, flagged for review); no signal at all →
+      possibly_intentionally_independent (low, flagged — absence of a
+      signal is weak evidence, not a safety conclusion); fewer than two
+      of a group's D1-named paths still existing → insufficient_
+      current_evidence (low, flagged — D1's finding can't be
+      corroborated against the corpus's current state). Question 8
+      (overlap) answered directly: each file-level group is checked
+      against D1's own directory-duplicate groups to see whether it
+      sits entirely inside an already-reported structural match.
+      Live-corpus divergence handled explicitly (D1 ran while Syncthing
+      was active; D2's own reads happen later) — every vanished/moved
+      path is its own recorded fact, never silently reasoned from a
+      known-stale snapshot. The report's own JSON carries a
+      `_read_this_first` disclaimer stating D2 is forensic
+      interpretation, not a deletion recommendation. Runner:
+      `scripts/t7_provenance_analysis.py <d1.json> <output.json>
+      <summary.txt>` — writes both machine-readable JSON and a
+      human-readable top-10-by-reclaimable-bytes summary per category.
+      24 new tests, entirely synthetic. Full suite: 621 tests. **The T7
+      was only ever read via `os.lstat`** — no file opened, written to,
+      moved, renamed, deleted, or otherwise modified. Deliberately not
+      built: any deletion/move/rename/quarantine/extraction; any
+      `DedupFilesystemExecutor` invocation; any authorization creation;
+      any automatic canonical-file choice or deletion marking.
+      **Reviewed before commit, per explicit request** — found a real
+      naming/epistemics defect, not a style nit: the original
+      classification codes doubled as both "which evidence pattern
+      fired" and "what that means," so `current_plus_historical`
+      (one dated/keyword-marked copy + one undated one) asserted a
+      temporal claim the evidence doesn't support — a path lacking a
+      dating convention is not proof a file is in active use. Fixed by
+      splitting every classification into a neutral `inference_code`
+      (naming only the evidence pattern — `DIVERGENT_DATE_SIGNAL`,
+      `PARTIAL_DATE_OR_KEYWORD_SIGNAL`, `UNIFORM_KEYWORD_NO_FURTHER_
+      SIGNAL`, `NO_PROVENANCE_SIGNAL`, `STALE_REFERENCE_UNVERIFIABLE`)
+      and separately-rendered hedged prose (`INFERENCE_PROSE`, never
+      stored per group). The exact pattern under review
+      (`PARTIAL_DATE_OR_KEYWORD_SIGNAL`) was downgraded from medium to
+      low confidence with human review now required — on the real
+      corpus this moved 50,970 groups from "medium, unflagged" to "low,
+      flagged." Pipeline also split into two independent stages
+      (`collect_path_signals` — the only T7-touching step — and a pure
+      `classify()`), specifically so this correction could be re-run
+      against the real, already-collected corpus data with **zero
+      additional T7 access** via a new `load_raw_from_previous_report`
+      reconstruction path — confirmed via the real run: 12.9 seconds,
+      not a second ~14-minute `os.lstat` pass. Report size cut 62.6%
+      (498.4MB → 186.6MB) by dropping unused per-path `mtime`/`ctime`
+      and the previously-repeated inference prose. Documentation now
+      states precisely (not merely implies): all D1-referenced paths
+      being observable during D2 does NOT prove the corpus was
+      unchanged between the two runs (D2 ran ~2 hours after D1, with
+      Syncthing continuously active throughout both); low-confidence
+      findings mean "requires human provenance review," never "likely
+      safe to remove" (enforced by a dedicated test asserting no
+      "safe to remove"/"safe to delete" language anywhere in the
+      rendered prose); `.c9r` provenance stays explicitly scoped to
+      ciphertext chunks via a report-level note. 10 new tests from this
+      review pass (34 total for this module). Full suite: 631 tests.
+      **The real corpus was NOT re-scanned to fix the defect** — the
+      correction was re-derived entirely from already-collected data.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
