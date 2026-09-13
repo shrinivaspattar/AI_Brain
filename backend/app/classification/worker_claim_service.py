@@ -1,0 +1,168 @@
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
+
+from app.models.content_identity_group import ContentIdentityGroup, ContentPipelineState
+from app.models.source_instance import SourceInstance
+
+
+class WorkerClaimService:
+    """Claims/releases work for the two identity-resolution and
+    pipeline-advance queues described in "Controlled T7 -> AI_Brain
+    Ingestion Design" (`6491dad`), rounds 1-2. Provides only the
+    concurrency-safe claiming PRIMITIVE - no ingestion pipeline logic
+    (extraction/normalization/chunking/embedding) is implemented here
+    or anywhere in this schema-extension milestone; a future,
+    separately-authorized gate builds the actual pipeline on top of
+    these primitives.
+
+    Claim mechanism: `SELECT ... FOR UPDATE SKIP LOCKED` (a row a
+    second concurrent caller has already locked is skipped, never
+    blocked on and never double-claimed) followed by an `UPDATE` in the
+    SAME transaction - the row lock held by the SELECT is what makes
+    this safe under real concurrency, not merely careful sequencing.
+    This generalizes Chain 1's own `SELECT ... FOR UPDATE` execution-
+    claiming primitive to a queue rather than a single-shot claim - it
+    does not reuse Chain 1's state machine.
+
+    A claim is considered stale - reclaimable by ANY worker, including
+    a different one than originally claimed it - once `claimed_at` is
+    older than `lease_duration`. There is no separate "recovery
+    service": the same claim query that grants fresh work also
+    reclaims stale work, by construction (the `WHERE claimed_by IS NULL
+    OR claimed_at < :stale_before` clause below covers both cases in
+    one query).
+
+    `claimed_by`/`claimed_at` are cleared by `release_*` on every
+    attempt's completion, success or failure - they are a transient,
+    in-flight marker, never a permanent record. Permanent history
+    belongs to `IngestionAttempt` (see `IngestionAttemptService`).
+    """
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def claim_content_identity_group(
+        self,
+        *,
+        worker_id: str,
+        eligible_pipeline_states: list[ContentPipelineState],
+        lease_duration: timedelta,
+        claiming_pipeline_state: ContentPipelineState | None = None,
+    ) -> ContentIdentityGroup | None:
+        """Claims one ContentIdentityGroup whose pipeline_state is in
+        `eligible_pipeline_states` and whose claim (if any) is stale.
+
+        `claiming_pipeline_state`, when given, is written atomically
+        alongside the claim - used for the one step the frozen
+        `ContentPipelineState` enum has an explicit in-progress marker
+        for (`EXTRACTING`, claimed FROM `CLASSIFIED`). Every other step
+        leaves `pipeline_state` at its current (completed-previous-
+        step) value for the duration of the claim - `claimed_at` alone
+        is the in-progress signal for those steps, since the frozen
+        enum has no NORMALIZING/CHUNKING/EMBEDDING equivalent and this
+        schema-extension gate does not add one.
+
+        Returns None if no eligible, unclaimed-or-stale row exists.
+        """
+        stale_before = datetime.now(UTC) - lease_duration
+
+        candidate_id = self.db.execute(
+            select(ContentIdentityGroup.id)
+            .where(
+                ContentIdentityGroup.pipeline_state.in_(eligible_pipeline_states),
+                (ContentIdentityGroup.claimed_by.is_(None))
+                | (ContentIdentityGroup.claimed_at < stale_before),
+            )
+            .order_by(ContentIdentityGroup.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ).scalar_one_or_none()
+
+        if candidate_id is None:
+            return None
+
+        values: dict = {
+            "claimed_by": worker_id,
+            "claimed_at": datetime.now(UTC),
+        }
+        if claiming_pipeline_state is not None:
+            values["pipeline_state"] = claiming_pipeline_state
+
+        self.db.execute(
+            update(ContentIdentityGroup)
+            .where(ContentIdentityGroup.id == candidate_id)
+            .values(**values)
+        )
+        self.db.commit()
+
+        return self.db.get(ContentIdentityGroup, candidate_id)
+
+    def release_content_identity_group_claim(
+        self,
+        group_id: int,
+        *,
+        new_pipeline_state: ContentPipelineState | None = None,
+    ) -> None:
+        """Clears a group's claim, optionally advancing pipeline_state
+        in the same statement (the normal "attempt finished" path)."""
+        values: dict = {"claimed_by": None, "claimed_at": None}
+        if new_pipeline_state is not None:
+            values["pipeline_state"] = new_pipeline_state
+
+        self.db.execute(
+            update(ContentIdentityGroup)
+            .where(ContentIdentityGroup.id == group_id)
+            .values(**values)
+        )
+        self.db.commit()
+
+    def claim_source_instance_for_identity_resolution(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+    ) -> SourceInstance | None:
+        """Claims one root-level SourceInstance needing identity
+        resolution: content_identity_group_id IS NULL. Archive-member
+        instances are never claimed here - per the frozen design, an
+        archive's members are all discovered/resolved together as part
+        of claiming and processing the parent archive as one unit, not
+        individually."""
+        stale_before = datetime.now(UTC) - lease_duration
+
+        candidate_id = self.db.execute(
+            select(SourceInstance.id)
+            .where(
+                SourceInstance.content_identity_group_id.is_(None),
+                (SourceInstance.claimed_by.is_(None))
+                | (SourceInstance.claimed_at < stale_before),
+            )
+            .order_by(SourceInstance.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ).scalar_one_or_none()
+
+        if candidate_id is None:
+            return None
+
+        self.db.execute(
+            update(SourceInstance)
+            .where(SourceInstance.id == candidate_id)
+            .values(claimed_by=worker_id, claimed_at=datetime.now(UTC))
+        )
+        self.db.commit()
+
+        return self.db.get(SourceInstance, candidate_id)
+
+    def release_source_instance_claim(self, instance_id: int) -> None:
+        """Clears a SourceInstance's identity-resolution claim. Does
+        NOT touch content_identity_group_id - that remains write-once,
+        set only via ContentIdentityService.assign_content_identity."""
+        self.db.execute(
+            update(SourceInstance)
+            .where(SourceInstance.id == instance_id)
+            .values(claimed_by=None, claimed_at=None)
+        )
+        self.db.commit()

@@ -77,6 +77,21 @@ class SourceInstance(Base):
     treated as if it were part of `evidence_snapshot`. The two live in
     genuinely different columns specifically so this distinction can
     never be blurred.
+
+    WORKER CLAIM/LEASE FIELDS (added per "Controlled T7 -> AI_Brain
+    Ingestion Design", `6491dad`, round 2, point 2 - schema-extension
+    gate): `claimed_by`/`claimed_at` exist ONLY for the identity-
+    resolution queue - a root-level instance (`content_identity_
+    group_id IS NULL`, no parent link) whose content has never been
+    read/hashed, e.g. a uniquely-sized loose T7 file D1 never hashed.
+    Archive-member instances never use these fields: per the frozen
+    design, the unit of claiming for an archive is its own parent
+    `SourceInstance` (or, once one exists, its `ContentIdentityGroup`),
+    not each member individually - one worker opens the archive once
+    and creates/resolves every member's identity inside that single
+    claimed unit of work. Same transient-marker semantics as
+    `ContentIdentityGroup.claimed_by`/`claimed_at`: cleared on every
+    attempt's completion, permanent history lives in `IngestionAttempt`.
     """
 
     __tablename__ = "source_instances"
@@ -150,6 +165,13 @@ class SourceInstance(Base):
     )
 
     canonical_status_decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Identity-resolution claim fields - see class docstring. Only ever
+    # used for root-level, unhashed instances.
+    claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 

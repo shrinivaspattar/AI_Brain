@@ -5740,6 +5740,161 @@ these, even though none is implemented in this pass):
   designs; no new scan, hash, or read of either T7 path occurred to
   produce it.
 
+## Ingestion Schema-Extension Implementation: worker claims + IngestionAttempt
+
+An eighth T7 gate, opened after the Controlled T7 → AI_Brain Ingestion
+Design froze at `6491dad`. Implements exactly the two schema
+extensions that design recommended - worker claim/lease fields and a
+durable per-attempt failure record - and nothing else. No T7 access,
+no extraction, no embeddings, no real ingestion jobs, no ingestion
+pipeline logic, no logical document/version semantics, no API/UI.
+
+### What was built
+
+**`ContentIdentityGroup`** gains `claimed_by` (nullable text) and
+`claimed_at` (nullable timestamptz) - a transient, in-flight marker,
+cleared on every attempt's completion (success or failure), never a
+permanent record. Because the frozen `pipeline_state` enum has an
+explicit in-progress marker for exactly one step (`EXTRACTING`) and
+none for normalization/chunking/embedding, `claimed_by`/`claimed_at`
+serve as the uniform in-progress signal across every step: claiming
+for extraction also advances `pipeline_state` to `EXTRACTING` in the
+same atomic statement (reusing the existing enum value as intended);
+every other step leaves `pipeline_state` at its previous completed
+value for the duration of a claim.
+
+**`SourceInstance`** gains the same two columns, used only for
+root-level, unhashed instances (`content_identity_group_id IS NULL`,
+no parent link) - a uniquely-sized loose T7 file D1 never hashed.
+Archive-member instances never use these fields: per the frozen
+design, the claiming unit for an archive is its own parent
+`SourceInstance`, not each member individually.
+
+**`IngestionAttempt`** (new table) - one durable, immutable audit row
+per attempt, matching this codebase's existing one-row-per-event
+precedent (`DedupExecutionActionAudit`, `DiscoveryRun`,
+`ClassificationRun`) rather than mutable "latest failure" columns.
+Recorded for every attempt, success or failure, so full retry history
+is always reconstructable. Correct parent relationship: exactly one of
+`content_identity_group_id` (`PIPELINE_ADVANCE` attempts) or
+`source_instance_id` (`IDENTITY_RESOLUTION` attempts) is set, enforced
+by `ck_ingestion_attempts_parent_matches_kind` - mirroring
+`DuplicateReview`'s existing "exactly one of content_hash/similarity,
+depending on match_type" pattern rather than a generic polymorphic
+association table. `failure_code` (a small controlled vocabulary
+matching the failure/retry matrix from `6491dad` exactly - corrupt
+input, malformed archive, oversized/expansion-limit, extraction/
+normalization/chunking error, embedding unavailable, T7 unavailable,
+insufficient disk space, permission denied, other read error),
+`failure_detail`, and `retryable` are populated if and only if
+`outcome = FAILED`, enforced by `ck_ingestion_attempts_failure_
+requires_detail` - mirroring `SourceInstance.canonical_status`'s own
+evidence-required constraint. Never populated for, and never confused
+with, `EXCLUDED`/`UNSUPPORTED`/`NEEDS_REVIEW` - those `ContentPipelineState`
+values carry their own, different reasoning elsewhere.
+
+**`app/classification/worker_claim_service.py`** (`WorkerClaimService`)
+- the concurrency-safe claiming primitive: `SELECT ... FOR UPDATE SKIP
+LOCKED` (a row a concurrent caller has already locked is skipped, never
+blocked on and never double-claimed) followed by an `UPDATE` in the
+same transaction, generalizing Chain 1's own execution-claiming
+primitive to a queue rather than a single-shot claim - not a reuse of
+Chain 1's state machine. A claim is stale, and reclaimable by any
+worker, once `claimed_at` is older than a caller-supplied
+`lease_duration` - the same query that grants fresh work also
+reclaims stale work; no separate recovery service exists or is needed.
+`claim_content_identity_group`/`release_content_identity_group_claim`
+and `claim_source_instance_for_identity_resolution`/
+`release_source_instance_claim` cover both queues.
+
+**`app/classification/ingestion_attempt_service.py`**
+(`IngestionAttemptService`) - records outcomes a caller already
+determined; performs no extraction, normalization, chunking, or
+embedding itself. `record_pipeline_attempt`/`record_identity_
+resolution_attempt`, both validating that a `FAILED` outcome always
+carries `failure_code`/`failure_detail`/`retryable` - enforced twice,
+once in Python (a clear `ValueError` before ever reaching the
+database) and once by the DB `CHECK` constraint (so a direct-insert
+caller bypassing this service is still refused).
+
+### Migration `fd9f81672e59` (`b9a82d073399` → `fd9f81672e59`)
+
+Purely additive: two new nullable columns each on
+`content_identity_groups`/`source_instances`, one new table. Applied
+and verified against `aibrain_test` only - `upgrade` → `downgrade` →
+`upgrade` all ran cleanly; `\d` on every affected table confirmed every
+column and constraint landed exactly as designed. The main `aibrain`
+database's Alembic head remains untouched.
+
+### Concurrency proof (the explicitly non-negotiable requirement for this gate)
+
+Real Postgres, real separate sessions/threads, never mocked - matching
+the same standard already applied to Chain 1's `execute()` race test
+and to `ContentIdentityService.get_or_create_group`:
+
+- **Concurrent claims on one group**: two threads race for the same
+  eligible `ContentIdentityGroup` - exactly one wins, the other gets
+  `None` back cleanly, never a corrupted or double claim.
+- **Ten workers racing for five groups**: every group claimed exactly
+  once total; no two workers ever claim the same group; verified via a
+  fresh connection's `COUNT(DISTINCT claimed_by)`, not just the ORM's
+  local view.
+- **Stale-claim recovery under concurrency**: a claim aged past its
+  lease is reclaimed by exactly one of two competing fresh workers -
+  the crashed worker's identity never persists as the final claimant.
+- **Competing workers across a mixed pool**: one unclaimed, one
+  freshly (actively) claimed, one stale-claimed group, processed by
+  six concurrent workers simultaneously - the actively-claimed group is
+  never touched, the other two are claimed exactly once between them,
+  proving the claim query's three-way `WHERE` logic holds under real
+  contention, not only in isolated single-case tests.
+- **Failure-attempt persistence under concurrency**: eight workers
+  concurrently recording attempts for eight different groups - zero
+  errors, all eight rows durably persisted.
+- **Retry-history idempotency**: five concurrent, valid retry attempts
+  for the SAME group all persist as independent rows (none lost, none
+  merged); a parallel test proves the service's failure-field
+  validation still guards every concurrent caller, not only sequential
+  ones - five concurrent invalid calls all correctly raise `ValueError`
+  and persist zero rows.
+
+All 7 concurrency tests passed 15/15 consecutive runs with no
+flakiness. `aibrain_test` confirmed empty of synthetic rows after every
+run (this milestone's tests use direct `psql`-style verification via a
+fresh connection, plus the existing `join_transaction_mode=
+"create_savepoint"` isolation pattern for the non-concurrency tests).
+
+### Full suite
+
+**687 passed, 1 skipped**, run three times, zero flakiness (659
+pre-existing + 28 new: 21 schema/service tests, 7 concurrency tests).
+The main `aibrain` database's schema and Alembic head (`ef65da409302`)
+remain untouched throughout implementation and verification. No T7
+access of any kind occurred - `/media/personal/Seenu_T7SSD` and
+`/media/personal/Seenu_T7SSD1` were neither read from nor written to.
+
+### What this implementation pass explicitly does NOT include
+- Any ingestion pipeline logic (extraction, normalization, chunking,
+  embedding) - the claim/attempt primitives exist for a future,
+  separately-authorized pipeline gate to call, not to be called by
+  anything built in this milestone.
+- Any real ingestion job, real `ImportJob` row for a T7 source, or the
+  `source_type` allow-list hardening `6491dad` recommended for
+  `FileAccessService` (a code change to an existing service, not a
+  schema extension - deferred to the implementation gate that actually
+  needs it).
+- A `superseded_by_classification_run_id`-style field for future
+  reclassification of `UNSUPPORTED`/`EXCLUDED`/`NEEDS_REVIEW` groups -
+  still named, still not added.
+- Any exact lease-duration value beyond what individual call sites
+  pass as a parameter - no default policy is baked into the schema or
+  services; a future pipeline gate chooses its own lease durations per
+  call.
+- Logical document/version identity (identity layers 3/4) - unchanged,
+  still deferred.
+- Any API routes, Pydantic schemas, or UI for any of this - not
+  requested, not built.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

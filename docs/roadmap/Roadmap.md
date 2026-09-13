@@ -1496,6 +1496,50 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       opened, and still requiring its own schema-extension gate first
       for the `claimed_by`/`claimed_at`/failure-detail fields this
       design recommends but does not add.
+- [x] Ingestion Schema-Extension Implementation — implements exactly
+      the two extensions `6491dad` recommended: worker claim/lease
+      fields and a durable per-attempt failure record. No T7 access, no
+      extraction, no embeddings, no real ingestion jobs, no pipeline
+      logic. `ContentIdentityGroup` and `SourceInstance` each gain
+      `claimed_by`/`claimed_at` (transient in-flight markers, cleared
+      on every attempt's completion); new `IngestionAttempt` table
+      (one durable row per attempt, matching this codebase's existing
+      `DedupExecutionActionAudit`/`DiscoveryRun` one-row-per-event
+      precedent) with `attempt_kind`/`attempted_stage`/`outcome`/
+      `failure_code`/`failure_detail`/`retryable`/`worker_id`, and two
+      `CHECK` constraints: exactly one of `content_identity_group_id`/
+      `source_instance_id` set matching `attempt_kind`
+      (`ck_ingestion_attempts_parent_matches_kind`, mirroring
+      `DuplicateReview`'s existing "exactly one of two fields depending
+      on kind" pattern), and failure fields present iff `outcome =
+      FAILED` (`ck_ingestion_attempts_failure_requires_detail`,
+      mirroring `SourceInstance.canonical_status`'s own evidence-
+      required constraint). New `app/classification/worker_claim_
+      service.py` (`SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE`,
+      generalizing Chain 1's claiming primitive without reusing its
+      state machine; lease-expiry alone recovers stale claims, no
+      separate recovery service) and `ingestion_attempt_service.py`
+      (records outcomes a caller determined, validates failure fields
+      in Python before the DB CHECK ever has to). Migration
+      `fd9f81672e59` (`b9a82d073399` → `fd9f81672e59`), purely
+      additive, applied and verified against `aibrain_test` only.
+      **Concurrency required and delivered, not assumed**: 7 real
+      Postgres, real-thread tests — one-winner claim races (2 and 10
+      concurrent workers), stale-claim recovery under contention, a
+      mixed fresh/stale/unclaimed pool proving the claim query's
+      three-way logic holds under real load, concurrent attempt
+      persistence across 8 workers/8 groups, and retry-history
+      idempotency (5 concurrent valid retries all persist independently;
+      5 concurrent invalid retries all correctly rejected, zero rows
+      persisted) — 15/15 consecutive runs, no flakiness. Full suite:
+      **687 passed, 1 skipped**, run three times, zero flakiness (659
+      pre-existing + 28 new). Main `aibrain` database untouched, still
+      at `ef65da409302`. See `AI_Brain_Architecture.md`'s "Ingestion
+      Schema-Extension Implementation" section for the full report.
+      **Next gate, not yet authorized**: the actual ingestion pipeline
+      (extraction/normalization/chunking/embedding) built on these
+      primitives — still no T7 access, real ingestion jobs, or
+      embeddings until that is separately opened.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

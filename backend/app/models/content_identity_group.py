@@ -3,7 +3,7 @@ from enum import Enum
 
 from sqlalchemy import DateTime
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy import Integer, String, UniqueConstraint
+from sqlalchemy import Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -66,6 +66,33 @@ class ContentIdentityGroup(Base):
     + `identity_hash`) so two different hash layers can never be
     silently compared as if they were the same namespace, even though
     this milestone only ever populates one combination.
+
+    WORKER CLAIM/LEASE FIELDS (added per the "Controlled T7 -> AI_Brain
+    Ingestion Design", `6491dad`, round 2, point 1 - schema-extension
+    gate): `claimed_by`/`claimed_at` are a transient, in-flight marker,
+    NOT a permanent "who last touched this" record - both are cleared
+    the moment an attempt finishes, success or failure. Permanent
+    per-attempt history (who, when, what stage, outcome) lives in
+    `IngestionAttempt` instead (see that model), never here. A claim is
+    considered stale (reclaimable by any worker, including a different
+    one than originally claimed it) once `claimed_at` is older than
+    whatever lease duration the claiming query uses - no separate
+    "recovery service" exists or is needed: the same claim query that
+    grants fresh work also reclaims stale work, by construction (see
+    `app.classification.worker_claim_service`).
+
+    Because the frozen `pipeline_state` enum has an explicit in-progress
+    marker for exactly one step (`EXTRACTING`) but none for
+    normalization/chunking/embedding, this design uses `claimed_by`/
+    `claimed_at` as the UNIFORM in-progress signal across every step:
+    for extraction, claiming ALSO advances `pipeline_state` to
+    `EXTRACTING` in the same atomic statement (reusing the existing
+    enum value as intended); for every other step, `pipeline_state`
+    stays at the previous step's completed value (e.g. `EXTRACTED`)
+    for the entire duration a claim is held, and only advances on
+    success. This asymmetry is inherited from the already-frozen enum,
+    not introduced by this schema-extension gate - documented here so
+    it is never mistaken for an oversight.
     """
 
     __tablename__ = "content_identity_groups"
@@ -101,6 +128,13 @@ class ContentIdentityGroup(Base):
         nullable=False,
         default=ContentPipelineState.DISCOVERED,
         server_default=ContentPipelineState.DISCOVERED.name,
+    )
+
+    # Transient in-flight marker - see class docstring. Cleared on every
+    # attempt's completion (success or failure), never a permanent record.
+    claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(

@@ -19,6 +19,13 @@ from app.models.discovery_run import DiscoveryRun, DiscoveryRunKind
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.import_job import ImportJob
+from app.models.ingestion_attempt import (
+    IngestionAttempt,
+    IngestionAttemptKind,
+    IngestionAttemptOutcome,
+    IngestionAttemptStage,
+    IngestionFailureCode,
+)
 from app.models.memory import Memory
 from app.models.message import Message
 from app.models.provenance_link import ProvenanceLink, ProvenanceLinkKind
@@ -48,6 +55,11 @@ __all__ = [
     "DuplicateReview",
     "DuplicateReviewMember",
     "ImportJob",
+    "IngestionAttempt",
+    "IngestionAttemptKind",
+    "IngestionAttemptOutcome",
+    "IngestionAttemptStage",
+    "IngestionFailureCode",
     "Memory",
     "Message",
     "ProvenanceLink",
