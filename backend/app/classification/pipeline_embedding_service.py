@@ -71,7 +71,7 @@ class PipelineEmbeddingService:
         try:
             self._embed_claimed_group(group, worker_id=worker_id)
         except Exception:
-            self.claims.release_content_identity_group_claim(group.id)
+            self.claims.release_content_identity_group_claim(group.id, claim_generation=group.claim_generation)
             raise
 
         self.db.refresh(group)
@@ -140,7 +140,9 @@ class PipelineEmbeddingService:
             if remaining_unembedded == 0
             else ContentPipelineState.EMBEDDED
         )
-        self.claims.release_content_identity_group_claim(group.id, new_pipeline_state=final_state)
+        self.claims.release_content_identity_group_claim(
+            group.id, claim_generation=group.claim_generation, new_pipeline_state=final_state
+        )
 
     def _fail(
         self,
@@ -160,5 +162,5 @@ class PipelineEmbeddingService:
             retryable=True,
         )
         self.claims.release_content_identity_group_claim(
-            group.id, new_pipeline_state=ContentPipelineState.FAILED
+            group.id, claim_generation=group.claim_generation, new_pipeline_state=ContentPipelineState.FAILED
         )

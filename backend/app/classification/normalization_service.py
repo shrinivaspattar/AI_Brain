@@ -60,7 +60,7 @@ class NormalizationService:
         try:
             self._normalize_claimed_group(group, worker_id=worker_id, workspace_root=workspace_root)
         except Exception:
-            self.claims.release_content_identity_group_claim(group.id)
+            self.claims.release_content_identity_group_claim(group.id, claim_generation=group.claim_generation)
             raise
 
         self.db.refresh(group)
@@ -122,7 +122,7 @@ class NormalizationService:
             outcome=IngestionAttemptOutcome.SUCCEEDED,
         )
         self.claims.release_content_identity_group_claim(
-            group.id, new_pipeline_state=ContentPipelineState.NORMALIZED
+            group.id, claim_generation=group.claim_generation, new_pipeline_state=ContentPipelineState.NORMALIZED
         )
 
     def _find_existing_document(self, group_id: int):
@@ -152,5 +152,5 @@ class NormalizationService:
             retryable=True,
         )
         self.claims.release_content_identity_group_claim(
-            group.id, new_pipeline_state=ContentPipelineState.FAILED
+            group.id, claim_generation=group.claim_generation, new_pipeline_state=ContentPipelineState.FAILED
         )

@@ -209,9 +209,10 @@ def test_release_content_identity_group_claim_clears_claim_and_advances_state(
         lease_duration=timedelta(minutes=10),
         claiming_pipeline_state=ContentPipelineState.EXTRACTING,
     )
+    db.refresh(group)
 
     WorkerClaimService(db).release_content_identity_group_claim(
-        group.id, new_pipeline_state=ContentPipelineState.EXTRACTED
+        group.id, claim_generation=group.claim_generation, new_pipeline_state=ContentPipelineState.EXTRACTED
     )
 
     db.refresh(group)
@@ -229,9 +230,10 @@ def test_release_content_identity_group_claim_on_failure_leaves_failed_state(
         eligible_pipeline_states=[ContentPipelineState.EXTRACTED],
         lease_duration=timedelta(minutes=10),
     )
+    db.refresh(group)
 
     WorkerClaimService(db).release_content_identity_group_claim(
-        group.id, new_pipeline_state=ContentPipelineState.FAILED
+        group.id, claim_generation=group.claim_generation, new_pipeline_state=ContentPipelineState.FAILED
     )
 
     db.refresh(group)

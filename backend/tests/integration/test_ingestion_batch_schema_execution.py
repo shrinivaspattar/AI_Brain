@@ -351,18 +351,46 @@ def test_claim_generation_does_not_advance_when_already_actively_claimed(db: Ses
 
 
 def test_reserved_embeddings_defaults_to_null_and_persists_when_set(db: Session) -> None:
+    """`reserved_embeddings_batch_id` (Milestone 4's "Durable
+    Reservation Ownership" correction) must be set together with
+    `reserved_embeddings` - the `ck_content_identity_groups_reservation
+    _ownership_consistent` CHECK constraint enforces this biconditional
+    at the database level, tested directly in
+    test_batch_aware_worker_claim_execution.py; this test only confirms
+    the plain default-null / round-trip behavior still holds."""
+    run = _classification_run(db)
+    batch = IngestionBatch(**_minimal_batch_kwargs(run.id))
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    batch_id = batch.id  # captured now - see note below
+
     group = _content_identity_group(db)
     assert group.reserved_embeddings is None
+    assert group.reserved_embeddings_batch_id is None
 
+    # Both attributes are assigned from a pre-captured local (`batch_id`),
+    # never from `batch.id` accessed live here: `db.commit()` above
+    # expires `batch`'s attributes, so a later `batch.id` access would
+    # trigger a lazy-reload mid-assignment - which triggers autoflush
+    # BETWEEN the two attribute-sets below, flushing `reserved_embeddings
+    # = 42` alone (with `reserved_embeddings_batch_id` not yet set) and
+    # tripping the ownership-consistency CHECK constraint. Not a model
+    # bug - purely an ordering hazard in test code assigning two
+    # co-constrained columns from an object whose id needs a fresh read.
     group.reserved_embeddings = 42
+    group.reserved_embeddings_batch_id = batch_id
     db.commit()
     db.refresh(group)
     assert group.reserved_embeddings == 42
+    assert group.reserved_embeddings_batch_id == batch_id
 
     group.reserved_embeddings = None
+    group.reserved_embeddings_batch_id = None
     db.commit()
     db.refresh(group)
     assert group.reserved_embeddings is None
+    assert group.reserved_embeddings_batch_id is None
 
 
 # -- SourceInstance discovery-run-scoped uniqueness (defense-in-depth) ---

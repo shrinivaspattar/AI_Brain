@@ -1,9 +1,9 @@
 from datetime import UTC, datetime
 from enum import Enum
 
-from sqlalchemy import DateTime
+from sqlalchemy import CheckConstraint, DateTime
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy import Integer, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -95,25 +95,46 @@ class ContentIdentityGroup(Base):
     it is never mistaken for an oversight.
 
     GENERATION-FENCED RESERVATION PRIMITIVES (added per "Scaled Real-T7
-    Ingestion - Implementation Design Pass", `2fab4b3`, Rounds 2-3 -
-    schema/model milestone only, no reservation lifecycle implemented
-    yet): `claim_generation` increments by exactly 1 every time
+    Ingestion - Implementation Design Pass", `2fab4b3`, Rounds 2-3;
+    wired into a real lifecycle by Implementation Milestone 4):
+    `claim_generation` increments by exactly 1 every time
     `WorkerClaimService.claim_content_identity_group` grants a claim on
     this row - whether that claim is fresh or a stale-reclaim. A caller
     holds the generation value returned by its own claim for the
     lifetime of its attempt. `reserved_embeddings` records how many
     embeddings a claim has reserved against this row's batch-level
-    budget. Both fields exist so a FUTURE reservation lifecycle can
-    fence every reserve/consume/release/recover operation to
-    `claim_generation = :my_generation` - closing a real ABA/zombie-
-    worker race where a delayed (not merely crashed) worker could
-    otherwise mistake a later generation's live reservation for its own
-    stale one. Recovery is authorized because it reads this row fresh,
-    under the same `SELECT ... FOR UPDATE` lock the claim query already
-    takes - never because of a special-cased caller identity. Neither
-    field is read or written by any service in this codebase yet; only
-    the claim/reclaim increment described above is wired up in this
-    milestone.
+    budget. Every mutating reservation operation (reserve/consume/
+    release/recover) fences on `claim_generation = :my_generation` -
+    closing a real ABA/zombie-worker race where a delayed (not merely
+    crashed) worker could otherwise mistake a later generation's live
+    reservation for its own stale one. Recovery is authorized because it
+    reads this row fresh, under the same `SELECT ... FOR UPDATE` lock the
+    claim query already takes - never because of a special-cased caller
+    identity.
+
+    `reserved_embeddings_batch_id` (added by Milestone 4's final
+    correction, "Durable Reservation Ownership") records WHICH
+    `IngestionBatch` a live reservation belongs to - closing a gap the
+    original two-column design left open: without it, stale-claim
+    recovery had no way to know which batch's `embeddings_reserved`
+    counter to credit back when reclaiming an abandoned reservation
+    (`ContentIdentityGroup` can legitimately be referenced by
+    `SourceInstance` rows from many different batches, so the owning
+    batch is never inferable from the group alone - see the "Why
+    cross-batch identity convergence cannot create ownership ambiguity"
+    reasoning in the frozen "### 8. Embedding reservation" design,
+    which correctly keeps the CLAIM itself batch-agnostic but did not
+    anticipate this specific recovery-time lookup need). FROZEN
+    INVARIANT, enforced by a CHECK constraint below: `reserved_embeddings
+    IS NULL` if and only if `reserved_embeddings_batch_id IS NULL` -
+    never one set without the other. When a reservation is live:
+    `reserved_embeddings > 0` (also CHECK-enforced) and
+    `reserved_embeddings_batch_id` names the exact `IngestionBatch` that
+    reserved it; `claim_generation` remains the fencing token for WHO
+    (which attempt) may mutate the reservation, while
+    `reserved_embeddings_batch_id` records WHAT (which batch's counter)
+    that mutation must reconcile against - two orthogonal facts, never
+    conflated.
     """
 
     __tablename__ = "content_identity_groups"
@@ -123,6 +144,15 @@ class ContentIdentityGroup(Base):
             "identity_algorithm",
             "identity_hash",
             name="uq_content_identity_groups_identity",
+        ),
+        CheckConstraint(
+            "(reserved_embeddings IS NULL AND reserved_embeddings_batch_id IS NULL) "
+            "OR (reserved_embeddings IS NOT NULL AND reserved_embeddings_batch_id IS NOT NULL)",
+            name="ck_content_identity_groups_reservation_ownership_consistent",
+        ),
+        CheckConstraint(
+            "reserved_embeddings IS NULL OR reserved_embeddings > 0",
+            name="ck_content_identity_groups_reserved_embeddings_positive",
         ),
     )
 
@@ -165,6 +195,14 @@ class ContentIdentityGroup(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     reserved_embeddings: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Durable reservation ownership (Milestone 4 final correction) - see
+    # class docstring. NULL exactly when reserved_embeddings is NULL
+    # (CHECK-enforced). No ORM relationship() declared - this column is
+    # read/written only via WorkerClaimService's raw UPDATE statements,
+    # matching this model's existing convention for claimed_by/claimed_at.
+    reserved_embeddings_batch_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("ingestion_batches.id"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
