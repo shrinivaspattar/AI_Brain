@@ -35,6 +35,19 @@ class BatchStopReason(str, Enum):
     POSTGRES_HARD_STOP = "postgres_hard_stop"
     OLLAMA_PERSISTENTLY_UNREACHABLE = "ollama_persistently_unreachable"
     SAFETY_INVARIANT_VIOLATION_DETECTED = "safety_invariant_violation_detected"
+    # The explicit "PAUSED -(operator aborts explicitly)-> ABORTED"
+    # edge from "### 12. Batch state machine - exact transitions" -
+    # added per Implementation Milestone 3's final-correction pass.
+    # Deliberately distinct from every resource/safety reason above:
+    # those describe something the SYSTEM detected; this describes a
+    # human's deliberate decision to stop, with no detection behind it.
+    # The frozen state machine documents this operator-abort edge ONLY
+    # from PAUSED, never as a cause of RUNNING -> ABORTED directly (that
+    # edge's only documented causes are hard-stop / persistent-Ollama-
+    # failure / safety-invariant-violation) - `BatchControlService.abort()`
+    # enforces this exact restriction, never accepting MANUAL_ABORT from
+    # a RUNNING batch.
+    MANUAL_ABORT = "manual_abort"
 
 
 class IngestionBatch(Base):
