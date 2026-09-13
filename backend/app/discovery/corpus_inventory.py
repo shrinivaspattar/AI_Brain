@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app.discovery.safety import reject_destination_inside_root
+
 # Extensions app.ingestion.document_ingestor.ARCHIVE_CONTAINER_SUFFIXES
 # already recognizes and can act on downstream, kept in sync manually
 # (not imported) since this module must stay independent of the
@@ -265,33 +267,12 @@ def write_inventory_report(inventory: CorpusInventory, destination: Path) -> Pat
     Fail-closed, structurally rather than by caller convention: refuses
     (`ValueError`, no directory created, nothing written) if
     `destination` resolves to the scanned root itself or anywhere
-    inside it. The whole point of this milestone is that discovery
-    never mutates the corpus it describes - a report written back into
-    that same corpus would be exactly that, regardless of how
-    well-behaved every CURRENT caller happens to be. Checked via
-    `.resolve(strict=False)` on BOTH `inventory.root` and `destination`
-    - never the raw, unresolved strings - so a `..` segment or a
-    symlinked intermediate directory that resolves into the root is
-    caught, not merely a literal path-string prefix match.
-    `strict=False` is deliberate: `destination` (and possibly several
-    of its trailing components) need not exist yet - whatever prefix
-    already exists on disk is resolved through any symlinks, and the
-    rest is appended literally, which is exactly the containment
-    question that matters here.
+    inside it - see `safety.reject_destination_inside_root` (shared
+    with every other report writer in this package) for exactly what
+    "resolves to" means here (symlinks, `..`, not-yet-existing paths).
     """
     destination = Path(destination)
-    scanned_root = Path(inventory.root).resolve(strict=False)
-    resolved_destination = destination.resolve(strict=False)
-
-    if resolved_destination == scanned_root or resolved_destination.is_relative_to(
-        scanned_root
-    ):
-        raise ValueError(
-            f"Report destination {destination} resolves to "
-            f"{resolved_destination}, which is the scanned root "
-            f"{scanned_root} or a location inside it - a discovery "
-            "report must never be written into the corpus it describes"
-        )
+    reject_destination_inside_root(inventory.root, destination)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(inventory.to_json_dict(), indent=2, default=str))

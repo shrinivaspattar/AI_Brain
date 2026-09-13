@@ -977,6 +977,71 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       archive-signature verification, archive extraction, any wiring
       into ingestion/the database, any deduplication analysis, any
       mutation of any kind.
+- [x] T7 Deduplication Analysis (Phase D1) — read-only, a separate
+      explicitly-authorized gate opened only after Discovery was
+      independently, critically re-verified and committed (`ee043c6`).
+      Authorization scope: reading metadata AND content for hashing,
+      reading directory structure, comparing files/directories,
+      producing reports — explicitly NOT delete/move/rename/extract/
+      quarantine/execution of any kind. New module
+      `app/discovery/duplicate_analysis.py`: `analyze_duplicates()`
+      runs a metadata-only pass (full size index + bottom-up
+      per-directory structural signatures, in one `os.walk` traversal —
+      `inventory.json`'s own report doesn't retain a full per-file
+      listing, only a bounded top-N, so this couldn't literally reuse
+      it as an index the way first assumed; noted rather than silently
+      deviating from the stated plan) followed by a content-reading
+      pass that opens and SHA-256-hashes ONLY files sharing a size with
+      at least one other file — a uniquely-sized file can never be an
+      exact duplicate and is never opened. Three kept-separate finding
+      types: `exact_duplicate_groups` (hash-confirmed, zero-byte files
+      excluded), `cryptomator_chunk_duplicate_groups` (the same
+      hash-match logic, but `.c9r` groups reported separately since a
+      same-hash Cryptomator chunk pair is ciphertext-identical, not
+      necessarily "the same document twice" the way a repeated `.jpg`
+      is — a mixed group with even one non-`.c9r` member stays
+      ordinary), and `directory_duplicate_groups` (whole-subtree
+      structural matches by name+size, empty dirs excluded, only the
+      TOPMOST match reported when an entire tree is nested-duplicated,
+      to avoid redundant sub-match noise). Archives treated as plain
+      files for this pass — compared by size→hash like anything else,
+      never opened internally. `write_duplicate_report` reuses a new
+      shared `app/discovery/safety.py` (`reject_destination_inside_
+      root`) rather than re-implementing that safety-critical check a
+      second time — `corpus_inventory.write_inventory_report` was
+      refactored onto the same shared helper, its existing test suite
+      re-run and passed unchanged, confirming no regression to
+      already-committed, already-hardened behavior. Runner:
+      `scripts/t7_duplicate_analysis.py <root> <output.json>`. 22 new
+      tests (17 core + 5 for the extracted safety helper, including a
+      sibling-directory-with-shared-name-prefix case proving the check
+      is genuinely resolution-based, not a naive string comparison),
+      entirely synthetic `tmp_path`. Full suite: 594 tests. **The T7
+      was only ever opened read-only for hashing** — no file on it was
+      written to, truncated, moved, renamed, deleted, or otherwise
+      modified. Deliberately not built: any deletion/move/rename/
+      extraction/quarantine/execution; any archive-internal inspection;
+      any database/executor wiring; any automatic decision-making from
+      these findings.
+      **Reviewed before commit, per explicit request** — see "T7
+      Deduplication Analysis (Phase D1)" in AI_Brain_Architecture.md
+      for the full seven-point "read this before acting on any D1
+      finding" summary (live-corpus caveat, forensic-not-deletion
+      framing, the reclaimable-bytes formula, the never-sum-the-two-
+      totals rule, `.c9r` separation, the exact zero-byte explanation
+      for the hashing-count gap, and the accepted linear-memory
+      tradeoff). One real bug was found and fixed during this review: a
+      symlink's tiny `lstat` size could have collided with an unrelated
+      file's size, causing `_hash_file`'s `open(path, "rb")` to
+      silently follow the symlink and hash its TARGET's content while
+      reporting the symlink's own size — fixed by excluding symlinks
+      from hash-based duplicate detection entirely (still counted in
+      aggregates, still part of directory structural signatures).
+      **Confirmed to have had zero effect on the completed real-corpus
+      report**: exFAT cannot represent symlinks, so the triggering
+      condition never existed on the actual T7 data — no re-scan was
+      needed or performed. 3 new tests from this review pass; full
+      suite 597 tests.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

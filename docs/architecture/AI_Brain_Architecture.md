@@ -3105,17 +3105,219 @@ analysis of what the scan finds; any mutation of any kind. **The T7
 was scanned read-only, exactly as authorized - no file on it was
 opened, moved, renamed, deleted, or otherwise modified.**
 
+## T7 Deduplication Analysis (Phase D1) — read-only
+
+A separate, explicitly-authorized follow-on gate to T7 Corpus Discovery
+above, opened only after that milestone was independently, critically
+re-verified and committed (`ee043c6`). Authorization scope: reading
+file metadata AND content for hashing, reading directory structure,
+comparing files/directories, producing analysis reports - explicitly
+NOT authorizing delete, move, rename, extract, quarantine, or any
+deduplication execution.
+
+**Read this before acting on any D1 finding - seven facts that must
+stay explicit, not merely implied by the code:**
+
+1. **D1 was performed against a LIVE corpus.** The real T7 run
+   executed for 76.6 minutes while Syncthing was independently,
+   actively modifying the corpus throughout (confirmed running before,
+   during, and after the run) - see "Live-corpus semantics" below for
+   exactly what that does and does not affect.
+2. **D1 produces read-only forensic evidence, not a deletion
+   recommendation.** It establishes that specific files are
+   byte-for-byte identical (or that specific directory trees match
+   structurally); it does not, and cannot, determine which copy - if
+   any - is safe to remove. A file's backup/provenance significance is
+   outside what a hash comparison can ever tell you.
+3. **"Reclaimable bytes" is a formula, not a promise.** It is
+   `size_bytes * (copies - 1)` per group - "the space freed if every
+   group kept exactly one copy" - never "space confirmed safe to
+   recover." Treat it as an upper-bound estimate under an assumption
+   (keep-one-arbitrary-copy) that D1 itself never validates.
+4. **The exact-file and directory-structural reclaimable totals must
+   never be added together.** They are two different lenses over
+   overlapping data (see `DuplicateAnalysis`'s own docstring) - summing
+   them overstates genuinely reclaimable space, likely substantially.
+5. **`.c9r` Cryptomator-chunk duplicates remain semantically separate**
+   from ordinary plaintext/document duplicates, always - a same-hash
+   `.c9r` pair means ciphertext-identical, not confirmed-identical
+   plaintext, and a group is only classified this way if EVERY member
+   ends in `.c9r`.
+6. **The `size_collision_candidate_files` vs `files_hashed` gap (624,847
+   vs 581,414 in the real run) is entirely, exclusively explained by
+   zero-byte files** sharing a size with at least one other zero-byte
+   file - they count as "candidates" but are never hashed (hashing an
+   empty file is pointless; it reclaims zero bytes). No other code path
+   causes a candidate to skip hashing - proven with a dedicated
+   synthetic test, not merely asserted.
+7. **Memory usage scales linearly with corpus size, intentionally.**
+   Unlike `corpus_inventory.py`'s bounded top-N rankings, D1's size
+   index and directory signatures hold one entry per file/directory -
+   an accepted, necessary tradeoff (genuine duplicate detection cannot
+   be done from a bounded sample), observed practical on the real
+   ~628,000-file corpus (peak memory in the low hundreds of MB).
+
+**`app/discovery/duplicate_analysis.py`** - the only new production
+code. `analyze_duplicates(root)` runs two passes:
+
+1. **Metadata-only** (comparable cost to `corpus_inventory.scan_
+   corpus`): one `os.walk(topdown=False)` traversal builds a full
+   size index (every file's path, grouped by `os.lstat` size) AND,
+   bottom-up in the SAME pass, a structural signature per directory
+   (a SHA-256 digest over each directory's own sorted `(filename,
+   size)` pairs plus its immediate subdirectories' already-computed
+   signatures - so a signature match implies identical names and
+   sizes recursively throughout the entire subtree). **`corpus_
+   inventory.py`'s own `inventory.json` does not retain a full
+   per-file listing** (only a bounded top-N via `_TopNTracker`), so
+   this could not literally reuse that report as a full index the way
+   the recommended plan first assumed - this module performs its own
+   independent full-corpus metadata pass instead, noted here rather
+   than silently deviating from the stated plan.
+2. **Content-reading, the expensive part**: only files that share
+   their size with at least one other file (a real "collision
+   candidate") are opened read-only and SHA-256 hashed - a file with a
+   globally unique size can never be an exact duplicate of anything
+   and is never opened. Hashing mirrors `document_ingestor._hash_file`
+   exactly (1MB chunks, `"rb"` mode, `None` on `OSError` rather than
+   raising).
+
+**Three distinct kinds of findings, kept separate rather than merged**:
+- `exact_duplicate_groups` - 2+ files with identical size AND SHA-256
+  hash. Zero-byte files are excluded (trivially "identical," reclaim
+  nothing, would otherwise dump every empty file in the corpus into
+  one meaningless group).
+- `cryptomator_chunk_duplicate_groups` - the SAME exact-hash-match
+  logic, but reported separately whenever EVERY member of a group ends
+  in `.c9r` (Cryptomator's encrypted-chunk extension). A same-hash
+  `.c9r` pair is ciphertext-identical, not necessarily "the same user
+  document appears twice" the way a repeated `.jpg` is - explicitly
+  not folded into the ordinary category so a human reviewer doesn't
+  mistake vault-internal chunk duplication for an obvious deletion
+  candidate. A group containing even one non-`.c9r` member is
+  classified as an ordinary exact duplicate instead, never silently
+  absorbed into this category.
+- `directory_duplicate_groups` - 2+ directories whose entire subtree
+  matches by name and size, recursively - a STRUCTURAL signal
+  corroborating, but not a substitute for, the per-file hash evidence
+  above. Empty directories are excluded from this category (same
+  reasoning as zero-byte files). When an entire tree is duplicated
+  (both a parent and its children all match), only the TOPMOST match
+  is reported - every nested sub-match is redundant noise from the
+  same underlying duplicate tree, though the parent-level group's own
+  `total_size_bytes`/`file_count` already include everything beneath
+  it.
+
+**Archives treated as plain files for this pass**, exactly as scoped:
+a `.zip`/`.7z`/etc. participates in the same size→hash comparison as
+any other file (two identical archives are found as an ordinary exact
+duplicate); no archive is opened, inspected, or extracted internally.
+
+**`write_duplicate_report`** reuses the SAME destination-safety
+invariant as the discovery module - factored out into a new shared
+`app/discovery/safety.py` (`reject_destination_inside_root`) rather
+than duplicating that safety-critical check a second time.
+`corpus_inventory.write_inventory_report` was refactored to use this
+same shared helper; its own existing test suite was re-run and passed
+unchanged, confirming the refactor didn't regress already-committed,
+already-hardened behavior.
+
+**Runner**: `scripts/t7_duplicate_analysis.py <root> <output.json>`.
+
+**Tests**: 22 new (17 for `duplicate_analysis.py`, 5 for the extracted
+`safety.py` helper) - all synthetic `tmp_path`, no real T7 access.
+Covering: exact-duplicate detection, the size-collision-only hashing
+optimization (a uniquely-sized file is never opened), zero-byte
+exclusion, Cryptomator-chunk classification (including the mixed-group
+non-absorption case), directory-tree structural matching (including
+the require-matching-sizes-not-just-names case and the topmost-only
+nested-match reporting), empty-directory exclusion, resilience to an
+unreadable file (mocked) and an unlistable directory (real `chmod
+000`), and the destination-safety invariant (including a sibling
+directory sharing a name PREFIX, proving the check is genuinely
+path-resolution-based, not a naive string-prefix comparison).
+
+**Deliberately not built this milestone**: any deletion, move, rename,
+extraction, quarantine, or deduplication execution of any kind; any
+archive-internal inspection; any wiring into the database or the
+existing dedup executor pipeline; any automatic decision-making from
+these findings. **The T7 was only ever opened read-only (`"rb"` mode)
+for hashing - no file on it was written to, truncated, moved, renamed,
+deleted, or otherwise modified.**
+
+**Review pass, before committing - one real correctness fix, two
+documentation clarifications.** Requested explicitly before treating
+this milestone as done, rather than accepting the real-run numbers at
+face value:
+
+- **Fix**: `_hash_file` opens a path in `"rb"` mode, which unavoidably
+  follows a symlink to its target. A symlink's `os.lstat` size (its own
+  tiny size) is unrelated to its target's actual size - if that tiny
+  size happened to collide with an unrelated regular file's size, this
+  module would have silently hashed an arbitrary amount of the
+  symlink's TARGET content while reporting a `size_bytes` reflecting
+  only the symlink's own size, a real data-integrity mismatch. Fixed
+  by excluding symlinks from the hash-candidate size index entirely
+  (still counted in `total_files_considered`, still included in their
+  directory's structural signature by their own lstat size, exactly
+  like `corpus_inventory.py` treats them) - proven with a synthetic
+  reproduction before the fix (showing `_hash_file` on a symlink path
+  really does return the target's content hash) and two new tests
+  after. **The completed real-corpus run was never affected by this
+  bug**: exFAT (the T7's filesystem) cannot represent symlinks at all,
+  so the triggering condition was structurally impossible on the
+  actual data analyzed - confirmed, not assumed.
+- **The two reclaimable totals must never be summed**: `exact_
+  duplicate_reclaimable_bytes` and `directory_duplicate_reclaimable_
+  bytes` are two different lenses over overlapping data (a file inside
+  a duplicated directory tree is very likely also counted in the
+  file-level total), not two independent pools of unique bytes - now
+  stated explicitly in `DuplicateAnalysis`'s own docstring, since
+  nothing in the code previously stated this even though nothing in
+  the code ever summed them either.
+- **Memory usage is not bounded** the way `corpus_inventory.py`'s top-N
+  rankings are - the size index and directory signatures scale
+  linearly with the corpus's file/directory count, an accepted,
+  necessary tradeoff for genuine duplicate detection (a bounded sample
+  cannot find all duplicates), observed practical on the real
+  ~628,000-file corpus (peak memory in the low hundreds of MB) - now
+  stated explicitly rather than left implicit.
+- **Live-corpus semantics documented explicitly**: the real T7 run
+  (76.6 minutes) executed while Syncthing was independently, actively
+  modifying the corpus throughout - each file's size (pass 1) and
+  content hash (pass 2, run strictly after pass 1 completes for the
+  entire tree) can reflect two different points in real time, not one
+  atomic snapshot. Every individual hash comparison remains internally
+  valid; the overall analysis should be read as "assembled from reads
+  spread across the run's duration," not "the corpus at one instant."
+  Directory-level structural signatures are internally consistent with
+  each other (one single metadata pass) but are not independently
+  content-hash-verified for every file within.
+- **`Archive 2/vscode/data` does not match as one single top-level
+  tree** - its own bottom-up signature diverges from `vscode/data`'s
+  somewhere in the full recursive listing, so instead of one giant
+  match, 361 separate directory-duplicate groups have at least one
+  path under that subtree (`Obsidian`, `media library`, `Syncthing`,
+  `Documents`, and numerous `takeout-*` folders each matching their
+  counterparts elsewhere individually) - a materially more nuanced
+  finding than "the whole 211.83GB tree is duplicated," reported here
+  rather than the simpler but less accurate claim.
+- 3 new tests added by this review pass (the exact `size_collision_
+  candidate_files` vs `files_hashed` counting-gap mechanism, and two
+  proving the symlink fix), full suite re-run and passed unchanged.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
 - `knowledge/` — reserved for curated/derived knowledge artifacts
-  (future); `knowledge/t7_discovery/` holds T7 corpus inventory reports
-  specifically, gitignored since they contain real personal file/
-  directory names.
+  (future); `knowledge/t7_discovery/` holds T7 corpus inventory AND
+  duplicate-analysis reports specifically, gitignored since they
+  contain real personal file/directory names.
 - `postgres/`, `redis/` — data directories for the Dockerized services.
 - `logs/`, `config/`, `prompts/` — reserved, currently empty.
-- `scripts/t7_discovery.py` — the T7 Corpus Discovery runner (see
-  above); otherwise reserved, currently empty.
+- `scripts/t7_discovery.py`, `scripts/t7_duplicate_analysis.py` — the
+  T7 Corpus Discovery and Deduplication Analysis runners (see above);
+  otherwise reserved, currently empty.
 
 ## Open/planned areas
 - `docker-compose.yml` is currently empty — services (Postgres, Redis,
