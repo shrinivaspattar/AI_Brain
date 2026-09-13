@@ -4863,6 +4863,883 @@ synthetic rows after every run; the main `aibrain` database's schema
 and Alembic head (`ef65da409302`) remain untouched. No T7 access of
 any kind occurred during this review round.
 
+## Controlled T7 → AI_Brain Ingestion Design (APPROVED and frozen — no implementation yet)
+
+A seventh T7 gate, opened after the schema/model implementation closed
+at `1253a2e`. Scope, stated explicitly at authorization: **design
+only**. No T7 access of any kind, no extraction, no hashing on the T7,
+no embeddings, no database schema changes, no dedup executor changes,
+no mutation of any kind. The deliverable is this document; nothing
+here is implemented. Went through two review rounds (round 2's
+worker/queue-concurrency, `FileAccessService`, and failure-semantics
+corrections below) before being approved. **Status: frozen** — the
+next gate is implementation of this design (still requiring its own
+schema-extension gate first, per the concrete recommendations below),
+not yet authorized.
+
+### Grounding
+
+In addition to everything already grounded in the `29d6864`/`14b8063`
+sections above, this pass inspected `ImportJobService` and
+`EmbeddingService` (not read closely before now):
+
+- `ImportJobService.execute_job()` wraps
+  `SourceScanner`/`ArchiveExtractor`/`DocumentIngestor`/embedding in a
+  single `try`/`except` — **one failing file currently fails the whole
+  job**, matching the gap already named in `29d6864`. `_embed_documents`
+  is the one place that already isolates per-item failures (catches
+  and logs, never aborts the batch) — a real, existing precedent this
+  design reuses rather than inventing a new pattern.
+- `EmbeddingService.embed_document()` is already fully idempotent by
+  construction: it `DELETE`s a document's existing chunks and
+  re-inserts fresh ones, every call. Re-running it twice on the same
+  content produces the same end state. This is the load-bearing
+  existing precedent for Q6/idempotency below.
+- `FileAccessService._allowed_roots()` trusts **any** `ImportJob` with
+  `status == COMPLETED`, resolving its raw `source_path` string as a
+  live filesystem root chat tools may read from. This interacts
+  directly with Q17 below and is addressed explicitly, not glossed
+  over.
+
+### The nine-question answer set (deliverables 1–9), then explicit deferrals (deliverable 10)
+
+#### 1. What is ingested — eligibility categories
+
+Six outcomes, not three: **discovered** (a path D0/D1/D2 named or
+extraction revealed) → **eligible** (classification decided extraction
+should be attempted) → one of **excluded** (`.c9r` ciphertext, or a
+future policy exclusion — a decision, not a failure), **unsupported**
+(format/type has no extractor today — a fact about capability, not
+this file), **failed** (an attempt was made and it errored), or
+**successfully ingested**. This maps directly onto
+`ContentPipelineState` as already frozen in `14b8063` — no new states
+proposed. Ordinary loose files and archives are eligible by default;
+`.c9r` is excluded by policy (per D2's own established finding);
+media/other-unsupported-format files are unsupported until an
+extractor exists; corrupt/unreadable files are only discoverable as
+`failed` *after* an extraction attempt, never pre-judged as such.
+
+#### 2. The ingestion unit — three layers, never collapsed
+
+- **Discovery/classification granularity**: `SourceInstance` — one row
+  per physical occurrence, as already frozen.
+- **Extraction granularity**: an archive member, discovered live
+  during extraction (see Q3) — becomes its own `SourceInstance`, never
+  folded into its parent's.
+- **Pipeline granularity — the actual unit of work**:
+  `ContentIdentityGroup`. This was already established in `29d6864`'s
+  idempotency key and is restated precisely here because this gate's
+  Q6 depends on it: **the extraction-onward pipeline (normalize →
+  chunk → embed) runs per `ContentIdentityGroup`, never per
+  `SourceInstance` and never per archive member.** No new "ingestion
+  work item" table is proposed — `ContentIdentityGroup.pipeline_state`
+  already *is* the queue state, and no schema change is needed to make
+  it one. Concretely, there are two independent queues, both already
+  expressible in the frozen schema with zero new columns:
+  1. **Extraction queue**: `SourceInstance` rows with
+     `content_identity_group_id IS NULL` — physical occurrences whose
+     identity is not yet known and must be read to discover it.
+  2. **Pipeline queue**: `ContentIdentityGroup` rows whose
+     `pipeline_state` is not yet terminal — content identities needing
+     normalization/chunking/embedding.
+
+#### 3. `SourceInstance` creation — corrects an implicit assumption from `14b8063`
+
+`14b8063`'s design implicitly assumed classification could create every
+`SourceInstance` up front, including archive members. **This is wrong,
+and is corrected here**: D1/D2 never opened a single archive — an
+archive's internal member list is genuinely unknown until extraction
+actually reads it. So:
+- **Classification** creates exactly one `SourceInstance` per
+  T7-visible path named in D0/D1/D2 (loose files and top-level
+  archives, each starting with a one-link `T7_FILE`-root
+  `ProvenanceLink` chain), with `evidence_snapshot` populated from
+  actual D0/D1/D2 report data.
+- **Extraction** creates every deeper `SourceInstance` (one per archive
+  member, at whatever nesting depth), the moment an archive is opened
+  and its members enumerated — never at classification time. These
+  rows still reference the SAME `classification_run_id` as their
+  parent archive's instance (the classification run that decided to
+  extract the enclosing archive is "responsible for" what extraction
+  produces from it — no schema change needed for this, since
+  `classification_run_id` is already a plain FK, not scoped to
+  "things D0/D1/D2 actually named"). Their `evidence_snapshot` is
+  honest about this: it records `{"discovered_during_extraction":
+  true, "parent_source_instance_id": ...}` rather than fabricating
+  D1/D2 evidence that was never collected for a path D1/D2 never saw.
+
+The live filesystem is never treated as authoritative for anything
+already recorded: a `SourceInstance`'s `evidence_snapshot` is fixed at
+creation (per `14b8063`'s already-frozen immutability contract) whether
+that creation happened at classification time or extraction time.
+
+#### 4. Content identity — when each identity kind is known
+
+Restating `14b8063` precisely for the ingestion case: `ContentIdentityGroup.
+identity_kind` stays `EXTRACTED_CONTENT`-only in this design too —
+`SOURCE_BYTES`/`NORMALIZED_CONTENT` remain reserved, unpopulated, exactly
+as frozen. When identity becomes knowable differs by case:
+- A loose T7 file **D1 already hashed** (a size-collision candidate):
+  identity is known at **classification** time — no extraction read is
+  needed at all; `get_or_create_group` can be called immediately using
+  D1's already-computed hash.
+- A loose T7 file **D1 never hashed** (unique size — D1's own
+  size-collision filter skipped it, exactly as `14b8063`'s round-5
+  correction already established): identity is unknown until the
+  ingestion pipeline itself reads and hashes the file, at the
+  `EXTRACTING`→`EXTRACTED` transition.
+- **Any archive member**: identity is never known before the member is
+  actually read during extraction — D1 never opened archives, full
+  stop. This is the one case Q5 exists to describe precisely.
+
+#### 5. Archive processing flow, precisely
+
+```
+T7 archive file (one SourceInstance, one-link T7_FILE-root chain,
+                 created at classification)
+   |
+   v
+EXTRACTING: ArchiveExtractor opens it (reusing the EXISTING safety
+   |         guards: path-traversal rejection, disk-space reserve,
+   |         expansion-ratio bomb guard, symlink-member rejection -
+   |         all already implemented in app/ingestion/archive.py,
+   |         reused, not reinvented), enumerates members
+   v
+for each member:
+   |
+   +-- create a new SourceInstance (chain = parent's chain + this
+   |   member's ARCHIVE_MEMBER link, sequence_index = parent depth + 1)
+   |
+   +-- member's bytes are now in hand (extraction just read them) ->
+   |   compute its EXTRACTED_CONTENT/SHA256 hash immediately
+   |
+   +-- get_or_create_group(EXTRACTED_CONTENT, SHA256, hash)
+   |     |
+   |     +-- if the returned group's pipeline_state is already
+   |     |   INGESTED: STOP HERE for this member. assign_content_
+   |     |   identity() links this new SourceInstance to the existing
+   |     |   group and its existing Document - no normalize/chunk/
+   |     |   embed work repeats. This is the idempotency key from
+   |     |   29d6864, made concrete: downstream work is skippable,
+   |     |   the READ itself never was.
+   |     |
+   |     +-- if the member is ITSELF an archive: recurse (same
+   |         extraction logic, depth + 1, the SAME safety guards
+   |         re-applied at this level too - path-traversal and
+   |         expansion-ratio checks must run at EVERY recursion
+   |         level, not only the outermost one), plus a NEW
+   |         recursion-depth limit (not designed to an exact number
+   |         here - a bounded constant, analogous to
+   |         ArchiveExtractor.HARD_EXPANSION_RATIO, to be set at
+   |         implementation time) to prevent an archive-bomb-via-
+   |         nesting distinct from the existing single-level
+   |         expansion-ratio bomb guard.
+   |
+   +-- otherwise (new identity): proceed to NORMALIZED -> CHUNKED ->
+       EMBEDDED -> INGESTED for this ContentIdentityGroup, exactly
+       once.
+```
+
+#### 6. Idempotency — the durable boundary, and how it survives every failure mode named
+
+The unit is `ContentIdentityGroup` (Q2). Restating and extending
+`29d6864`'s idempotency key against each specific scenario the
+authorization asked about:
+- **Retries**: `pipeline_state` is the durable resume checkpoint - a
+  crash mid-`EXTRACTING` leaves the group at `EXTRACTING` (or, more
+  precisely, still `CLASSIFIED` if the state transition to `EXTRACTING`
+  itself is written *before* the extraction attempt begins, so a crash
+  never leaves a group claiming to be "in progress" on work that never
+  actually started - this ordering is a real implementation detail to
+  get right, named here, not solved in code).
+- **Crashes**: same durability principle as Chain 1 (one durable row =
+  resume checkpoint), explicitly **not** Chain 1's state machine
+  (already established in `29d6864`, unchanged here). A resumer's
+  query is trivial and needs no new schema: `WHERE pipeline_state NOT
+  IN (INGESTED, EXCLUDED, UNSUPPORTED)` (whether `FAILED` and
+  `NEEDS_REVIEW` are included in a resume sweep is a retry-policy
+  choice, not a schema question - see Failure/retry matrix below).
+- **Duplicate jobs / concurrent claims**: already solved, already
+  tested, in `1253a2e` - `ContentIdentityService.get_or_create_group`'s
+  real-database concurrency proof applies unchanged here. This gate
+  does not need to design new concurrency handling; it needs to *call*
+  what already exists.
+- **Process restarts**: identical to "crashes" above. The one
+  additional requirement this surfaces: **each pipeline step's own
+  operation must itself be idempotent, not merely resumable-once** -
+  `EmbeddingService.embed_document`'s existing delete-then-recreate
+  pattern is the model to follow for normalization and chunking too
+  (re-running a step against the same input must produce the same
+  output state, not accumulate duplicates).
+
+#### 7. Ingestion state machine — transitions, retryability, terminality, reversibility
+
+Reusing `ContentPipelineState` exactly as frozen in `14b8063` - no new
+states, but **one real correction to how `NEEDS_REVIEW` is used**,
+found while answering Q18 below and stated here because it changes the
+transition table: `NEEDS_REVIEW` is reachable only from `CLASSIFIED`
+when **classification itself cannot decide eligibility** (a genuine
+ambiguity about whether this content category should be attempted at
+all) - it is **not** the same thing as D2's per-instance
+`requires_human_review` evidence flag, which lives inside
+`SourceInstance.evidence_snapshot` and drives `canonical_status`
+resolution only. `29d6864` already established that content ingestion
+must never wait on canonical resolution; a `ContentPipelineState.
+NEEDS_REVIEW` that triggered on every D2-flagged group would silently
+contradict that. This is a real inconsistency between `29d6864` and
+`14b8063`, caught here, resolved by narrowing `NEEDS_REVIEW`'s scope to
+eligibility-level ambiguity only.
+
+```
+DISCOVERED --(classification)--> CLASSIFIED
+CLASSIFIED --(eligible)--------> EXTRACTING
+CLASSIFIED --(no extractor)----> UNSUPPORTED         [terminal-for-now]
+CLASSIFIED --(policy exclusion)-> EXCLUDED           [terminal-for-now]
+CLASSIFIED --(eligibility ambiguous)-> NEEDS_REVIEW  [blocks further
+                                                       progress until a
+                                                       human/policy call]
+EXTRACTING --(success)---------> EXTRACTED
+EXTRACTING --(error)-----------> FAILED              [retryable -> EXTRACTING]
+EXTRACTED  --(success)---------> NORMALIZED
+EXTRACTED  --(error)-----------> FAILED              [retryable -> EXTRACTED's predecessor step]
+NORMALIZED --(success)---------> CHUNKED
+NORMALIZED --(error)-----------> FAILED              [retryable]
+CHUNKED    --(success)---------> EMBEDDED
+CHUNKED    --(error)-----------> FAILED              [retryable]
+EMBEDDED   --(success)---------> INGESTED            [TERMINAL - success]
+EMBEDDED   --(error)-----------> FAILED              [retryable]
+```
+
+- **Terminal, success**: `INGESTED` only.
+- **Terminal-for-now, not permanently frozen by construction**:
+  `UNSUPPORTED` and `EXCLUDED` - a *future* `ClassificationRun` (a new
+  row, per the existing "reclassification is a new run, never an edit"
+  convention) could revisit and potentially move such a group forward
+  once capability changes (a new extractor, a policy change) - this is
+  a reclassification EVENT, not a direct state-machine transition, and
+  is named as an open question for the next schema-extension gate:
+  today's schema has no `superseded_by_classification_run_id` field to
+  record such a supersession, and none is added here.
+  `NEEDS_REVIEW` is not retryable automatically; it requires an
+  explicit human/policy decision before any forward transition.
+- **Retryable**: `FAILED` only, and only back to the step that failed -
+  never a full rollback to `DISCOVERED`. Retry policy (backoff, max
+  attempts, automatic vs. manual) is explicitly implementation detail,
+  not designed here.
+- **Reversibility**: none of these transitions are reversible in the
+  sense of undoing a completed step - there is no `INGESTED →
+  EXTRACTED` transition. The only "reversal" concept in this design is
+  retrying `FAILED` back to its own attempted step, or a future
+  reclassification superseding `UNSUPPORTED`/`EXCLUDED`/`NEEDS_REVIEW`.
+
+#### 8. Extraction/working-space design
+
+Unchanged in principle from `0002`/`29d6864`: T7 (immutable, forever
+read-only) → temporary extraction workspace (`documents/imports/
+<job_id>/extracted/`, ephemeral) → durable AI_Brain derived artifacts
+(the `Document`/`DocumentChunk` **rows**, not the on-disk working
+copy - the working copy's own retention policy remains the still-open
+question named in `29d6864`, unchanged here). Specifics for this gate:
+- **Cleanup**: still an open policy question (unchanged from `29d6864`)
+  - not resolved here either.
+- **Disk-space checks**: reuse `ArchiveExtractor`'s existing
+  `HARD_FREE_SPACE_BYTES`/`PREFERRED_FREE_SPACE_RATIO` mechanism as-is;
+  these already check the *workspace's* disk, which is exactly right -
+  the T7's own free space is irrelevant since it is never written to.
+- **Partial extraction recovery**: a crash mid-extraction may leave a
+  partially-written directory in the workspace. Because extraction is
+  deterministic given the same archive bytes, the correct recovery is
+  to **delete the partial directory and re-extract from scratch** on
+  retry - never attempt to resume a byte-partial extraction.
+- **Nested archive safety**: `ArchiveExtractor`'s existing
+  path-traversal and expansion-ratio guards must be re-applied at
+  **every** recursion level, not only the outermost call - easy to
+  miss when generalizing a single-level extractor into a recursive
+  one, named explicitly here so it isn't missed at implementation time.
+- **Path traversal protection**: same point as above, stated for
+  emphasis - a member path validated safe relative to its immediate
+  archive's extraction directory must be re-validated at each nesting
+  level, since a safe-looking relative path can still escape when
+  composed across levels if not checked per-level.
+
+#### 9. Snapshot / live-corpus semantics for ingestion
+
+`DiscoveryRun` (already implemented) already carries the correct,
+honest, non-atomic semantics - restated, not re-designed. The one gap
+this gate surfaces: `SourceInstance` rows discovered **during
+extraction** (Q3) have no corresponding D0/D1/D2 `DiscoveryRun` at all
+- they were never named in any report, because D1/D2 never opened
+archives. Their `evidence_snapshot`'s `discovered_during_extraction:
+true` marker (Q3) is the honest record of this - it does **not**
+retroactively claim these paths were part of any `DiscoveryRun`'s
+observation. A future query asking "what fraction of the corpus has
+been observed" (Q12) must account for this: paths discovered only via
+extraction were never part of any D0/D1/D2 denominator to begin with.
+
+### Deliverable 4: data-flow / provenance query graph (answers Q15)
+
+Confirmed fully queryable with the schema exactly as already
+implemented in `1253a2e` - zero gaps, zero new columns needed:
+
+```
+DocumentChunk.document_id
+   -> Document.content_identity_group_id
+      -> ContentIdentityGroup.id
+         <- SourceInstance.content_identity_group_id (reverse, 1:N -
+            every physical occurrence that ever resolved to this
+            identity, across every ClassificationRun that ever
+            observed one)
+            -> SourceInstance.id
+               <- ProvenanceLink.source_instance_id (reverse, 1:N)
+                  -> walk parent_link_id to the root (sequence_index=0,
+                     kind=T7_FILE)
+                     -> root_t7_path (or, for the field itself,
+                        SourceInstance.root_t7_path directly - already
+                        denormalized for exactly this convenience)
+```
+
+This is `ProvenanceService.trace_document()`'s existing walk
+(`ImportJob → Document → DocumentChunk → Message`), extended one hop
+earlier exactly as `29d6864` already specified - no new subsystem, a
+service-layer addition to an already-existing, already-tested query
+pattern.
+
+### Deliverable 5: failure/retry matrix (answers Q11, Q13)
+
+| Failure | State reached | Retryable? | Notes |
+|---|---|---|---|
+| Corrupt PDF/DOCX/etc. | `FAILED` (from `NORMALIZED`'s predecessor) | Yes, manually/on-schedule | Not `UNSUPPORTED` - the *format* is supported, this *file* is bad |
+| Malformed archive | `FAILED` (from `EXTRACTING`) | Yes | `ArchiveExtractor` already raises a typed error for this |
+| Encrypted archive (no password available) | `UNSUPPORTED` | No (until a future capability exists) | A capability gap, not a per-file failure |
+| Unsupported file type | `UNSUPPORTED` | No (until an extractor exists) | Decided at `CLASSIFIED`, before any attempt |
+| Oversized file / exceeds expansion ratio | `FAILED` | Policy-dependent | `ArchiveExtractor`'s existing hard limits already produce a typed error |
+| Extraction failure (other) | `FAILED` (from `EXTRACTING`) | Yes | |
+| Normalization failure | `FAILED` (from `EXTRACTED`) | Yes | |
+| Chunking failure | `FAILED` (from `NORMALIZED`) | Yes | |
+| Embedding failure (e.g. Ollama unreachable) | `FAILED` (from `CHUNKED`) | Yes, likely transient | Matches `_embed_documents`'s existing per-item catch-and-skip precedent |
+| T7 unavailable mid-`EXTRACTING` | `FAILED` | Yes, once T7 returns | Not data loss - the source file is presumed still there, just unreachable now |
+| Insufficient workspace disk space | `FAILED` | Yes, once space is freed | Detected by the existing `ArchiveExtractor` disk-space check |
+
+**Named schema gap, not fixed here** (database schema changes are out
+of scope for this design pass): `ContentIdentityGroup` has no
+`failure_reason`/error-detail column today, unlike `ImportJob.
+error_message` or `DedupExecutionActionAudit.error_message`. A `FAILED`
+group currently has no durable, structured place to record *why* -
+this is a genuine, concrete recommendation for whatever schema-
+extension gate comes before this design is implemented.
+
+### Deliverable 6: idempotency model — see Q6 above (kept together with its own question rather than duplicated here)
+
+### Deliverable 7: snapshot/live-corpus semantics — see Q9 above
+
+### Deliverable 8: extraction workspace design — see Q8 above
+
+### Deliverable 9: processing lineage design (sketch only, per explicit instruction not to build the full architecture yet)
+
+The concept, not the schema: a future minimal lineage layer would need,
+at minimum, an analogous pattern to `ClassificationRun.classifier_
+version` generalized across every pipeline step - e.g. an
+`extractor_version`/`normalizer_version`/`chunker_version`/`embedding_
+model_version` recorded per `ContentIdentityGroup` (or per `Document`)
+at the point each step runs, so a future answer can name "which parser
+produced this text, which model produced this vector." The fuller
+`Processor`/`ProcessorVersion`/`ProcessingRun`/`InputArtifact`/
+`OutputArtifact` shape from the dormant research backlog (see
+[[project-ai-brain-prior-art-research-priorities]]-equivalent doc
+section) remains the eventual destination, but this gate does not
+propose its schema - only confirms that the frozen `14b8063` design's
+one-`ContentIdentityGroup`-per-pipeline-run shape is compatible with
+attaching such fields later without restructuring anything already
+built.
+
+### Answering the remaining questions not yet covered above
+
+**Q12 (partial corpus ingestion)**: no new "completeness" flag or table
+proposed. Completeness is a **derived**, not stored, fact - a query
+comparing paths named across `DiscoveryRun`-backed reports against
+`SourceInstance`s with a terminal `pipeline_state` gives a live
+completeness view. This is an observability/reporting concern (dormant
+backlog item), not a schema concern, and is not designed further here.
+
+**Q13 (T7 unavailability, continued)**: a "previously observed source
+disappears" (a later D1 report no longer lists a path an earlier
+`SourceInstance` named) does **not** mutate or delete the earlier
+`SourceInstance` or anything derived from it - `SourceInstance` rows
+are immutable historical facts (per `14b8063`); disappearance is
+represented purely by *absence* from a later `DiscoveryRun`'s
+underlying report, never as an edit to old rows. A dedicated
+`OBSERVED`/`MISSING_FROM_LATEST_SNAPSHOT` status (dormant backlog item
+11) would need a new schema field to track current-presence-per-
+snapshot explicitly - not designed or added here.
+
+**Q14 (path vs. identity)**: fully answered by mechanisms already
+built, requiring no new design. A renamed/moved file with unchanged
+content produces a *new* `SourceInstance` (new physical occurrence)
+that resolves, via `get_or_create_group`, to the *same*
+`ContentIdentityGroup` - "same content, new occurrence." A file at a
+*stable* path whose content changes produces a new `SourceInstance`
+whose hash differs, resolving to a *different* `ContentIdentityGroup` -
+"same physical occurrence, new content" - while the old `SourceInstance`
+(and anything already derived from its old content identity) remains
+untouched, exactly the historical-record behavior `14b8063` already
+guarantees.
+
+**Q16 (rebuildability)**: in principle, `T7 (immutable) +
+DiscoveryRun.report_sha256-verified reports + ClassificationRun.
+classifier_version + SourceInstance/ProvenanceLink (durable) +
+ContentIdentityGroup (durable)` is sufficient to re-derive `Document`/
+`DocumentChunk` by re-running extraction/normalization/chunking/
+embedding. **One real operational gap surfaced by checking this
+carefully**: the actual D0/D1/D2 JSON report files
+(`knowledge/t7_discovery/*.json`) are gitignored and exist only on this
+one machine - if this machine's disk were lost, `report_sha256`
+verification and full reconstruction would be lost even though the T7
+itself might survive. This is a genuine rebuildability risk worth a
+future gate's attention (e.g. a durable off-machine backup of discovery
+reports), not something this design pass fixes. Also worth naming: an
+embedding model change means "rebuilt" vectors are not bit-identical to
+lost ones, only functionally similar - full rebuildability of
+*embeddings specifically* also depends on pinning/retaining the exact
+model version (Q10's territory).
+
+**Q17 (privacy boundaries)**: two distinct decisions, both named
+explicitly rather than defaulted silently:
+1. **Storage vs. semantic indexing**: `SourceInstance.root_t7_path`/
+   `member_path` and `ProvenanceLink.path` necessarily store real
+   filenames/paths as structured provenance metadata - unavoidable,
+   that's the whole point of provenance. This design's position: these
+   fields are **not** independently embedded/semantically indexed as
+   searchable text content (i.e. a filename is never fed into the
+   embedding pipeline as if it were document text) - only actual
+   extracted document content is embedded.
+2. **Display/exposure**: whether a future chat answer's citation shows
+   the raw T7 path verbatim, or a redacted/generic label, is a
+   UI/prompt-design decision explicitly **not** made here (matches the
+   dormant "privacy boundaries" backlog item) - named as a real
+   decision a future RAG/UI gate must make deliberately, not one that
+   should default silently to "show everything."
+3. **A concrete, existing risk this gate identifies and mitigates at
+   the design level**: `FileAccessService._allowed_roots()` trusts any
+   `ImportJob.source_path` where `status == COMPLETED` as a live,
+   chat-tool-readable filesystem root. If a future T7 ingestion run
+   were represented as an `ImportJob` with `source_path = "/media/
+   personal/Seenu_T7SSD1"`, completing it would silently grant every
+   chat tool read access to the **entire T7**, far beyond anything the
+   ingestion/identity layer actually vetted - a serious, unintended
+   widening of exposure. **Recommended mitigation, a value convention
+   requiring zero schema change**: a T7 ingestion run's `ImportJob.
+   source_path` should be set to a non-path reference string (e.g.
+   `"classification_run:<id>"`), never a real T7 directory.
+   Verified precisely, not just asserted: `Path("classification_run:
+   42").resolve()` resolves relative to the process's current working
+   directory (no leading slash), producing a harmless, almost
+   certainly nonexistent path - it can never satisfy `resolved.
+   is_relative_to(root)` for a real T7 path a chat tool might request,
+   so `FileAccessService` correctly, structurally fails closed. This
+   is a recommended convention for the eventual implementation gate,
+   not a code change made now.
+
+**Q18 (human review)**: reuses `CanonicalDecisionService` exactly as
+already built in `1253a2e` - no new mechanism. D2's `requires_human_
+review` evidence (copied into `SourceInstance.evidence_snapshot` at
+classification time, per `29d6864`) is what a human consults before
+ever calling `decide()`; it is never auto-converted into a `CANONICAL`/
+`NON_CANONICAL` decision by any code path, matching the standing rule
+that inference must never be silently promoted to disposition. As
+resolved under Q7 above, this human-review path is entirely orthogonal
+to `ContentPipelineState.NEEDS_REVIEW`, which now means eligibility
+ambiguity only, not "D2 flagged something."
+
+### Review round 2 — worker/queue semantics, security hardening, failure-detail direction
+
+Requested before freezing: tighten eight specific points. The review's
+opening instruction was explicit - "do not assume the unique identity
+constraint solves pipeline concurrency" - and that assumption is
+exactly what round 1 left implicit. Corrected below, still design-only:
+no code, schema, or migration changes are made in this round either.
+
+#### 1. `ContentIdentityGroup` as work unit — the identity `UNIQUE`
+constraint solves a *different* problem than pipeline concurrency
+
+`1253a2e`'s `get_or_create_group` concurrency proof establishes that
+two workers racing to **establish** the same identity converge on one
+group. It says **nothing** about two workers racing to **advance** an
+*already-existing* group's `pipeline_state` - that is a second,
+separate concurrency problem, unaddressed until now.
+
+**The concrete gap**: today's `ContentIdentityGroup` schema
+(`pipeline_state`, `created_at`, `updated_at`) has no field recording
+*who is currently working on advancing this group*, or *when they
+started*. Without one, two workers could both see `pipeline_state =
+'EXTRACTED'`, both start normalizing, and both write conflicting
+`DocumentChunk` rows.
+
+**Recommended design** (schema fields named precisely, not added in
+this pass - a concrete requirement for the next schema-extension gate):
+add `claimed_by` (text, nullable) and `claimed_at` (timestamp,
+nullable) to `ContentIdentityGroup`. A worker claims a group with a
+single atomic statement - the standard Postgres claim pattern already
+proven safe by this codebase's own `get_or_create_group` and Chain 1's
+`SELECT ... FOR UPDATE` claiming, generalized:
+
+```sql
+UPDATE content_identity_groups
+SET claimed_by = :worker_id, claimed_at = now()
+WHERE id = (
+    SELECT id FROM content_identity_groups
+    WHERE pipeline_state IN (<the state this worker advances FROM>)
+      AND (claimed_by IS NULL OR claimed_at < now() - :lease_duration)
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING *;
+```
+
+`FOR UPDATE SKIP LOCKED` is what makes this safe under real concurrency
+- a second worker's identical query simply skips a row another worker
+already has locked, rather than blocking on it or double-claiming it.
+This is the same category of primitive Chain 1 already relies on for
+execution claiming, generalized here for a queue rather than a
+single-shot execution - not a new invention, not Chain 1's specific
+state machine either.
+
+**Answering each sub-question explicitly**:
+- **Claim**: the atomic `UPDATE ... WHERE ... FOR UPDATE SKIP LOCKED`
+  above.
+- **Preventing double-processing**: the same statement - a group with
+  a fresh (non-expired) `claimed_at` is excluded from every other
+  worker's claim query.
+- **Worker crashes after claiming**: `claimed_by`/`claimed_at` remain
+  set, `pipeline_state` remains at whatever it was before the crash
+  (the crash happened *during* an attempt to advance it, so it never
+  advanced). The group looks claimed but is making no progress.
+- **Stale-claim recovery**: a lease duration (a bounded constant, value
+  not chosen here) makes a claim eligible for reclaiming once
+  `claimed_at` is older than the lease - the same `WHERE (claimed_by IS
+  NULL OR claimed_at < now() - lease_duration)` clause already shown
+  above *is* the recovery mechanism, not a separate one - no distinct
+  "recovery service" is needed the way Chain 1 needed
+  `recover_stale_execution`, because claim expiry alone is sufficient
+  here (no filesystem mutation is at stake, only which worker gets to
+  attempt a database write).
+- **Retry semantics**: reclaiming a stale or `FAILED` group and
+  re-attempting its current step is safe *specifically because* each
+  step's operation is idempotent (Q6's `EmbeddingService.
+  embed_document` precedent) - re-running normalize/chunk/embed against
+  the same input produces the same result, never a duplicate.
+- **Terminal failure**: not decided in this pass. Whether `FAILED`
+  remains indefinitely retryable or accumulates an attempt count that
+  eventually reaches a genuinely terminal "gave up" state depends on
+  the attempt-metadata design in point 5 below - named as an open
+  question there, not answered twice.
+- **Idempotent retries**: as above - the correctness argument is "the
+  operation is idempotent," not "the claim mechanism prevents
+  duplication" (the claim mechanism prevents *concurrent* duplication;
+  idempotency is what makes a *sequential* retry after a crash safe).
+
+#### 2. `SourceInstance` identity-resolution queue — an even more acute version of the same gap
+
+`SourceInstance` has **no state or claim field of any kind** today -
+not even the single `pipeline_state` `ContentIdentityGroup` has. Two
+different cases need two different answers, not one:
+
+- **Archive members**: no per-member claim field is needed at all,
+  because the natural unit of claiming is the **parent archive's own
+  `SourceInstance`**, not each member individually. One worker claims
+  the archive-file `SourceInstance` (via the same claim pattern as
+  point 1, applied to whatever record represents "this archive needs
+  extracting" - concretely, its owning `ContentIdentityGroup` if one
+  exists for the archive container, or the `SourceInstance` itself if
+  extraction is modeled as a pre-identity step - see below), opens it
+  once, and within that single claimed unit of work: enumerates every
+  member, creates every member `SourceInstance`, computes every
+  member's `EXTRACTED_CONTENT` hash, and calls `get_or_create_group`/
+  `assign_content_identity` for each - all inside one worker's
+  transaction. No second worker can ever be mid-way through the SAME
+  archive at the same time, because only the archive-level claim was
+  ever contended for.
+- **Uniquely-sized loose files** (no parent archive to claim instead):
+  this case has no coarser unit to borrow a claim from - it genuinely
+  needs its own claim mechanism. **Recommended design, not added in
+  this pass**: the same `claimed_by`/`claimed_at` pattern from point 1,
+  added to `SourceInstance` itself, used only for instances where
+  `content_identity_group_id IS NULL` and no parent link exists (a
+  root-level, unhashed loose file).
+
+**Lifecycle, stated precisely**: `queue` (`content_identity_group_id
+IS NULL`, root-level `SourceInstance`) → `claim` (per above) → `read
+and hash the file` → `get_or_create_group` + `assign_content_identity`
+(both already concurrency-proven in `1253a2e` - reused, not
+redesigned) → on failure, see point 5 (this is exactly the case named
+there where a failure has no home in today's schema, since
+`SourceInstance` carries no failure field at all).
+
+#### 3. `FileAccessService` — the full call chain, and a structural fix instead of a naming convention alone
+
+Round 1's proposed mitigation was a *string convention*
+(`"classification_run:<id>"` never resolving as a real path). This
+review correctly identifies that a convention alone is one careless
+future caller away from being violated - a structural check is
+stronger. The full call chain was re-read end to end:
+`read_file(path)` → `_allowed_roots()` (queries every `COMPLETED`
+`ImportJob`, resolves each raw `source_path` to a `Path`) →
+`resolved.is_relative_to(root)` for the *requested* path against every
+allowed root → `resolved.is_file()` → `extract_text(resolved)`. The
+only place a T7-backed reference could ever leak into "read access" is
+`_allowed_roots()` - nowhere else in the chain even sees `source_type`.
+
+**Structural fix, not a naming convention**: `_allowed_roots()` must
+filter by `ImportJob.source_type` against an explicit **allow-list**,
+not merely trust every `COMPLETED` job's `source_path` regardless of
+kind. Checked directly against this codebase's actual usage (`grep`
+across `tests/` and `app/`): every real caller today sets
+`ImportJob.source_type = "filesystem"` - already, unanimously, before
+this design pass touched anything. The recommended allow-list is
+therefore exactly `{"filesystem"}` today, requiring **zero change to
+any existing caller's behavior** - only an added filter in
+`_allowed_roots()`'s query (`WHERE status == COMPLETED AND source_type
+== 'filesystem'`, or an explicit small allow-list if more filesystem-
+backed types are added later).
+
+**Why an allow-list, not a deny-list, and why that choice matters**:
+a deny-list (block known-bad `source_type`s) trusts every *new* type by
+default - a future T7-reference type, or any other non-filesystem
+concept nobody thought to block yet, would be silently trusted the
+moment it's introduced. An allow-list trusts nothing by default - a
+new `source_type` is unreadable until someone deliberately adds it to
+the allow-list, which forces a conscious decision at the moment it
+matters. This is the same fail-closed posture already established as
+a house principle after the D2 safety-follow-up incident
+("application safety must not depend on the OS happening to deny an
+unsafe operation") - applied here to a different mechanism, the same
+underlying discipline.
+
+**Explicit answer to "why can a T7-backed classification/import object
+never become a chat-readable filesystem root"**: because (a) its
+`source_path` never contains a real filesystem path in the first place
+(point 7 below states precisely which objects may hold one), and (b)
+even if it somehow did, its `source_type` would not be in `{"filesystem"}`
+and `_allowed_roots()` would exclude it by construction, not by
+convention. Two independent reasons, not one - a violation of (a)
+alone is still caught by (b).
+
+#### 4. `EmbeddingService` crash semantics — verified by re-reading the code, not assumed
+
+`embed_document()`'s `DELETE` and subsequent `INSERT`s are issued on
+the **same session, with no intermediate commit** between them - the
+only `db.commit()` for the non-empty-chunks path is the single call at
+the very end, after both the delete and the adds. Confirmed against
+`app/db/session.py`'s `SessionLocal` configuration and SQLAlchemy 2.0's
+"autobegin" transaction semantics: a transaction begins implicitly on
+first use and persists until an explicit `commit()` or `rollback()` -
+there is no intermediate auto-commit point hiding inside this method.
+
+**Stated precisely, per stage**:
+- **Crash after the `DELETE` statement is issued, before `commit()`**:
+  the `DELETE` is part of an uncommitted transaction. Postgres rolls
+  back the entire transaction when the connection drops - the delete
+  never takes effect. **Old chunks are preserved, unchanged.** Not a
+  partial-delete state; a full no-op from the database's perspective.
+- **Crash during `self.embedding_client.embed(chunks)`** (the Ollama
+  network call): still before any add or commit - same outcome as
+  above. Old chunks preserved.
+- **Crash during `db.add_all(records)` or before the final
+  `db.commit()`**: still uncommitted - same outcome. Old chunks
+  preserved.
+- **The one residual ambiguity, common to any transactional system, not
+  specific to this code**: a crash *during* the `commit()` call itself,
+  where the command reached Postgres and was applied, but the
+  acknowledgment never reached the client. This is not resolvable by
+  inspecting this method in isolation - **it is resolved by
+  idempotency**: calling `embed_document()` again is always safe
+  regardless of which outcome actually occurred, because it starts
+  with the same `DELETE` and produces the same end state either way.
+
+**Conclusion, stated as the review required - not silently assumed**:
+this existing implementation *is* effectively atomic for the delete+
+recreate pair (single uncommitted transaction, all-or-nothing), and the
+one edge case a database transaction cannot resolve on its own is
+covered by the operation's own idempotency, not by a false claim of
+distributed-transaction atomicity. No change to `EmbeddingService` is
+proposed - the existing behavior is correct and is now documented as
+such, with the reasoning shown rather than asserted.
+
+#### 5. Failure semantics — a recommended direction, not implemented
+
+**Recommended shape** for the next schema-extension gate, chosen by
+weighing the two options the review named against this codebase's own
+established pattern:
+
+A **per-attempt audit row** (one new table, e.g. `ContentPipelineAttempt`
+- name illustrative, not final), recording `content_identity_group_id`,
+`attempted_stage` (which forward transition was being tried),
+`failure_code` (a small controlled vocabulary - `corrupt_archive`,
+`extraction_error`, `embedding_unavailable`, etc.), `failure_detail`
+(free text - the actual exception message, for debugging), `attempted_
+at`, `worker_id`. **This is the recommended direction**, not the
+simpler alternative (a handful of mutable columns directly on
+`ContentIdentityGroup` - `last_failed_stage`/`failure_code`/
+`failure_detail`/`attempt_count`), because this codebase already has a
+strong, repeated precedent for exactly this shape: `DedupExecutionActionAudit`
+and `DiscoveryRun`/`ClassificationRun` themselves are all one-row-per-
+event, append-only audit records, not mutable "latest status" columns
+bolted onto a parent row. An audit table preserves the *full retry
+history* ("why does this keep failing, across every attempt") rather
+than only the most recent failure - directly useful for the debugging
+`FAILED` groups will need. The simpler column-only alternative remains
+available as a lighter fallback if the schema-extension gate weighs the
+trade-off differently; this design pass states a recommendation, not a
+mandate.
+
+**Distinguishability, stated explicitly since this is exactly what the
+review is probing for**: `failure_code`/`failure_detail`/`attempted_
+stage` (wherever they end up living) are populated **only** when
+`pipeline_state = 'FAILED'`. They are never populated for, and never
+used to distinguish, `EXCLUDED` (whose reasoning already lives in
+`SourceInstance.evidence_snapshot`/documented policy, not a failure),
+`UNSUPPORTED` (a capability fact - "no extractor exists," not a
+per-attempt detail), or `NEEDS_REVIEW` (whose reasoning is the
+eligibility-ambiguity finding itself, already the state's whole
+meaning). Four states, four different kinds of "why," never
+conflated into one shared detail field.
+
+#### 6. Discovery report rebuildability — gitignored is not disposable
+
+**The design decision, stated explicitly**: D0/D1/D2 report files
+(`knowledge/t7_discovery/*.json`) are **durable, high-value, hard-to-
+reproduce-identically artifacts**, not disposable/regenerable-on-demand
+junk. Gitignoring them protects against committing real personal
+filenames into shared git history (a privacy control) - it says
+nothing about backup, and this design pass corrects the conflation.
+Re-scanning the T7 to "regenerate" a lost report would **not** reliably
+reproduce it: the T7 is a live, Syncthing-managed corpus (established
+since D0/D1/D2 themselves), so a new scan reflects a different point in
+time, not a byte-identical replay of an old one - a lost report is a
+genuine, non-trivial loss, not an inconvenience fixed by re-running a
+script.
+
+**Options considered and the recommendation**:
+- Backing the reports up *onto the T7 itself* is explicitly **rejected**
+  - it would violate the standing "T7 remains immutable, forever
+    read-only" principle just to solve a backup problem for something
+    else entirely.
+- Committing them to git (even a private repository) is explicitly
+  **rejected** - the reason they were gitignored (real personal
+  filenames/paths) doesn't stop being true just because a repository is
+  private.
+- **Recommended**: treat this as an *operational* backup responsibility
+  outside AI_Brain's own application code - the same way any personal
+  backup routine already exists for a home machine - copy `knowledge/
+  t7_discovery/*.json` to at least one location independent of this
+  one machine's disk (an external drive, a personal cloud backup,
+  etc.). AI_Brain's own responsibility, for a future gate, is limited
+  to making the *need* visible rather than solving backup itself -
+  e.g., a future health-check confirming a `DiscoveryRun.report_sha256`
+  still matches a reachable file, surfacing drift or loss rather than
+  silently trusting a stale reference.
+- **Also named as a real alternative for a future schema-extension
+  gate to weigh, not decided here**: storing report content (or a
+  compacted, critical subset of it) directly in Postgres as a `DiscoveryRun`
+  column, so the reports inherit whatever backup discipline already
+  covers the database itself, rather than needing a wholly separate
+  file-backup policy. Not proposed as a schema change in this pass.
+
+#### 7. Real/derived source boundary — an explicit allow/forbid list
+
+Stated once, precisely, tying points 3 and 7 together as one coherent
+rule:
+
+**MAY hold a real T7 path, as inert metadata only, never as a
+live-dereferenceable filesystem root**: `DiscoveryRun.source_root`,
+`SourceInstance.root_t7_path`/`member_path`, `ProvenanceLink.path`.
+Already documented (in `29d6864`/`14b8063`) as never re-dereferenced as
+a live path after classification runs - reaffirmed here, unchanged.
+
+**MUST NEVER hold a real, live-dereferenceable T7 path**: `ImportJob.
+source_path` for any T7-sourced ingestion run (must hold a non-path
+reference such as `"classification_run:<id>"`, per point 3) - and
+`Document.source`, which already means the on-disk **working-copy**
+path under `documents/imports/<job_id>/`, never the T7 path itself,
+for T7-sourced documents exactly as it already means for personal-
+corpus documents today - no new exception introduced.
+
+**The actual authority boundary, stated as one rule**: a real T7 path
+existing anywhere in the database, as provenance evidence, never by
+itself grants filesystem access. Access is gated **exclusively** through
+`FileAccessService._allowed_roots()`'s `source_type` allow-list (point
+3) - and every object that legitimately carries a real T7 path
+(`DiscoveryRun`, `SourceInstance`, `ProvenanceLink`) has no `source_type`
+field and is never consulted by `_allowed_roots()` at all, structurally,
+not by omission that could later be "fixed" into a leak.
+
+### Deliverable 10: explicit list of decisions still deferred (updated after review round 2)
+
+**Now a decided *direction*, not an open menu** (round 2 committed to
+these, even though none is implemented in this pass):
+- Worker claiming for `ContentIdentityGroup`: `claimed_by`/`claimed_at`
+  columns + `SELECT ... FOR UPDATE SKIP LOCKED`, lease-based stale
+  recovery (round 2, point 1).
+- Identity-resolution claiming for root-level, unhashed
+  `SourceInstance`s: the same `claimed_by`/`claimed_at` pattern, added
+  to `SourceInstance` itself; archive members need no such field
+  because their unit of claiming is their parent archive (round 2,
+  point 2).
+- `FileAccessService._allowed_roots()` must filter by an explicit
+  `source_type` **allow-list** (`{"filesystem"}` today), not merely
+  trust every `COMPLETED` `ImportJob` (round 2, point 3) - a code
+  change, not a schema change, for the implementation gate.
+- Failure detail: a per-attempt audit table (recommended,
+  `ContentPipelineAttempt`-shaped) over mutable columns directly on
+  `ContentIdentityGroup`, matching this codebase's existing audit-row
+  precedent (round 2, point 5).
+- Discovery reports are durable artifacts requiring an operational,
+  off-machine backup routine outside AI_Brain's own code - never
+  backed up onto the T7, never committed to git (round 2, point 6).
+- The real/derived source boundary is now an explicit allow/forbid list
+  (round 2, point 7), not a single convention.
+
+**Still genuinely open, exact values/schemas not chosen**:
+- The exact lease duration for stale-claim recovery (point 1).
+- The exact resume-sweep policy for `FAILED` (auto-retry vs. manual,
+  backoff, max attempts) and whether `FAILED` ever becomes a distinct,
+  bounded-retry terminal state (points 1 and 5).
+- The retention policy for the extraction workspace (still open since
+  `29d6864`).
+- The exact recursion-depth limit for nested-archive extraction (a
+  bounded constant, value not chosen here).
+- A `superseded_by_classification_run_id`-style field (or equivalent)
+  for `UNSUPPORTED`/`EXCLUDED`/`NEEDS_REVIEW` groups a future
+  reclassification might move forward - not designed, not added to the
+  schema here.
+- The exact schema for `ContentPipelineAttempt` (or the lighter
+  column-only alternative, if a future gate weighs the trade-off
+  differently) - a direction is recommended, not a final schema.
+- The full `Processor`/`ProcessorVersion`/`ProcessingRun` architecture
+  (Q10) - only the minimal per-step version-field concept is sketched.
+- Citation/UI display policy for real T7 paths (Q17.2).
+- Whether discovery-report content should eventually move into
+  Postgres itself rather than staying as external files (round 2,
+  point 6's named alternative).
+- Corpus-completeness reporting/observability (Q12) - derivable from
+  existing data, but no view or endpoint is designed here.
+- Everything already deferred by `29d6864`/`14b8063` and unchanged by
+  this pass: logical document/version identity (identity layers 3/4),
+  any canonical-selection algorithm beyond an explicit human decision,
+  resource limits/backpressure/scheduling (Track 2), and the exact
+  `SourceInstance` backfill logic for any pre-existing `Document` rows.
+
+### What this design pass explicitly does NOT decide or build
+- Any code, migration, or schema change of any kind.
+- The `ImportJob.source_type`/`source_path` convention change for T7
+  runs (Q17.3) - recommended, not applied.
+- Any T7 access, read, hash, extraction, or embedding. This section was
+  written entirely from the existing, already-implemented codebase
+  (`app/ingestion/`, `app/classification/`, `app/services/`,
+  `app/provenance/`, `app/files/`) and the frozen `29d6864`/`14b8063`
+  designs; no new scan, hash, or read of either T7 path occurred to
+  produce it.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

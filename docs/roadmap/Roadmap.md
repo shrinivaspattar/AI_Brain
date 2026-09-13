@@ -1314,11 +1314,10 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       gap. See `AI_Brain_Architecture.md`'s "Schema/Model Design"
       section for the full, frozen proposal, including the round-5
       invariant table and cardinality/checklist walkthroughs.
-- [ ] Schema/Model Implementation for `SourceInstance → ProvenanceLink
+- [x] Schema/Model Implementation for `SourceInstance → ProvenanceLink
       → ContentIdentityGroup → Document → DocumentChunk` — implements
       the `14b8063` design exactly, no T7 access, no real-corpus
-      ingestion, no embeddings. **Implementation complete, one
-      pre-commit review round done, not yet committed.** Five new
+      ingestion, no embeddings. **Committed at `1253a2e`.** Five new
       models (`DiscoveryRun`,
       `ClassificationRun`, `ContentIdentityGroup`, `SourceInstance`,
       `ProvenanceLink`) plus one new nullable, UNIQUE
@@ -1387,6 +1386,116 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       extraction/ingestion — still no T7 access beyond what D0/D1/D2
       already performed, no embeddings, no
       real-corpus mutation, until each is separately opened.
+- [x] Controlled T7 → AI_Brain Ingestion Design — design pass only, no
+      T7 access, no code/schema/migration changes. **APPROVED and
+      frozen after two review rounds.** Answers 18 questions
+      across eligibility, the ingestion unit, `SourceInstance` creation
+      timing, content-identity timing, archive processing, idempotency,
+      the state machine, workspace design, snapshot semantics,
+      provenance queryability, failure/retry handling, partial-corpus
+      state, T7 unavailability, path-vs-identity, rebuildability,
+      privacy boundaries, and human review. Key findings: (1) `14b8063`
+      implicitly assumed classification creates every `SourceInstance`
+      up front, including archive members — corrected: D1/D2 never
+      opened archives, so archive-member `SourceInstance`s are only
+      ever created live, during extraction, referencing their parent
+      archive's `classification_run_id`. (2) The ingestion unit of work
+      is `ContentIdentityGroup` — no new "work item" table needed,
+      `pipeline_state` already is the queue state, decomposed into two
+      queues expressible in the existing schema (`SourceInstance`s
+      needing identity resolution vs. `ContentIdentityGroup`s needing a
+      pipeline run). (3) A real inconsistency between `29d6864` and
+      `14b8063` was found and resolved: `ContentPipelineState.
+      NEEDS_REVIEW` cannot mean "D2 flagged this" (ingestion must never
+      wait on canonical resolution, per `29d6864`) — narrowed to mean
+      eligibility ambiguity at classification time only, entirely
+      separate from D2's per-instance review flag, which drives
+      `canonical_status` via the already-built `CanonicalDecisionService`
+      and nothing else. (4) A concrete security risk was identified and
+      mitigated at the design level: `FileAccessService._allowed_roots()`
+      trusts any `COMPLETED` `ImportJob.source_path` as a live,
+      chat-readable root — a T7-sourced `ImportJob` must use a
+      non-path reference string (e.g. `"classification_run:<id>"`),
+      verified to structurally fail `FileAccessService`'s containment
+      check rather than accidentally exposing the whole T7. (5) Reused,
+      not reinvented: `ArchiveExtractor`'s existing safety guards
+      (path-traversal, expansion-ratio, disk-space, symlink rejection)
+      apply recursively at every nesting level plus a new depth limit;
+      `EmbeddingService.embed_document`'s existing delete-then-recreate
+      pattern is the model for idempotent normalization/chunking;
+      `get_or_create_group`'s already-proven concurrency safety (from
+      `1253a2e`) is called, not redesigned. Named, not fixed (schema
+      changes are out of scope for design): `ContentIdentityGroup` has
+      no `failure_reason` column today; a durable off-machine backup
+      for `knowledge/t7_discovery/*.json` is a real rebuildability gap;
+      a `superseded_by_classification_run_id`-style field for
+      `UNSUPPORTED`/`EXCLUDED`/`NEEDS_REVIEW` reclassification is
+      recommended for a future schema-extension gate. See
+      `AI_Brain_Architecture.md`'s "Controlled T7 → AI_Brain Ingestion
+      Design" section for the full proposal, including the state
+      machine, failure/retry matrix, and provenance query graph.
+
+      **Review round 2 (direction approved, tightened before freezing)**:
+      the reviewer's opening instruction was explicit — "do not assume
+      the unique identity constraint solves pipeline concurrency" — and
+      round 1 left exactly that implicit. (1) `ContentIdentityGroup`
+      worker/queue semantics now designed precisely: `claimed_by`/
+      `claimed_at` columns (recommended, not added) + a
+      `SELECT ... FOR UPDATE SKIP LOCKED` claim query, generalizing
+      Chain 1's claiming primitive without reusing Chain 1's state
+      machine; stale-claim recovery is lease-expiry on the same query,
+      no separate recovery service needed; retries are safe because
+      each step is idempotent, not because the claim mechanism prevents
+      sequential duplication. (2) `SourceInstance` identity-resolution
+      queuing: archive members need no per-instance claim field at all
+      — the natural claim unit is their parent archive, one worker
+      opens it once and creates every member's `SourceInstance` inside
+      that single claimed unit of work; uniquely-sized loose files have
+      no such coarser unit and genuinely need their own `claimed_by`/
+      `claimed_at` fields (recommended, not added). (3)
+      `FileAccessService` hardened from a naming convention to a
+      structural check: `_allowed_roots()` must filter by an explicit
+      `source_type` **allow-list** (verified via `grep` that every real
+      caller today already uses `"filesystem"`, so this requires zero
+      change to existing behavior) rather than trusting every
+      `COMPLETED` `ImportJob` — an allow-list fails closed for any
+      future `source_type` nobody thought to block yet, a deny-list
+      would not. (4) `EmbeddingService`'s delete-then-recreate
+      confirmed, by re-reading the code and its transaction semantics
+      (not assumed), to already be atomic — `DELETE` and `INSERT`s
+      share one uncommitted transaction, so any crash before the final
+      `commit()` leaves old chunks fully intact; the one residual
+      ambiguity common to any transactional system (commit sent,
+      acknowledgment lost) is resolved by the operation's own
+      idempotency, not a false atomicity claim. (5) Failure-detail
+      direction decided: a per-attempt audit table (recommended,
+      matching this codebase's existing `DedupExecutionActionAudit`/
+      `DiscoveryRun` one-row-per-event precedent) over mutable columns
+      on `ContentIdentityGroup`, populated only when `pipeline_state =
+      FAILED` — never blurring `EXCLUDED`/`UNSUPPORTED`/`NEEDS_REVIEW`,
+      each of which already carries its own distinct reasoning
+      elsewhere. (6) Discovery-report rebuildability: gitignored
+      explicitly redefined as *not* disposable — reports are durable,
+      hard-to-reproduce-identically artifacts requiring an operational,
+      off-machine backup routine outside AI_Brain's own code; backing
+      them up onto the T7 itself or committing them to git are both
+      explicitly rejected, for reasons named precisely (violates T7
+      immutability; doesn't remove the privacy reason they were
+      gitignored). (7) The real/derived source boundary is now an
+      explicit allow/forbid list tying points 3 and 7 together: a real
+      T7 path existing anywhere in the database never by itself grants
+      filesystem access — only `DiscoveryRun`/`SourceInstance`/
+      `ProvenanceLink` may hold one (as inert metadata), `ImportJob.
+      source_path`/`Document.source` never may, and access is gated
+      exclusively through the `source_type` allow-list. **APPROVED and
+      frozen** — a resend of the same review was confirmed as such
+      (not a new round) and the design was approved for freeze without
+      further changes. **Next gate, not yet authorized**:
+      implementation of this design — still no T7 access, extraction,
+      embeddings, or real-corpus ingestion until that is separately
+      opened, and still requiring its own schema-extension gate first
+      for the `claimed_by`/`claimed_at`/failure-detail fields this
+      design recommends but does not add.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
