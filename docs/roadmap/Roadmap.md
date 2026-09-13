@@ -1853,6 +1853,137 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       ingestion gate until then — this freeze authorizes no code, no
       schema migration, and no T7 access.
 
+- [x] Scaled Real-T7 Ingestion — Numeric + Policy Definition Pass —
+      **APPROVED and frozen**, design-only, sitting on top of the frozen
+      architecture (`f2b9815`).
+      No T7 access, no scan, no schema/code change. Every number is
+      derived from the two existing reports (`inventory.json`,
+      `duplicate_analysis.json`) plus direct local disk/database
+      measurement — never invented, never a fresh corpus traversal.
+
+      Replaces the illustrative "Batch A–G" sketch with 8 concrete
+      classes grounded in real D0/D1 evidence: Class 1 (Text/Document,
+      `LOOSE_FILE` only) is the primary initial-rollout candidate — the
+      corpus's document category is only 2.6% of bytes (17.6GB /
+      377,943 files, ~46KB average) but by far the lowest-risk. Classes
+      2–5 (Small/Medium/Large/Extreme Archive) use D1-derived
+      **source-size** tiers (<10MB / 10MB–1GB / 1–5GB / 5GB+ — declared
+      compressed bytes only, explicitly not an expansion-risk claim),
+      covering 97.9% of D0's known `.zip`/`.7z` files. Classes 6/7
+      (Media/Software) are **deferred, completeness-only** — not
+      ordinary low-risk ingestion classes — since no extractor exists
+      for that content today; they exist purely so the completeness
+      denominator accounts for the corpus's `UNSUPPORTED` share. Class 8
+      (Special/Deferred) explicitly excludes `.c9r`, `.html` (40.1GB —
+      the corpus's single largest "unaccounted" contributor, which
+      would otherwise silently succeed as raw-markup "text" with no
+      real extractor), `.dat`/`.db`/no-extension, and Anki files.
+
+      **Real finding, worded to keep the architecture invariant and the
+      scaling optimization distinct**: archive containers are not
+      deduplicated through `ContentIdentityGroup` (correct — a
+      container isn't itself content), so identical archive *copies*
+      may otherwise be independently, redundantly extracted. The 1–5GB
+      tier alone has 31 distinct archives appearing as 68 physical
+      copies (~2.2× average duplication). Selection **may** admit at
+      most one representative per D1 exact-duplicate group (SHA-256
+      content hash) for extraction — never on filename/path similarity,
+      directory-naming convention, or compressed size alone. This is a
+      selection/scheduling decision only: the other physical copies
+      remain exactly what they already are — real, distinct
+      `SourceInstance` rows and provenance observations — never treated
+      as deleted, discarded, or globally equivalent, and no dedup
+      mutation of any kind occurs.
+
+      **Resource-envelope correction, per review**: `max_extracted_bytes`
+      must not be read as "however much workspace disk happens to be
+      free." Each physical resource (workspace `/home`, PostgreSQL `/`)
+      is governed by the same inequality with an explicit, visible
+      safety reserve: `projected_consumption + projected_background_growth
+      + safety_reserve <= currently_available_capacity`, re-checked live,
+      never assumed fixed. **The 10GB/5GB reserve values are configured
+      policy; the 25GB/13GB free-space figures are runtime measurements
+      of this machine right now, not each other** — a future
+      implementation must re-measure free space live, never treat
+      today's numbers as permanently known facts. Concretely, using
+      today's measurement as a worked example: workspace reserve 10GB
+      (25GB free today → 15GB extraction budget); PostgreSQL reserve
+      5GB (13GB free today → 8GB db-growth budget). No DB-growth-per-
+      embedding formula is invented — the governing invariant instead
+      uses the three tiers already defined per-guard (soft stop, review-
+      required, hard stop): **soft-stop fires before hard-stop** as a
+      resource depletes (a controlled pause — no further work admitted —
+      well before an emergency stop), review-required is a separate,
+      projection-based check orthogonal to that live sequence, and
+      **the tightest remaining resource budget governs continued
+      execution** across every guard, with hard-stop as the last-resort
+      tier, never the first threshold that matters. Per-embedding DB
+      cost is an empirical output Class 1 must measure, not an input
+      assumed now.
+
+      First scaled batch defined precisely: Class 1, 1,000 files
+      (an explicit **policy choice**, not a threshold derived from a
+      rate/scaling formula), 2GB source-byte safety cap, and a 2-hour
+      runtime ceiling — **also an explicit provisional policy choice
+      requiring later calibration, the same status as the 1,000-file
+      figure**, not a measured limit. `max_embeddings` is **CALIBRATION_REQUIRED**
+      — per review, the earlier "~5 chunks/file" estimate was an
+      arithmetic error: the two pilots' only real evidence (5 items,
+      3–2,821 bytes each, ~1 chunk per 700–1,400 bytes) actually implies
+      ~33–66 chunks/file against this category's real ~46KB average, and
+      5 tiny items cannot be responsibly extrapolated to that population.
+      This gap must be closed by Class 1's own execution-authorizing
+      gate, not guessed here; the atomic-reservation mechanism applies
+      to whatever ceiling is ultimately set. Class 1's promotion evidence
+      now explicitly includes the calibration inputs every later class
+      needs: chunks-per-source distribution, embeddings-per-source
+      distribution, embedding throughput/latency, DB growth per embedded
+      chunk, workspace consumption, processing time, and retry/error
+      distribution. Promotion ladder remains evidence-based, not
+      size-doubling: each step requires zero safety incidents,
+      denominator reconciliation, and (starting at Class 2) real
+      expansion-ratio/risk-estimation-accuracy evidence this corpus has
+      never produced before, since both real pilots' archives had zero
+      actual members.
+
+      Resource-guard thresholds set from real, just-measured local
+      state: the PostgreSQL data volume (`/`, 13GB free of 110GB) is
+      the *tighter* constraint, not the workspace volume (`/home`, 25GB
+      free) — worth naming explicitly since it's easy to assume
+      otherwise. Ollama embedding-latency ceiling and all archive-
+      extraction-envelope/risk-tier-actual numeric boundaries remain
+      explicitly marked **UNRESOLVED**, deferred to calibration from
+      Class 1/2's own real results, not guessed. Archive source-size
+      tiers (SMALL/MEDIUM/LARGE/EXTREME) name declared compressed bytes
+      only — `risk_tier_estimated` is informed by, but kept distinct
+      from, that size tier, leaving room for future non-size signals.
+      `selection_policy_version` is named per batch-class/policy (e.g.
+      `"batch-class-1-text-document-v1"`), separate from envelope
+      values, which already feed the selection fingerprint directly.
+
+      See `AI_Brain_Architecture.md`'s "Scaled Real-T7 Ingestion —
+      Numeric + Policy Definition Pass" section for the full
+      specification, including the decided-now vs. requires-calibration
+      table.
+
+      **APPROVED as the numeric/policy baseline** — Class 1's five
+      envelope values (`max_source_instances=1,000`,
+      `max_source_bytes=2GB`, `max_extracted_bytes=N/A`,
+      `max_embeddings=CALIBRATION_REQUIRED`,
+      `max_runtime_seconds=7,200` provisional), the 10GB/5GB policy
+      reserves, the four archive source-size tiers, D1-duplicate
+      scheduling-only handling, and Media/Software deferred/
+      completeness-only status are all frozen as the baseline.
+      UNRESOLVED/`CALIBRATION_REQUIRED` items remain intentionally
+      deferred, not disguised as settled numbers. **This approval
+      authorizes no implementation, schema/migration work, or real-T7
+      access.** **Next gate, not yet authorized**: a separate
+      implementation design pass translating this policy layer into
+      `IngestionBatch`, selection, resource-guard, reservation,
+      reporting, and worker-control behavior while preserving every
+      contract frozen at `f2b9815` — implementation itself is a further,
+      later gate beyond that.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

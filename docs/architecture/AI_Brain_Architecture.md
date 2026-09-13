@@ -6733,6 +6733,579 @@ Host resource monitoring beyond disk/Postgres/Ollama is optional and pluggable; 
   explicitly approved before an implementation design, and the real T7
   remains outside the ingestion gate until then.
 
+## Scaled Real-T7 Ingestion — Numeric + Policy Definition Pass (design pass, APPROVED and frozen — no implementation yet)
+
+Docs-only, sitting on top of the frozen architecture (`f2b9815`). No T7
+access, no scan, no schema/code change. Every number below is derived
+from the two reports already on disk (`inventory.json`,
+`duplicate_analysis.json`) plus direct, local, non-T7 measurements of
+this machine's current disk/database state — never invented, never a
+fresh corpus traversal. Anything the existing evidence can't support is
+marked **UNRESOLVED**, not guessed.
+
+### Evidence base (computed just now, from existing reports only)
+
+D0 (`inventory.json`, scanned 2026-09-12): 619,087 files, 669.1 GB.
+
+**Important scope limit on the normalization below**: Syncthing appends
+`_<digits>` to a colliding filename (e.g. `.pdf_1768918262`), and
+8,000+ files carry such a suffix. For *this pass's numeric estimation
+only*, those raw observed extensions are merged into their base
+extension (`.pdf_1768918262` → `.pdf`) to produce a meaningful
+aggregate size/count table — otherwise the same real content-type
+would be undercounted across many synthetic-looking "extensions."
+**This is an analytical bucketing step for sizing envelopes, not a
+decision about how the real `SourceInstance.workload_category`
+classification function should behave.** Whether the actual
+implementation strips conflict-rename suffixes when computing
+`workload_category` is a separate, still-open implementation-design
+question, not settled by this document:
+```
+raw observed extension/path  →  normalized analytical bucket (THIS PASS, for sizing only)
+raw observed extension/path  →  SourceInstance.workload_category (a DIFFERENT, not-yet-decided function)
+```
+Normalized workload rollup (analytical only):
+
+| Rollup | Files | Bytes | % of corpus |
+|---|---|---|---|
+| ARCHIVE (`.zip`/`.7z`/`.gz`/`.rar`) | 787 | 368.6 GB | 55.1% |
+| MEDIA (`.mp4`/`.jpg`/`.png`/`.wav`/`.m4a`/…) | 37,287 | 163.8 GB | 24.5% |
+| SOFTWARE (`.exe`/`.dll`/`.msi`/`.apk`/…) | 16,549 | 52.8 GB | 7.9% |
+| UNACCOUNTED (`.html` 40.1GB dominant, `.dat`/`.db`/no-ext/`.bin`) | ~42,700 | 55.0 GB | 8.2% |
+| TEXT_DOCUMENT (`.txt`/`.md`/`.pdf`/`.docx`/`.pptx`/`.json`) | 377,943 | 17.6 GB | 2.6% |
+| ANKI (`.apkg`/`.colpkg`) | 288 | 6.8 GB | 1.0% |
+| ENCRYPTED (`.c9r`) | 79,314 | 4.5 GB | 0.7% |
+
+Verified directly against the running code (`eligibility_service.py`,
+`text_extractor.py`), not assumed: `_EXCLUDED_SUFFIXES = {.c9r}`,
+`_KNOWN_UNSUPPORTED_SUFFIXES = {.bin, .exe, .dll, .jpg, .jpeg, .png,
+.gif, .mp3, .mp4, .mov}` — meaning most of MEDIA and part of SOFTWARE
+are *already* routed to a durable `UNSUPPORTED` with zero wasted
+attempt. `.wav`/`.m4a` (MEDIA) and `.msi`/`.apk`/`.dat`/`.db`/no-
+extension/`.html` are **not** in either list today — they would be
+attempted, and most would fail the plain-text-decode fallback as
+`CORRUPT_INPUT` (a safe but wasted attempt), except `.html`, which
+would *succeed* as raw markup treated as plain text — a quality
+problem, not a safety one, since `text_extractor.py` only has explicit
+extractors for `.pdf`/`.docx`/`.pptx`/`.xlsx`; `.txt`/`.md`/`.json`/
+`.csv` work today purely via the plain-decode fallback succeeding.
+
+D1 (`duplicate_analysis.json`) `.zip`/`.7z` group-size distribution
+(the two pipeline-extractable archive types — `.gz`/`.rar` are outside
+`ArchiveExtractor`'s current scope entirely, so are `SPECIAL`, not
+`ARCHIVE`, for this pipeline): covers 412 of D0's 421 known `.zip`/`.7z`
+files (97.9%; the remaining 2.1% are unique, non-duplicated archives D1
+can't see).
+
+| Size bucket | Distinct groups | Physical copies | Group bytes |
+|---|---|---|---|
+| <1MB | 16 | 74 | 0.003 GB |
+| 1–10MB | 19 | 138 | 0.061 GB |
+| 10–50MB | 8 | 28 | 0.166 GB |
+| 50–200MB | 10 | 39 | 1.278 GB |
+| 200MB–1GB | 14 | 51 | 7.478 GB |
+| 1–5GB | 31 | 68 | 60.237 GB |
+| 5–20GB | 2 | 12 | 23.773 GB |
+| 20GB+ | 1 | 2 | 21.271 GB |
+
+**Real finding, worded precisely to keep the architectural invariant
+and the scaling optimization distinct**: archive containers are not
+deduplicated through `ContentIdentityGroup` (an already-frozen,
+correct invariant — a container is never itself content; this is a
+fact about what the identity system does, not a claim about which
+files are "the same"). Therefore, identical archive copies may
+otherwise be independently, redundantly extracted — the 1–5GB bucket
+alone has 31 distinct archives appearing as 68 physical copies (~2.2×
+average duplication) per D1. The batch-selection policy **may**
+explicitly exclude/defer redundant archive copies, but only on
+evidence of the same kind D1 itself already establishes content
+identity with: **membership in the same D1 exact-duplicate group
+(SHA-256 content hash, already computed)**. Filename similarity, path
+similarity, directory-naming convention (e.g. "Archive 2", dated
+snapshots), or compressed size alone are **never** sufficient evidence
+that two archive files are redundant copies of each other — those are
+exactly the signals D2's provenance work already established as
+suggestive, never authoritative. See policy filters below for the
+precise predicate.
+
+Local environment, measured directly (no T7 involved): workspace/
+extraction volume (`/home`, where `documents/imports/` lives) has 25GB
+free of 127GB (80% used). The PostgreSQL data volume (`/`) has **13GB
+free of 110GB (88% used) — the tighter of the two**, worth naming
+explicitly since it's easy to assume the workspace disk is the binding
+constraint when it currently isn't. The `aibrain` database is
+currently 10MB. Ollama v0.31.2 / `nomic-embed-text` (768-dim) is
+running and verified.
+
+**`max_extracted_bytes` must not be read as permission to consume that
+much space merely because the workspace happens to have it.** Each
+physical resource is governed independently by the same inequality,
+with an *explicit, visible* safety reserve — not folded silently into
+a single "floor" number:
+```
+projected_consumption_by_this_batch + projected_background_growth + safety_reserve
+    <= currently_available_capacity   (re-checked live, not assumed fixed)
+```
+**The 10GB/5GB reserve values are configured policy; the 25GB/13GB
+free-space figures are runtime measurements, not each other.** This
+distinction matters: the reserves are decisions this design makes and
+that persist until deliberately revised; the free-space figures are
+observations of this machine's state *right now* and may be different
+by the time any batch actually executes — a future implementation must
+re-measure free space live before and during a batch, never treat
+today's 13GB as a permanently known fact. Applied to each volume, using
+today's measurement purely as a worked example:
+```
+Workspace (/home, safety_reserve_workspace = 10GB, POLICY):
+    max_extracted_bytes (this batch's extraction) + safety_reserve_workspace
+        <= currently_measured_free_space (25GB free TODAY, RUNTIME MEASUREMENT)
+        →  extraction budget ceiling = 15GB AT TODAY'S HEADROOM, re-measured live
+
+PostgreSQL (/, safety_reserve_pg = 5GB, POLICY — the binding constraint
+for embedding-heavy classes):
+    projected_db_growth (embeddings + pgvector indexes + WAL + temp work)
+        + safety_reserve_pg
+        <= currently_measured_free_space (13GB free TODAY, RUNTIME MEASUREMENT)
+        →  db-growth budget ceiling = 8GB AT TODAY'S HEADROOM, re-measured live
+```
+**No DB-growth projection algorithm is defined here** (per-embedding
+storage cost depends on row overhead, pgvector index structure, WAL
+churn, and TOAST behavior — none of which have been measured against
+this schema at any real scale; inventing a bytes-per-embedding formula
+now would be exactly the kind of fabricated number this design pass is
+required to avoid). Instead, the **governing invariant** is:
+
+> Hard-stop is the last-resort tier, never the first threshold that
+> matters. Using exactly the three tiers already defined per-guard in
+> point 9 (soft stop, review-required, hard stop) — not inventing a new
+> ordering beyond what's there: as a resource depletes, the **soft-stop
+> threshold** (the less severe of the two live free-space levels —
+> workspace <15GB, PostgreSQL <8GB) fires *before* the **hard-stop
+> threshold** (workspace <10GB, PostgreSQL <5GB), triggering a
+> controlled pause — no further work is admitted/claimed, though
+> already-in-flight work may finish — well before an emergency stop is
+> ever needed. The **review-required condition** is a separate,
+> projection-based check evaluated at batch admission/planning time
+> (e.g. "this batch is projected to consume/grow beyond the stated
+> amount"), orthogonal to the live depletion sequence rather than a
+> third point along it — it can fire independently of exactly where
+> current headroom sits. Across all of this: **every required guard
+> (workspace disk, PostgreSQL disk, and any others later added) must
+> remain above its own hard-stop threshold throughout execution, and
+> the tightest remaining resource budget among them governs continued
+> execution** — a batch continues only as long as *every* guard clears,
+> not merely the one its own workload happens to stress most. For
+> Class 1 (no archives), the workspace guard is essentially inert; the
+> PostgreSQL guard is the one actually exercised, and by how much is
+> itself one of the empirical outputs Class 1 must produce (point 7's
+> calibration list: "DB growth per embedded chunk"), not an input
+> assumed in advance.
+
+Both budget ceilings above (15GB workspace, 8GB PostgreSQL) are
+snapshots of *today's* headroom, re-verified live before each batch
+starts and continuously during execution (per the frozen architecture's
+disk/DB checks) — never assumed to still hold at some future execution
+time, and never a substitute for measuring actual consumption once
+Class 1 runs.
+
+**Explicitly UNRESOLVED — no calibration data exists yet**: archive
+expansion ratio (compressed → extracted bytes) at any real size tier —
+both real pilot archives so far had zero actual members, contributing
+no expansion evidence at all. Embedding throughput/latency per chunk
+against the local Ollama instance — no benchmark has been run.
+Per-document chunk-count distribution beyond the two pilots' small
+sample (2–4 chunks for files in the 2.6–2.8KB range). These are named
+as calibration targets for the first scaled batch's own report to
+supply, not invented now.
+
+### 1. Batch classes (replaces the illustrative A–G sketch)
+
+| Class | Purpose | `source_category` | `workload_category` | Archive admission | Member policy | `risk_tier_estimated` ceiling | Aggressiveness | Initial rollout? |
+|---|---|---|---|---|---|---|---|---|
+| **1 — Text/Document** | Ordinary loose documents | `LOOSE_FILE` only | `TEXT_DOCUMENT`, `STRUCTURED_DATA` | none (no archives) | n/a | LOW–MEDIUM | Lowest | **Yes — primary candidate** |
+| **2 — Small Archive** | Prove archive path at scale, low blast radius | `LOOSE_FILE` + `ARCHIVE` | any (discovered post-extraction) | `.zip`/`.7z`, source-size tier SMALL (<10MB) | applies once members exist | LOW–MEDIUM | Low | **Yes — second candidate** |
+| **3 — Medium Archive** | Larger but still bounded archives | `LOOSE_FILE` + `ARCHIVE` | any | `.zip`/`.7z`, source-size tier MEDIUM (10MB–1GB) | applies once members exist | MEDIUM | Moderate | After 1 & 2 prove clean |
+| **4 — Large Archive** | The corpus's single biggest byte contributor | `ARCHIVE` | any | `.zip`/`.7z`, source-size tier LARGE (1–5GB) | applies once members exist | HIGH | High | Not initial — needs 2/3 evidence |
+| **5 — Extreme Archive** | A handful (3 groups, 14 copies, ~45GB) of monster archives | `ARCHIVE` | any | `.zip`/`.7z`, source-size tier EXTREME (5GB+) | applies once members exist | EXTREME | Highest | No — own dedicated future gate, one-at-a-time |
+| **6 — Media (deferred/completeness-only)** | Confirm `UNSUPPORTED` handling at scale — **not** an ingestion-value class | `LOOSE_FILE` | `MEDIA` | none | n/a | n/a — deferred while unsupported, not risk-rated | n/a | No — completeness tracking only, not a rollout candidate |
+| **7 — Software/Executable (deferred/completeness-only)** | Same as Class 6, for `.exe`/`.dll`/etc. | `LOOSE_FILE` | `SOFTWARE` | none | n/a | n/a — deferred while unsupported, not risk-rated | n/a | No — completeness tracking only, not a rollout candidate |
+| **8 — Special/Deferred** | `.c9r`, `.html`, `.dat`/`.db`/no-ext, Anki, backup/sync context | `LOOSE_FILE`/`SPECIAL` | `ENCRYPTED`/`UNKNOWN`/`CONTAINER` | none | n/a | n/a — deliberately not processed | n/a | No — deliberate exclusion, revisit later |
+
+Note on the "source-size tier" labels used for archive admission (2–5):
+these name **declared compressed source size only** — a physical fact
+about the file on disk before any extraction. They are deliberately
+**not** a restatement of `risk_tier_estimated`; see point 4 below for
+why the two are kept distinct even though size is, today, the primary
+signal informing the estimate.
+
+Classes 6/7 are reclassified as **deferred, completeness-only** per
+review — not "LOW-risk ingestion classes." Their content is not
+processable today (no extractor exists), so there is no ingestion
+value being deferred, only a denominator-completeness need: the
+*completeness denominator* (point 8) should still account for the
+~32% of the corpus (MEDIA+SOFTWARE) that terminates at `UNSUPPORTED`
+immediately, but this is bookkeeping, not a rollout candidate at any
+priority level.
+
+### 2. Numeric envelopes
+
+Distinguishing selection-time limits (enforceable from D0 alone),
+runtime consumption limits (enforceable only as running counters), and
+physical safety limits (independent of any single batch, checked
+continuously), per the frozen architecture:
+
+| Parameter | Kind | Class 1 (first batch) candidate | Rationale / evidence |
+|---|---|---|---|
+| `max_source_instances` | selection-time | **1,000 (policy choice, not derived)** | This is a deliberate policy choice for the first scaled batch — a conservative step beyond the two pilots' single-digit item counts — not a number the D0/D1 evidence itself dictates, and not validated by any rate/scaling formula. 1,000 remains available as a concrete anchor for the authorizing gate to accept or adjust. |
+| `max_source_bytes` | selection-time (safety cap) | **2 GB** | Selection order is lexicographic by *path*, not by size (frozen) — so nothing guarantees the first 1,000 alphabetical documents are small ones. This cap guards against an outlier (e.g. an unusually large PDF) dominating the batch, without constraining the expected case (1,000 × 46KB ≈ 46MB expected). |
+| `max_extracted_bytes` | runtime consumption | **N/A for Class 1** (no archives admitted) | Becomes meaningful starting at Class 2. For Class 2 specifically: UNRESOLVED precise value — expansion ratio for this corpus's archives has never been measured (both real pilots' archives had zero members). Recommend a conservative placeholder pending Class 2's own measurement, not a confident number. |
+| `max_embeddings` | runtime consumption (atomic reservation) | **CALIBRATION_REQUIRED — no defensible number today** | The only real evidence is 5 items across both pilots: 2,640B→4 chunks, 2,821B→2 chunks, 140B→1 chunk, 114B→1 chunk, 3B→0 chunks. Applying that per-byte rate (~1 chunk/700–1,400 bytes) to the document category's actual ~46KB average implies **~33–66 chunks/file**, not the ~5 previously stated — that earlier figure was an arithmetic error, not a smaller, more conservative estimate. Five tiny (<2.9KB) items cannot be responsibly extrapolated to a 46KB-average population that includes ~342KB-average PDFs. The atomic reservation mechanism (point 6) is unaffected by this — it enforces whatever ceiling is set, atomically; the *ceiling itself* must be set by the authorizing gate with this gap explicitly acknowledged, not invented here. |
+| `max_runtime_seconds` | runtime consumption (monotonic) | **7,200 (2 hours) — provisional first-batch policy choice; calibration required for later promotion** | Same status as `max_source_instances`: a concrete operational number chosen for this first batch, not a measured limit. No embedding-throughput benchmark exists yet against the local Ollama instance for this workload — Class 1's own measured throughput is what should set a calibrated figure for later classes. |
+| Workspace safety reserve (`/home`) | physical, continuous | **10GB, explicit** — extraction budget = 25GB current free − 10GB reserve = 15GB ceiling today | A standing invariant, not batch-specific; extraction envelope must never be sized as "however much free space exists," only against this reserved-down budget. |
+| PostgreSQL safety reserve (`/`) | physical, continuous | **5GB, explicit** — db-growth budget = 13GB current free − 5GB reserve = 8GB ceiling today | The *binding* constraint for embedding-heavy classes. Class 1's projected DB growth (~15MB of vectors + overhead) is trivial against this 8GB budget, but later archive classes must estimate their own `db_growth` against it explicitly — this is not merely "the floor," it's the reserve *plus* the growth this specific batch is projected to cause. |
+
+**What would cause these to be reduced**: any hard-stop firing during
+Batch 1 (see resource-guard thresholds), an error rate materially above
+what the two pilots showed (both were 100%-explained, zero unexplained
+failures), or workspace/Postgres headroom shrinking further before
+Batch 1 runs (these are today's numbers, not guaranteed at execution
+time). **What would cause these to be increased**: Batch 1 completing
+with zero safety incidents, all four denominators reconciling cleanly,
+and measured resource consumption well under the physical floors above
+— feeding directly into the promotion ladder (point 8).
+
+### 3. Archive SOURCE-SIZE tiers (declared compressed bytes — not a risk claim)
+
+Adopting the D1-grounded buckets directly (not round numbers). These
+name **declared, pre-extraction, compressed source size only** — a
+physical fact read from D0/D1, nothing about expected expansion or
+risk:
+
+| Source-size tier | Declared source size | Groups | Physical copies | Total group bytes |
+|---|---|---|---|---|
+| SMALL | <10MB | 35 | 212 | 0.064 GB |
+| MEDIUM | 10MB–1GB | 32 | 118 | 8.92 GB |
+| LARGE | 1–5GB | 31 | 68 | 60.24 GB |
+| EXTREME | 5GB+ | 3 | 14 | 45.04 GB |
+
+**Explicitly not inferred**: decompressed/expansion size, and
+therefore **not expansion-risk tiers**. D0/D1 record only compressed
+source bytes; no extraction has occurred at any scale larger than
+"zero real members" (both real pilots). Using a compressed-to-extracted
+multiplier here would be inventing a compression ratio — instead,
+Class 2 (SMALL source-size tier) is deliberately the *first* archive
+class precisely so its extraction produces the first real
+expansion-ratio evidence this corpus has ever generated, calibrating
+Class 3+. The separate `risk_tier_estimated`/`risk_tier_actual` model
+(point 4) is what actually carries risk judgments; the size tiers above
+are one *input* to `risk_tier_estimated`, not a relabeling of it.
+
+### 4. Risk-tier thresholds
+
+```
+LOOSE FILES:
+  LOW      - TEXT_DOCUMENT/STRUCTURED_DATA workload, <1MB (the large
+             majority, given the corpus's 46KB average)
+  MEDIUM   - TEXT_DOCUMENT/STRUCTURED_DATA, 1-50MB (PDF-sized outliers)
+  HIGH     - >50MB, any workload
+  EXTREME  - >500MB as a single loose file (anomalous - would warrant
+             review regardless of workload)
+
+ARCHIVES AT ADMISSION (risk_tier_estimated):
+  Informed primarily by the source-size tier above, since declared size
+  is the main pre-extraction signal currently available - but this is
+  a DISTINCT judgment from the size tier itself, not merely its label
+  restated. Today, in the absence of other pre-extraction signals
+  (compression-type-specific expansion history, corpus-wide duplication
+  patterns), the estimate tracks size directly:
+  LOW      - source-size tier SMALL
+  MEDIUM   - source-size tier MEDIUM
+  HIGH     - source-size tier LARGE
+  EXTREME  - source-size tier EXTREME
+  Future evidence (once Class 2+ produce real expansion/compression-type
+  data) may inform risk_tier_estimated independently of size - this
+  design leaves that door open rather than hard-wiring size==risk.
+
+ARCHIVE ACTUAL RISK (risk_tier_actual - post-extraction evidence):
+  UNRESOLVED precise numeric boundaries - no measured expansion-ratio/
+  member-count/nesting-depth data exists yet for this corpus at any
+  scale. Provisional structure only (multiplier boundaries NOT
+  evidence-derived, explicitly flagged for calibration from Class 2's
+  own results):
+    LOW      - low expansion, low member count, shallow nesting
+    MEDIUM   - moderate on any one of those axes
+    HIGH     - high on any one axis
+    EXTREME  - extreme on any axis
+  NULL (insufficient evidence) - extraction failed before member
+  enumeration completed (malformed archive, envelope abort, T7
+  unavailable) - never fabricated as LOW or any other value.
+```
+
+### 5. Batch policy filters (selection predicates)
+
+Respecting the frozen `SOURCE ADMISSION → extraction → MEMBER POLICY`
+separation strictly — member `workload_category` is never available at,
+and never used in, pre-extraction archive selection:
+
+```
+Class 1 (Text/Document):
+  eligible AND source_category == LOOSE_FILE
+          AND workload_category IN (TEXT_DOCUMENT, STRUCTURED_DATA)
+          AND risk_tier_estimated IN (LOW, MEDIUM)
+
+Class 2 (Small Archive):
+  [Class 1 predicate, admitting loose documents alongside archives]
+  OR (eligible AND source_category == ARCHIVE
+      AND suffix IN (.zip, .7z)
+      AND declared_source_bytes < 10MB
+      AND NOT redundant_archive_copy)
+
+  redundant_archive_copy is TRUE only when this candidate path is a
+  member of a D1 exact-duplicate group (SHA-256 content hash, already
+  computed by D1) that ALSO contains another archive path already
+  selected in this or an earlier batch. This is the ONLY evidence
+  allowed to establish redundancy - never filename similarity, path
+  similarity, directory-naming convention (e.g. "Archive 2", dated
+  snapshots), or compressed size alone. When exactly one candidate per
+  D1 group is needed, selection takes the lexicographically-first path
+  within that group (consistent with the frozen deterministic-ordering
+  rule).
+
+  **This is a selection/extraction-scheduling decision only, never a
+  deduplication mutation.** Precisely: for archive processing, at most
+  one representative of an exact-byte D1 duplicate group is admitted
+  for extraction by the relevant batch policy. The other physical
+  occurrences remain exactly what they already are — real, distinct
+  `SourceInstance` rows and provenance observations on real T7 paths —
+  and are NOT treated as deleted, discarded, merged, or globally
+  equivalent merely because their own extraction was skipped. Nothing
+  about their `SourceInstance` row changes; they simply remain
+  eligible-but-unselected for archive-container extraction specifically,
+  available to a future batch if this exclusion policy is ever
+  revisited. No file is touched, moved, or removed on T7 or anywhere
+  else as a result of this policy.
+
+Class 3/4/5: identical shape to Class 2, substituting the size-tier
+  bound (10MB-1GB / 1-5GB / 5GB+) and requiring the preceding class(es)
+  to have already been promoted per the ladder (point 8).
+
+Class 6/7 (Media/Software - completeness only):
+  eligible AND source_category == LOOSE_FILE
+          AND workload_category IN (MEDIA, SOFTWARE)
+
+Class 8 (Special/Deferred): NEVER auto-selected by any class above -
+  explicit exclusion, not merely "not matched": suffix IN
+  (_EXCLUDED_SUFFIXES ∪ {.html, .dat, .db, no-extension, .apkg,
+  .colpkg}) OR source_category == SPECIAL OR the (still-undesigned)
+  backup/sync context signal matches.
+```
+The archive-duplicate exclusion clause in Class 2+ operationalizes the
+"real finding" from the evidence section above — without it, the 2.2×
+average duplication in the 1–5GB tier alone would roughly double actual
+extraction work for no additional content-identity value.
+
+### 6. Special / deferred content — explicit policy
+
+| Content | Current code state (verified) | Batch policy |
+|---|---|---|
+| `.c9r` | Already `EXCLUDED` (`_EXCLUDED_SUFFIXES`) | Stays excluded — no batch ever selects it. |
+| `.jpg`/`.jpeg`/`.png`/`.gif`/`.mp3`/`.mp4`/`.mov`/`.exe`/`.dll`/`.bin` | Already `UNSUPPORTED` | Selectable only under Class 6/7 (completeness), never Class 1–5. |
+| `.wav`/`.m4a` | **Not** in either list — would attempt and fail `CORRUPT_INPUT` | Recommend adding to the unsupported list in a future implementation pass — not done here (docs-only). Meanwhile, excluded from every batch class above by not appearing in any class's workload set. |
+| `.msi`/`.apk`/`.dat`/`.db`/no-extension | **Not** in either list — would attempt and likely fail `CORRUPT_INPUT` | Same recommendation as above; excluded from all classes here via Class 8. |
+| `.html` (40.1GB, 7,896 files — the single largest "unaccounted" contributor) | **Not** in either list — would *succeed* via plain-decode as raw-markup "text," a quality problem | Deliberately routed to Class 8 (deferred), not Class 1, until a real HTML-to-text extractor exists — ingesting 40GB of raw tag soup as "text documents" would be a real, avoidable quality regression. |
+| `.apkg`/`.colpkg` (Anki, 6.8GB) | Not in either list; likely fails plain-decode (binary SQLite-based format) | Class 8 — structured but niche; revisit with a dedicated extractor later. |
+| Backup/sync/snapshot context (Syncthing, Takeout, "Archive 2", dated snapshots) | No code exists for this signal at all (frozen architecture defers it) | **Unresolved policy input** — no path patterns invented here, per instruction. Composes with `source_category` once designed, per the frozen architecture's own note on Batch F. |
+
+### 7. First scaled real-T7 batch — exact criteria
+
+```
+Class:               1 (Text/Document)
+Eligible workload:   LOOSE_FILE, workload_category IN (TEXT_DOCUMENT, STRUCTURED_DATA)
+Admission policy:    risk_tier_estimated IN (LOW, MEDIUM); no archives
+max_source_instances: 1,000 (policy choice for this first scaled batch, not
+                      derived from a validated rate/scaling formula)
+max_source_bytes:     2 GB (safety cap)
+max_extracted_bytes:  N/A (no archives)
+max_embeddings:       CALIBRATION_REQUIRED - the only real evidence (5 items,
+                      3-2,821 bytes each) cannot be responsibly extrapolated to
+                      this category's ~46KB average; this gap must be closed by
+                      the gate authorizing Class 1's actual execution, not
+                      guessed here. The atomic-reservation mechanism (point 6)
+                      applies to whatever ceiling is ultimately set.
+max_runtime_seconds:  7,200 (2 hours) - provisional first-batch policy choice;
+                      calibration required for later promotion, same status as
+                      max_source_instances
+Risk ceiling:         MEDIUM
+Stop conditions:      standard hard/soft/review set (point 9) - the tightest
+                      remaining resource budget governs continued execution
+                      (workspace and PostgreSQL guards both apply; PostgreSQL
+                      is expected to be the one actually exercised) - plus
+                      review-required on ANY unexpected failure-code class not
+                      already seen in the two prior pilots
+Expected evidence:    real embedding throughput at 100-250x pilot scale; real
+                      chunk-count distribution across ~1,000 real documents; a
+                      real failure-code histogram at scale (previously only ever
+                      observed in single digits); confirmation the discovery-run-
+                      scoped eligibility and immutable-membership invariants hold
+                      under real, larger data
+Promotion criteria:   zero safety incidents; zero unexplained claim/recovery
+                      anomalies; error rate consistent with or better than the
+                      two pilots (both had 100% explained outcomes); resource
+                      consumption held within the physical budgets in point 2;
+                      all four completion denominators reconcile with no gaps;
+                      PLUS the calibration evidence below, since these are the
+                      empirical inputs required to set max_embeddings/runtime/
+                      resource limits for every later class:
+                        - chunks per source distribution
+                        - embeddings per source distribution
+                        - embedding throughput/latency
+                        - DB growth per embedded chunk
+                        - workspace consumption
+                        - processing time
+                        - retry/error distribution
+```
+This is intentionally the *smallest* meaningful step up from the two
+pilots (4 → 7 → 1,000 items) that still produces genuinely new evidence
+(throughput and chunk-distribution data at real scale), not "as large
+as possible." Note that `max_embeddings` being unresolved means Class 1
+cannot actually be *executed* until that gap is closed by its own
+authorizing gate — this numeric/policy pass defines the shape and the
+other envelope values, not a claim that every number is ready to run.
+
+### 8. Promotion ladder
+
+Not a fixed size-doubling rule — each step requires specific evidence,
+per the frozen architecture's evidence-based-promotion principle:
+
+```
+Class 1 (Text/Document, 1,000 files)
+   ↓  requires: zero safety incidents; error rate ≤ pilot baseline;
+      resource headroom maintained; all denominators reconcile
+Class 1, scaled up (e.g. 5,000-10,000 files - exact number deferred to
+   that gate's own authorization, grounded in Class 1's actual measured
+   throughput/error rate, not chosen now)
+   ↓  requires the above, PLUS: Class 1's measured embeddings-per-file
+      and runtime-per-file actuals now replace the estimates in point 2
+Class 2 (Small Archive, <10MB, first real archive-at-scale evidence)
+   ↓  requires the above, PLUS: risk_tier_estimated vs risk_tier_actual
+      agreement within an acceptable margin (UNRESOLVED numeric margin -
+      no data exists to set one yet; Class 2's own report establishes
+      the first such comparison) - "archive risk-estimation accuracy"
+      only becomes measurable once Class 2 runs
+Class 3 (Medium Archive, 10MB-1GB)
+   ↓  requires the above, PLUS acceptable expansion-ratio variance
+      (now measured twice, at Class 2 and Class 3)
+Class 4 (Large Archive, 1-5GB) - the single biggest byte contributor
+   ↓  requires materially more evidence given this class alone is
+      ~60GB/31 distinct archives - a dedicated review checkpoint,
+      not a routine promotion
+Class 5 (Extreme Archive, 5GB+, 3 groups/14 copies/~45GB)
+      own dedicated future gate - explicitly NOT part of the routine
+      ladder; each of these 3 archives is individually reviewed
+```
+Class 6/7/8 do not sit on this ladder at all — they are either
+low-priority completeness work (6/7) or deliberately excluded (8).
+
+### 9. Resource-guard thresholds
+
+Using the frozen architecture's required checks (disk, Postgres size,
+Ollama reachability) with real, currently-measured baselines. Per the
+governing invariant stated in point 2: all of these must remain above
+their hard-stop threshold simultaneously, and **the tightest remaining
+budget among them governs continued execution** — a batch does not
+continue merely because the check its own workload happens to stress
+is fine; every guard must clear.
+
+| Check | Hard stop | Soft stop | Review-required | Calibration status |
+|---|---|---|---|---|
+| Workspace disk (`/home`, currently 25GB free) | free < 10GB | free < 15GB | any batch projected to consume >5GB | Set directly from measured headroom — no calibration needed. |
+| PostgreSQL disk (`/`, currently 13GB free — the tighter constraint) | free < 5GB | free < 8GB | any batch projected to grow the DB by >2GB | Set directly from measured headroom. |
+| Ollama reachability | unreachable on 3 consecutive checks | n/a | any single embedding call latency spike | Reachability check itself is ready now; a latency *ceiling* is **UNRESOLVED** — no baseline call-latency has ever been measured against this Ollama instance. Batch 1's own embedding calls should establish it. |
+| CPU/RAM | not defined | not defined | not defined | Deferred entirely per the frozen architecture — optional, pluggable, `psutil` not adopted. |
+
+### 10. Policy versioning
+
+`selection_policy_version` identifies the batch *policy/class*, not an
+opaque counter — e.g. `"batch-class-1-text-document-v1"`,
+`"batch-class-2-small-archive-v1"`. A version bump is reserved for
+changes to the *selection predicate itself* (which files a class
+includes/excludes) — e.g. `v2` if `.html` were later promoted out of
+Class 8 once a real extractor exists. Changing a **numeric envelope**
+value (e.g. raising Class 1's `max_source_instances` from 1,000 to
+5,000) does **not** require a new policy version, because envelope
+values are already a separate, direct input to the selection fingerprint
+(frozen at `f2b9815`) — so the fingerprint changes automatically on any
+envelope change, without needing the policy version itself to change.
+Policy version and envelope values are therefore both fingerprint
+inputs, but for different reasons: policy version captures "what rule
+decided inclusion," envelope values capture "how much was allowed."
+
+### 11. Reporting — design-level specification only (not implemented)
+
+The eventual `BatchReportService` (frozen architecture, not built yet)
+must expose at minimum:
+```
+eligible_source_count          policy_filtered_count       selectable_count
+source_instances_selected      unattempted_selected_count  attempted_source_count
+terminal_source_count          successful_ingestion_count
+source_bytes_selected          actual_source_bytes_read
+extracted_bytes_consumed       embeddings_reserved         runtime_consumed_seconds
+risk_tier_estimated vs risk_tier_actual distribution (including NULL/insufficient-evidence count)
+drift outcomes (OBSERVED_AT_SELECTION / SOURCE_PRESENT_AT_EXECUTION /
+  SOURCE_CHANGED_AFTER_SELECTION / SOURCE_MISSING_AT_EXECUTION counts)
+stop_reason (and stop_reason_detail)
+```
+No implementation of this report is written in this pass.
+
+### 12. Final review tables
+
+**Policy table**
+
+| Class | Source admission (source-size tier) | Member policy | `risk_tier_estimated` ceiling | `max_source_instances` | `max_source_bytes` | `max_extracted_bytes` | `max_embeddings` | `max_runtime` | Primary stop conditions | Promotion evidence |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `LOOSE_FILE`, TEXT/STRUCTURED | n/a | MEDIUM | 1,000 (policy choice) | 2GB | N/A | **CALIBRATION_REQUIRED** | 2h (policy choice, calibration required) | standard + tightest-resource-governs + new failure-code review | zero incidents, denominators reconcile, + full calibration list (point 7) |
+| 2 | + `ARCHIVE` SMALL (<10MB), D1-dedup-aware admission | post-extraction | MEDIUM | TBD at gate | TBD at gate | UNRESOLVED | TBD at gate | TBD at gate | + extraction-envelope overflow | + expansion-ratio evidence produced |
+| 3 | `ARCHIVE` MEDIUM (10MB–1GB) | post-extraction | MEDIUM | TBD | TBD | UNRESOLVED (calibrated from Class 2) | TBD | TBD | + risk-estimation accuracy | + accuracy within margin (TBD) |
+| 4 | `ARCHIVE` LARGE (1–5GB) | post-extraction | HIGH | TBD | TBD | UNRESOLVED | TBD | TBD | dedicated review checkpoint | materially more evidence required |
+| 5 | `ARCHIVE` EXTREME (5GB+) | post-extraction | EXTREME | 1 (one archive at a time) | n/a | UNRESOLVED | TBD | TBD | own dedicated gate | individual review per archive |
+| 6/7 | `LOOSE_FILE` MEDIA/SOFTWARE — deferred, completeness-only | n/a | n/a — not risk-rated, unsupported | n/a, low priority | n/a | N/A | ~0 (mostly zero-attempt `UNSUPPORTED`) | short | standard | completeness accounting only, never a scaling step |
+| 8 | none — deliberate exclusion | n/a | n/a | 0 | 0 | 0 | 0 | n/a | n/a | revisit only with dedicated future design |
+
+**Decided now vs. requires empirical calibration**
+
+| Decided now | Requires empirical calibration |
+|---|---|
+| Batch class taxonomy (1–8) and their admission predicates | Exact `max_source_instances`/`max_runtime` for Class 2 onward |
+| `max_source_instances`=1,000 for Class 1, as an explicit **policy choice** (not derived) | `max_embeddings` for Class 1 itself — the only real evidence (5 tiny items) cannot be responsibly extrapolated to the category's real size mix |
+| Archive SOURCE-SIZE tiers (SMALL/MEDIUM/LARGE/EXTREME), grounded in D1 — a physical-size fact only | `max_extracted_bytes` for any archive class (no expansion-ratio evidence exists) |
+| Risk-tier *structure* (estimated/actual split, loose-file boundaries) | `risk_tier_estimated` boundaries for archives beyond "informed by size tier" (no other pre-extraction signal yet exists); all `risk_tier_actual` numeric boundaries (no member-count/nesting/expansion data exists) |
+| Special/deferred content list (this pass's recommendations); Media/Software reclassified as deferred/completeness-only, not risk-rated | The backup/sync/snapshot contextual signal's pattern list (explicitly out of scope) |
+| Resource-guard hard/soft/review thresholds for disk (measured directly); the tightest-remaining-budget-governs invariant | A DB-growth-per-embedding projection (deliberately not modeled — measured empirically instead, point 7); Ollama embedding-latency ceiling (no baseline exists) |
+| Policy-versioning scheme and its relationship to the selection fingerprint | Class 1's own scaled-up size (deferred to that gate, informed by Class 1's actuals) |
+| Archive-duplicate-copy exclusion as a selection/scheduling policy (never a dedup mutation — the other copies remain untouched, real `SourceInstance` rows) | Acceptable expansion-ratio/risk-estimation-accuracy margins for promotion |
+
+### What this pass does NOT decide
+
+- No implementation, schema, or migration - docs only. This freeze
+  approves the numeric/policy baseline above; it does not authorize
+  code, schema/migration work, or real-T7 access.
+- No T7 access of any kind occurred in producing this pass - every
+  number above is derived from `inventory.json`/`duplicate_analysis.json`
+  (already on disk) and local, non-T7 disk/database measurements.
+- The backup/sync/snapshot context field's structure and pattern list.
+- Any UNRESOLVED/CALIBRATION_REQUIRED value marked above (`max_embeddings`
+  for Class 1, all archive-class envelopes, `risk_tier_actual` numeric
+  boundaries, the Ollama latency ceiling) - intentionally deferred to
+  the relevant batch's own empirical calibration, never disguised as a
+  settled number.
+
+**Next gate, not yet authorized**: a separate implementation design
+pass, translating this frozen policy layer into `IngestionBatch`,
+selection, resource-guard, reservation, reporting, and worker-control
+behavior while preserving every architectural contract already frozen
+at `f2b9815`. Implementation itself remains a further, later gate
+beyond that.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
