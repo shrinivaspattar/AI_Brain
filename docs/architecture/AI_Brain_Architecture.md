@@ -3016,12 +3016,106 @@ nothing beyond that message (no traceback, no internals) is exposed.
 `ValueError`-based 404/409 responses and the 200 success path are
 unchanged.
 
+## T7 Corpus Discovery / Inventory
+
+A deliberately separate track from both document ingestion and the
+dedup filesystem executor: read-only understanding of what is actually
+on the user's real T7 backup drive, gated and authorized independently
+of any mutation-capable milestone. Authorized only after the dedup
+execution/recovery milestone chain (`1868273` → `52e991a` → `1505f40`
+→ `462510b` → `e5f5350` → `0ef1d92`) was explicitly closed - this is a
+genuinely new, distinct gate, not a continuation of that chain.
+
+**`app/discovery/corpus_inventory.py`** - the only code this milestone
+adds. `scan_corpus(root, *, top_n=20) -> CorpusInventory` walks `root`
+via `os.walk(topdown=False, followlinks=False)`, reading only
+`os.lstat` metadata for each entry - **no file is ever opened, read,
+hashed, or extracted**, and `lstat` (not `stat`) means a symlink is
+measured by its own size, never the size of whatever it points to;
+`followlinks=False` means a symlinked directory is never descended
+into, closing off any possibility of a symlink loop or an escape
+outside the scanned root. This module is NOT wired into
+`SourceScanner`, `DocumentIngestor`, or any other part of the existing
+ingestion pipeline, and never touches the database - a clean, standalone
+module with zero coupling to anything that could mutate a file.
+
+Resilient by design for an external, foreign drive of unknown health:
+a directory that can't be listed (`os.walk`'s own `onerror` hook) or a
+file whose `lstat` fails (permission denied, a vanished entry, a
+device hiccup) is recorded in the returned inventory's `errors` list
+and skipped - the scan itself never raises over one bad entry, since
+aborting a multi-hundred-gigabyte inventory over a single unreadable
+file would defeat the entire point.
+
+Memory-bounded by construction: the full per-file list is never held
+in memory. Aggregate counts (`total_files`, `total_size_bytes`,
+`extension_counts`, `extension_size_bytes`, `archive_counts`) are
+plain running totals; the two rankings (`largest_files`,
+`largest_directories`) are each backed by a bounded min-heap
+(`_TopNTracker`) holding only the `top_n` largest entries seen so far -
+safe regardless of how many files the corpus actually contains.
+Directory sizes are computed bottom-up in the SAME single pass:
+`os.walk(topdown=False)` yields every directory only after all of its
+subdirectories, so each directory's total is simply its own files'
+sizes plus the already-computed totals of its immediate children,
+recorded in a `dict[str, int]` keyed by path - no second pass over the
+tree is needed.
+
+**Archive classification is extension-based only, deliberately not
+signature-verified, for this first pass** - `KNOWN_ARCHIVE_SUFFIXES`
+(`.zip`, `.7z`, matching `app.ingestion.document_ingestor.
+ARCHIVE_CONTAINER_SUFFIXES` - duplicated as a constant rather than
+imported, to keep this read-only module fully decoupled from the
+extraction-capable ingestion module) vs. `OTHER_ARCHIVE_SUFFIXES`
+(`.rar`, `.tar`, `.gz`, `.tar.gz`, `.iso`, and other common archive
+extensions this personal backup corpus might contain that AI_Brain
+cannot yet extract) - reported separately so a human can see the gap
+between "what is actually on the drive" and "what this project can
+currently act on." Verifying an archive's actual signature (`is_
+zipfile`, `py7zr.is_7zfile`) would require opening each candidate file
+- more than a "cheap first inventory" calls for; a natural candidate
+for a later, explicitly-authorized deeper-inventory phase, not
+something this milestone does silently.
+
+**Reports never committed to version control**: `write_inventory_
+report(inventory, destination)` writes plain JSON, and the
+conventional destination - `knowledge/t7_discovery/` - is listed in
+`.gitignore`, since a real inventory's `largest_files`/`largest_
+directories` rankings necessarily contain real personal file and
+directory names from the user's own backup drive.
+
+**Runner**: `scripts/t7_discovery.py <root> <output.json> [--top-n N]`
+- a thin CLI wrapper with no logic of its own beyond argument parsing,
+timing, and calling `scan_corpus`/`write_inventory_report` directly.
+
+**Tests**: 16 new, all synthetic-`tmp_path`-only (no real T7 access in
+any test) - counting, extension/archive classification (including the
+two-part `.tar.gz`-style extensions), bottom-up directory totals,
+`top_n` bounding (including `top_n=0` disabling the rankings without
+affecting aggregate counts), a mocked `lstat` failure proving the scan
+doesn't abort over one unreadable file, a real `chmod 000` directory
+proving the same for an unlistable directory, a real symlink proving
+`lstat`-not-`stat` semantics, a real symlinked directory proving
+`followlinks=False`, and JSON report round-tripping.
+
+**Deliberately not built this milestone**: any content hashing,
+archive-signature verification, or archive extraction; any wiring into
+`DocumentIngestor`/`SourceScanner`/the database; any deduplication
+analysis of what the scan finds; any mutation of any kind. **The T7
+was scanned read-only, exactly as authorized - no file on it was
+opened, moved, renamed, deleted, or otherwise modified.**
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
-- `knowledge/` — reserved for curated/derived knowledge artifacts (future).
+- `knowledge/` — reserved for curated/derived knowledge artifacts
+  (future); `knowledge/t7_discovery/` holds T7 corpus inventory reports
+  specifically, gitignored since they contain real personal file/
+  directory names.
 - `postgres/`, `redis/` — data directories for the Dockerized services.
-- `logs/`, `config/`, `prompts/`, `scripts/` — reserved, currently empty.
+- `logs/`, `config/`, `prompts/` — reserved, currently empty.
+- `scripts/t7_discovery.py` — the T7 Corpus Discovery runner (see
+  above); otherwise reserved, currently empty.
 
 ## Open/planned areas
 - `docker-compose.yml` is currently empty — services (Postgres, Redis,

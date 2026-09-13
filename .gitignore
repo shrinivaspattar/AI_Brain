@@ -43,3 +43,7 @@ redis/data/
 
 # Temporary
 tmp/
+
+# Corpus discovery reports - real personal file/directory names and
+# paths from the T7 corpus, never committed to version control.
+knowledge/t7_discovery/

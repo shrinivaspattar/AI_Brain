@@ -929,6 +929,55 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       (the only way to prevent the claim overlap itself, not just its
       consequences); any API/UI exposure; any real-corpus execution.
 
+- [x] T7 Corpus Discovery / Inventory — a deliberately separate,
+      newly-authorized gate (not a continuation of the dedup execution/
+      recovery chain, which was explicitly closed at `0ef1d92` first).
+      Read-only understanding of the user's real T7 backup drive,
+      gated independently of any mutation-capable work. New module
+      `app/discovery/corpus_inventory.py`: `scan_corpus(root, *,
+      top_n=20)` walks the tree via `os.walk(topdown=False,
+      followlinks=False)`, reading only `os.lstat` metadata per entry —
+      no file is ever opened, read, hashed, or extracted. `lstat` (not
+      `stat`) means a symlink is measured by its own size, never its
+      target's; `followlinks=False` means a symlinked directory is
+      never descended into. Not wired into `SourceScanner`/
+      `DocumentIngestor`/the database — a fully standalone module.
+      Resilient to a foreign, possibly-flaky external drive: an
+      unlistable directory or an unreadable file is recorded in the
+      inventory's own `errors` list and skipped, never raised — a
+      single bad entry can't abort a multi-hundred-gigabyte scan.
+      Memory-bounded: aggregate counts are plain running totals; the
+      largest-files/largest-directories rankings are each a bounded
+      min-heap holding only the top N seen so far, and per-directory
+      totals are computed bottom-up in the SAME single pass (`os.walk`
+      yields each directory only after its subdirectories, so a
+      directory's total is just its own files plus its already-known
+      children's totals — no second pass needed). Archive
+      classification is extension-based only for this first pass,
+      deliberately not signature-verified (that would require opening
+      every candidate file — more than a "cheap first inventory" calls
+      for) — reports both `KNOWN_ARCHIVE_SUFFIXES` (`.zip`/`.7z`,
+      matching what `DocumentIngestor` can already extract) and
+      `OTHER_ARCHIVE_SUFFIXES` (everything else this backup corpus
+      might contain) so a human can see the gap. Reports are plain
+      JSON, written to `knowledge/t7_discovery/` — gitignored, since a
+      real inventory's rankings necessarily contain real personal file
+      and directory names. Runner: `scripts/t7_discovery.py <root>
+      <output.json> [--top-n N]`. 16 new tests, entirely
+      synthetic-`tmp_path` — counting, extension/archive
+      classification (including two-part `.tar.gz`-style extensions),
+      bottom-up directory totals, `top_n` bounding, a mocked `lstat`
+      failure and a real `chmod 000` directory both proving the scan
+      doesn't abort over an unreadable entry, a real symlink proving
+      `lstat`-not-`stat` semantics, a real symlinked directory proving
+      `followlinks=False`, and JSON report round-tripping. Full suite:
+      565 tests. **The T7 was scanned read-only, exactly as
+      authorized** — no file on it was opened, moved, renamed, deleted,
+      or otherwise modified. Deliberately not built: content hashing,
+      archive-signature verification, archive extraction, any wiring
+      into ingestion/the database, any deduplication analysis, any
+      mutation of any kind.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time
