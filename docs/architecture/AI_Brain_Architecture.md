@@ -6163,6 +6163,148 @@ point in implementation, smoke-testing, or formal verification.
   existing personal-corpus-import path) - both remain exactly as they
   were.
 
+## Synthetic-only pre-real-T7 review gate
+
+Closed at `a0523b7`, test-only: extended nested-archive crash-resume
+coverage to three levels (`A.zip → B.zip → {file 1, file 2, C.zip →
+file 3}`) and closed the `FileAccessService` ↔ `ImportJob` boundary
+gap, including the defense-in-depth case of a mislabeled
+`source_type`. No production code changed - the implementation already
+matched the frozen design, so no documentation update was needed at
+the time. 714 passed, 1 skipped, run three times. Neither T7 path was
+accessed or referenced anywhere in this gate, including in "should be
+rejected" test inputs.
+
+## Real T7 Read-Only Ingestion Pilot
+
+Authorized explicitly ("AUTHORIZE: REAL T7 READ-ONLY INGESTION
+MILESTONE", checkpoint `a0523b7`) as this project's first-ever
+authorization to read actual file content from the mounted real T7
+corpus (`/media/personal/Seenu_T7SSD1`), strictly read-only, with an
+explicit first-pass limit to a small, controlled pilot batch rather
+than broad corpus ingestion.
+
+### Pre-flight
+- Mount confirmed present and matching D1's own recorded report root
+  (`report["root"] == "/media/personal/Seenu_T7SSD1"`) before any
+  candidate selection.
+- The Alembic migrations already applied to `aibrain_test` many times
+  (`b9a82d073399`, `fd9f81672e59`) were applied to the main `aibrain`
+  database **for the first time** in this milestone, advancing it from
+  `ef65da409302` to `fd9f81672e59` (head). Row counts on every
+  pre-existing table were confirmed identical before and after.
+- Ollama confirmed NOT running on this machine (`curl` connection
+  refused, no matching process) - meaning real embedding calls were
+  expected to fail with `EMBEDDING_UNAVAILABLE`, the already-designed-
+  for failure path, not a gap in this pilot.
+
+### Pilot batch (`scripts/t7_ingestion_pilot.py`)
+Four real T7 items, selected programmatically from the already-
+committed D1 `duplicate_analysis.json` report (never re-scanned) by
+picking the smallest exact-duplicate group under a small size cap for
+each of `.txt`/`.md`/`.pdf`/`.zip`: three small loose files and one
+small archive. Every source path's `(size, mtime)` was snapshotted
+before any read and re-verified identical after - including one final
+re-check after all diagnosis/cleanup activity below - confirming the
+real T7 corpus was never altered in any way at any point.
+
+Result: all three loose files resolved identity correctly; the
+archive was opened and found, correctly, to contain zero real file
+members (four empty directory entries only, confirmed independently
+via `unzip -l` against the real file) - the first real proof that
+`ArchiveProcessingService` correctly handles an archive with nothing
+to extract. One loose-file group reached `INGESTED` (trivially, having
+produced zero chunks to embed); the other two correctly failed at the
+embedding stage with `EMBEDDING_UNAVAILABLE`, proving the designed
+failure path rather than a success.
+
+### Real bug found: identity-resolution claim query had no archive exclusion
+
+The pilot script's idempotency-check section (re-running each claim
+method once more, expecting `None`) instead found and wrongly claimed
+the archive's own `SourceInstance` row. Root cause:
+`WorkerClaimService.claim_source_instance_for_identity_resolution`
+filtered only on `content_identity_group_id IS NULL` - with no
+exclusion for either (a) a root-level archive-suffixed path (which
+legitimately and permanently keeps `content_identity_group_id IS NULL`
+even after being fully, successfully processed - an archive's raw
+container bytes are never "content"), or (b) an archive-member row
+(`member_path IS NOT NULL`), whose actual content lives at
+`member_path` inside the archive, not at the shared `root_t7_path`
+value duplicated across every one of its siblings. Category (b) was
+never actually hit by this pilot (its one archive had no real
+members), but is the same latent hazard, structurally: had the archive
+contained a nested archive member, that member's own row would have
+been just as wrongly claimable, and would have caused
+`root_t7_path` (the ARCHIVE's path) to be re-hashed as if it were that
+member's content.
+
+Concretely: the second, unnecessary claim call hashed the archive's
+raw compressed bytes, created a bogus `ContentIdentityGroup`
+(`identity_kind=EXTRACTED_CONTENT`), attempted normalization against
+those bytes, and correctly failed there with `CORRUPT_INPUT` (`'utf-8'
+codec can't decode byte 0xb3...` - the zip bytes have no extractor
+mapping and fall through to the plain-text decode path). No
+`Document`/`DocumentChunk` rows were ever created from it. The real T7
+file was confirmed completely unchanged (`stat` size/mtime identical
+before, during, and after) - this bug corrupted only this
+application's own database bookkeeping, never the source corpus.
+
+**Fix**: `claim_source_instance_for_identity_resolution` now also
+requires `member_path IS NULL` and excludes any `root_t7_path` ending
+in `.zip`/`.7z` (the same `_ARCHIVE_SUFFIXES` already used by
+`claim_source_instance_for_archive_processing`), with the docstring
+corrected to describe what the query now actually enforces rather than
+what earlier prose merely assumed. Two regression tests were added
+(`test_identity_resolution_never_claims_a_fully_processed_root_archive`,
+`test_identity_resolution_never_claims_a_nested_archives_own_instance`)
+- both independently verified to fail against the pre-fix query and
+pass against the fixed one, not merely written to look plausible.
+
+**Cleanup performed against the main `aibrain` database** (corrective,
+not a new capability): the bogus `ContentIdentityGroup` row and its two
+associated `IngestionAttempt` rows were deleted, and the archive's
+`SourceInstance.content_identity_group_id` was reset to `NULL` (its
+correct, permanent value); the stray workspace file
+(`documents/imports/t7_pilot/group_4/content.zip`) was removed. The
+three legitimate resolved groups and the archive's own correct
+(zero-member) processing attempt were left untouched. Full synthetic
+suite re-run three times after the fix: **716 passed, 1 skipped**, zero
+flakiness (714 pre-existing + 2 new regression tests).
+
+### Minor semantic imprecision noted, not changed
+`ArchiveProcessingService` records its own archive-level attempts via
+`IngestionAttemptService.record_identity_resolution_attempt` (labeling
+them `attempt_kind=IDENTITY_RESOLUTION`), since that is the only method
+available for `SourceInstance`-scoped attempts - even though what it
+represents is "recursive archive extraction," not literally identity
+resolution of the container itself. Not a functional bug (the CHECK
+constraint and every consumer treat it correctly); left as a candidate
+for a future, separately-authorized naming cleanup rather than folded
+into this corrective gate.
+
+### `.gitignore` extended
+`documents/` (the ingestion extraction workspace, now containing real
+personal file content read from T7 for the first time) was added to
+`.gitignore`, mirroring the existing `knowledge/t7_discovery/` entry's
+reasoning - real personal content must never be committed to version
+control, whether it is file names/paths or file bytes.
+
+### What this pilot explicitly does NOT include
+- Any expansion beyond the four-item pilot batch - per the
+  authorization's explicit first-pass limit, no broader ingestion was
+  started, and none is authorized by this gate.
+- Any mutation, rename, delete, quarantine, permission/ownership/
+  timestamp change, or dedup disposition against T7 - none of this
+  pipeline has ever had such a capability; the fix and cleanup above
+  touched only this application's own Postgres database and its own
+  extraction workspace, never the T7 mount.
+- A fix for the `IDENTITY_RESOLUTION`-labeled archive-attempt naming
+  imprecision noted above.
+- Running Ollama or proving a real end-to-end embedding success against
+  real T7 content - Ollama was confirmed not running; the correct
+  `EMBEDDING_UNAVAILABLE` failure path was proven instead.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

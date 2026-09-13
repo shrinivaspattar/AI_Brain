@@ -127,18 +127,50 @@ class WorkerClaimService:
         worker_id: str,
         lease_duration: timedelta,
     ) -> SourceInstance | None:
-        """Claims one root-level SourceInstance needing identity
-        resolution: content_identity_group_id IS NULL. Archive-member
-        instances are never claimed here - per the frozen design, an
-        archive's members are all discovered/resolved together as part
-        of claiming and processing the parent archive as one unit, not
-        individually."""
+        """Claims one root-level, non-archive SourceInstance needing
+        identity resolution: content_identity_group_id IS NULL.
+
+        Excludes two categories of row that also have
+        content_identity_group_id IS NULL but must never be resolved by
+        this generic query, because `root_t7_path` would be the WRONG
+        content to hash for either of them:
+
+        - Archive-member instances (`member_path IS NOT NULL`): a
+          member's own content lives inside the archive at
+          `member_path`, not at `root_t7_path` (the archive's own
+          path, shared identically across every one of its members).
+          Per the frozen design, members are only ever identity-
+          resolved together as part of claiming and processing the
+          parent archive as one unit (see
+          `claim_source_instance_for_archive_processing` /
+          `ArchiveProcessingService`), never individually here.
+        - Root-level archive instances themselves
+          (`root_t7_path` ending in `_ARCHIVE_SUFFIXES`): an archive's
+          own raw container bytes are never "content" to identity-
+          resolve - only its extracted members are (see
+          `claim_source_instance_for_archive_processing`'s docstring).
+          Such a row legitimately and permanently keeps
+          `content_identity_group_id IS NULL` even after being fully,
+          successfully processed, so without this exclusion this query
+          would eventually claim it once no other unresolved work
+          remains and wrongly hash the archive's compressed bytes as
+          if they were document content.
+        """
         stale_before = datetime.now(UTC) - lease_duration
+
+        not_archive_suffixed = ~or_(
+            *(
+                SourceInstance.root_t7_path.ilike(f"%{suffix}")
+                for suffix in _ARCHIVE_SUFFIXES
+            )
+        )
 
         candidate_id = self.db.execute(
             select(SourceInstance.id)
             .where(
                 SourceInstance.content_identity_group_id.is_(None),
+                SourceInstance.member_path.is_(None),
+                not_archive_suffixed,
                 (SourceInstance.claimed_by.is_(None))
                 | (SourceInstance.claimed_at < stale_before),
             )

@@ -47,3 +47,9 @@ tmp/
 # Corpus discovery reports - real personal file/directory names and
 # paths from the T7 corpus, never committed to version control.
 knowledge/t7_discovery/
+
+# Ingestion extraction workspace - real personal file CONTENT read
+# from the T7 corpus during ingestion, never committed to version
+# control (same reasoning as knowledge/t7_discovery/ above, but for
+# file bytes rather than names/paths).
+documents/

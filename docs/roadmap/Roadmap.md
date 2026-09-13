@@ -1638,6 +1638,78 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       allow-list, the `ImportJob` source-reference convention), before
       the next authorization opens read-only real-T7 ingestion.
 
+- [x] Synthetic-only pre-real-T7 review gate — closed at `a0523b7`,
+      test-only, no production code changed (the implementation already
+      matched the frozen design). Extended nested-archive crash-resume
+      coverage to three levels deep (`A.zip → B.zip → {file 1, file 2,
+      C.zip → file 3}`) and closed the `FileAccessService` ↔ `ImportJob`
+      boundary gap, including the defense-in-depth "mislabeled
+      `source_type`" case — deliberately with zero literal T7 mount
+      path anywhere, even as a "should be rejected" input, since
+      `Path.resolve()` performs real stat/readlink syscalls against any
+      real, mounted path prefix. Full suite: 714 passed, 1 skipped, run
+      three times. Neither T7 path was accessed or referenced anywhere
+      in this gate. **APPROVED for closure.**
+
+- [x] Real T7 Read-Only Ingestion Pilot — the first-ever authorization
+      ("AUTHORIZE: REAL T7 READ-ONLY INGESTION MILESTONE", checkpoint
+      `a0523b7`) to read actual file content from the mounted real T7
+      corpus, strictly read-only and limited to a small controlled
+      pilot batch per the authorization's explicit first-pass-limit
+      instruction. Mount confirmed against D1's own recorded report
+      root before selecting candidates; the `b9a82d073399`/
+      `fd9f81672e59` migrations were applied to the main `aibrain`
+      database for the first time (previously `aibrain_test`-only),
+      with before/after row-count verification on every pre-existing
+      table. Ollama confirmed not running, so real embedding calls were
+      expected (and correctly took) the `EMBEDDING_UNAVAILABLE` failure
+      path, not a success path.
+
+      Pilot batch (`scripts/t7_ingestion_pilot.py`): three small loose
+      files and one small archive, selected programmatically from the
+      already-committed D1 report (never re-scanned). All three loose
+      files resolved identity correctly; the archive was correctly
+      found to contain zero real file members (four empty directory
+      entries only, independently confirmed via `unzip -l`). Every
+      source path's `(size, mtime)` was verified identical before,
+      during, and after — including one final re-check after all
+      diagnosis/cleanup below — confirming the real T7 corpus was never
+      altered.
+
+      **A real bug was found** via the pilot script's own idempotency
+      check: `WorkerClaimService.claim_source_instance_for_identity_
+      resolution` had no exclusion for archive-suffixed or
+      archive-member `SourceInstance` rows (both legitimately and
+      permanently keep `content_identity_group_id IS NULL`), so a
+      second, unnecessary claim call wrongly claimed the archive's own
+      row and hashed its raw compressed bytes as content — producing a
+      bogus `ContentIdentityGroup` that correctly then failed at
+      normalization (`CORRUPT_INPUT`, invalid UTF-8). No `Document`/
+      `DocumentChunk` rows resulted. The real T7 file itself was
+      confirmed completely unchanged throughout — this bug corrupted
+      only this application's own database bookkeeping, never the
+      source corpus. Fixed by adding `member_path IS NULL` and an
+      archive-suffix exclusion to the claim query (mirroring the
+      exclusion `claim_source_instance_for_archive_processing` already
+      had); two regression tests added, each independently verified to
+      fail against the pre-fix query and pass against the fixed one.
+      The erroneous database rows and stray workspace file were cleaned
+      up; the three legitimate resolved groups were left untouched.
+      Full suite re-run three times after the fix: **716 passed, 1
+      skipped**, zero flakiness (714 pre-existing + 2 new). `documents/`
+      (the extraction workspace, now holding real personal file
+      content for the first time) was added to `.gitignore`, mirroring
+      the existing `knowledge/t7_discovery/` reasoning. See
+      `AI_Brain_Architecture.md`'s "Real T7 Read-Only Ingestion Pilot"
+      section for the full report.
+
+      **Stopped at the authorized scope**, per the authorization's
+      explicit closing instruction: no broader ingestion, mutation, or
+      dedup disposition was started. **Next gate, not yet authorized**:
+      any ingestion beyond this four-item pilot batch, and the
+      dedup-disposition/mutation gate the authorization explicitly
+      excluded.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

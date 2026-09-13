@@ -338,6 +338,80 @@ def test_nested_archive_creates_full_provenance_chain_and_resolves_deep_member(
     assert [link.path for link in links] == [str(archive_path), "nested.zip", "deep.txt"]
 
 
+def test_identity_resolution_never_claims_a_fully_processed_root_archive(
+    db: Session, tmp_path
+) -> None:
+    """Regression test for a real bug found during the first real-T7
+    ingestion pilot: a root-level archive SourceInstance legitimately
+    and permanently keeps content_identity_group_id IS NULL even after
+    being fully, successfully processed (its raw container bytes are
+    never "content"). Before this fix, claim_source_instance_for_
+    identity_resolution had no suffix exclusion, so once every other
+    unresolved loose file was exhausted it would wrongly claim the
+    archive's own row and hash its raw compressed bytes as if they
+    were document content - producing a bogus ContentIdentityGroup
+    that then failed at normalization with CORRUPT_INPUT. This proves
+    a second, later call to resolve_next() (e.g. an idempotency /
+    "is there more work" check) finds nothing to do, rather than
+    wrongly claiming the archive."""
+    archive_path = tmp_path / "source" / "outer.zip"
+    archive_path.parent.mkdir(parents=True)
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        zf.writestr("a.txt", "content A")
+
+    run = _classification_run(db)
+    root_instance = _archive_instance(db, run, archive_path)
+
+    ArchiveProcessingService(db).process_next_archive(
+        worker_id="worker-a", workspace_root=tmp_path / "workspace"
+    )
+    db.refresh(root_instance)
+    assert root_instance.content_identity_group_id is None  # correct, permanent
+
+    result = IdentityResolutionService(db).resolve_next(
+        worker_id="worker-a", workspace_root=tmp_path / "workspace"
+    )
+    assert result is None
+
+    group_count_before = db.query(ContentIdentityGroup).count()
+    assert group_count_before == 1  # only "a.txt"'s group - no bogus archive group
+
+
+def test_identity_resolution_never_claims_a_nested_archives_own_instance(
+    db: Session, tmp_path
+) -> None:
+    """A nested archive's own member-row also permanently keeps
+    content_identity_group_id IS NULL (it is itself a container, not a
+    leaf) - proving the member_path exclusion, not just the root-level
+    suffix exclusion, closes the hazard for archives discovered during
+    extraction too."""
+    inner_zip = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner_zip, "w") as zf:
+        zf.writestr("deep.txt", "deeply nested content")
+
+    archive_path = tmp_path / "source" / "outer.zip"
+    archive_path.parent.mkdir(parents=True)
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        zf.write(inner_zip, "nested.zip")
+
+    run = _classification_run(db)
+    _archive_instance(db, run, archive_path)
+
+    ArchiveProcessingService(db).process_next_archive(
+        worker_id="worker-a", workspace_root=tmp_path / "workspace"
+    )
+
+    nested_archive_instance = (
+        db.query(SourceInstance).filter(SourceInstance.member_path == "nested.zip").one()
+    )
+    assert nested_archive_instance.content_identity_group_id is None  # correct, permanent
+
+    result = IdentityResolutionService(db).resolve_next(
+        worker_id="worker-a", workspace_root=tmp_path / "workspace"
+    )
+    assert result is None
+
+
 def test_archive_crash_halfway_is_resumable_without_duplicate_members(
     db: Session, tmp_path
 ) -> None:
