@@ -3477,6 +3477,92 @@ opened, written to, moved, renamed, deleted, or otherwise modified. The
 real corpus was NOT re-scanned to correct the classification defect
 above - the fix was re-derived entirely from already-collected data.
 
+### D2 Safety Follow-up - a procedural incident, disclosed precisely
+
+**What actually happened, stated precisely rather than smoothed over**:
+during D2's final pre-commit safety verification, a test intended to
+check whether `write_provenance_report`'s destination guard would
+reject a write into the OTHER named T7 path (not the one that
+particular analysis had scanned) was written as a REAL write attempt
+against `/media/personal/Seenu_T7SSD` (the canonical, currently-
+unmounted T7 path) - `write_provenance_report(analysis, Path("/media/
+personal/Seenu_T7SSD/sneaky.json"))`. **No T7 file was successfully
+mutated** - the attempt was denied by OS-level permissions (`EACCES`,
+that directory being root-owned) before any bytes were written, and
+`find`-based re-verification afterward confirmed the directory's
+contents were unchanged. But **the verification procedure itself
+violated this project's own standing rule of never directing a
+mutating operation at a real protected path, even as a test** - a
+permission denial is not an application-level safety guarantee, and
+this test should not have targeted a real path at all, synthetic or
+otherwise substitutable. The mounted real corpus, `/media/personal/
+Seenu_T7SSD1`, was not targeted by this specific test and was not
+mutated. This distinction - "did D2 mutate the T7" (no) versus "did the
+verification procedure obey the never-touch-the-real-corpus-for-
+testing rule" (no, it did not) - is deliberately kept separate here,
+per explicit correction, rather than collapsed into a single
+reassurance.
+
+**What this revealed about `reject_destination_inside_root`'s actual
+scope**: the helper protects only the SPECIFIC `root` it is given
+(`analysis.d1_root`, always caller-supplied, never hardcoded) - it has
+no concept of "other locations the caller separately considers
+sensitive." A destination inside a different, unrelated directory (a
+second T7 mount point, for instance) is not rejected, because the
+helper was never told that directory mattered. This is not a defect in
+the helper's own logic (its single-root guarantee holds exactly as
+designed and tested); it is a genuine gap in what this project's tools
+currently protect BEYOND the one root a given analysis actually
+scanned.
+
+**Protected-root policy - a decision, not an implementation this
+follow-up builds**: a broader "never write here regardless of what's
+being analyzed" policy belongs in a SEPARATE, EXPLICIT layer -
+deliberately NOT folded into `reject_destination_inside_root` itself,
+and deliberately NOT a hardcoded list of real paths inside `app/
+discovery/*.py` (this project has never hardcoded the real corpus
+location into production code, and a "protected roots" constant would
+be exactly that). The intended shape, decided now but built later, only
+when separately authorized:
+
+```
+operation
+   ↓
+destination safety policy
+   ├── resolve destination
+   ├── reject protected roots       <- NEW: an explicit, caller/config-
+   │                                     supplied list, never hardcoded
+   │                                     literals in library code
+   ├── reject inside active root    <- EXISTING: reject_destination_
+   │                                     inside_root, unchanged
+   └── reject unsafe/symlinked      <- EXISTING: already handled via
+       destinations                     .resolve(strict=False)
+```
+
+A caller wanting multiple locations protected today must call
+`reject_destination_inside_root` once per protected root explicitly
+(proven safe and correct via `test_caller_can_protect_multiple_roots_
+by_checking_each_explicitly`) - a real but manual pattern, acceptable
+for the current single-analysis-at-a-time scripts, but not something
+that would scale cleanly to a future milestone with more entry points.
+Building the actual policy layer (where the protected-root list lives -
+an explicit runner argument, an environment variable, a small config
+file never containing defaults) is explicitly deferred to its own,
+separately-authorized milestone.
+
+**Test added, entirely synthetic**: `test_does_not_protect_a_second_
+root_it_was_never_told_about` reproduces the exact scope gap using two
+disposable `tmp_path` directories, never referencing or touching any
+real filesystem location - proof of the boundary, not a repeat of the
+incident.
+
+**Deliberately not built this follow-up**: the protected-root policy
+layer itself; any change to `reject_destination_inside_root`'s
+single-root behavior; any T7 access of any kind, including read-only
+verification (already confirmed clean by D2's own final checks and not
+repeated here). This follow-up is documentation and a synthetic
+regression test only.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

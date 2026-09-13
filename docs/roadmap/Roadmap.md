@@ -1122,6 +1122,35 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       review pass (34 total for this module). Full suite: 631 tests.
       **The real corpus was NOT re-scanned to fix the defect** — the
       correction was re-derived entirely from already-collected data.
+- [x] D2 Safety Follow-up — a procedural incident, disclosed precisely,
+      not smoothed over. D2's final pre-commit verification included a
+      test that turned out to be a REAL write attempt against
+      `/media/personal/Seenu_T7SSD` (the canonical, unmounted T7 path) —
+      denied by OS permissions before any bytes were written, confirmed
+      via `find` that nothing changed, but the verification procedure
+      itself violated this project's own rule of never directing a
+      mutating operation at a real protected path, even as a test. Two
+      separate questions, kept separate rather than collapsed: did D2
+      mutate the T7 (no); did the verification procedure obey the
+      never-touch-the-real-corpus-for-testing rule (no). The mounted
+      real corpus, `/media/personal/Seenu_T7SSD1`, was not targeted by
+      this test and was not mutated. Revealed a genuine scope gap:
+      `reject_destination_inside_root` protects only the specific root
+      it's given, not "other locations the caller separately considers
+      sensitive" — not a defect in the helper (its single-root
+      guarantee holds exactly as designed), but a real gap in what this
+      project's tools protect beyond the one root actually scanned.
+      Decision recorded, not built: a protected-root policy belongs in
+      a separate, explicit layer (caller/config-supplied list, never
+      hardcoded literals in library code) — deferred to its own future
+      milestone. 1 new synthetic-only regression test
+      (`test_does_not_protect_a_second_root_it_was_never_told_about`)
+      reproduces the exact scope gap with two disposable `tmp_path`
+      directories, never touching any real path — plus a second test
+      demonstrating the correct manual multi-root pattern available
+      today. Full suite: 633 tests. **Zero T7 access of any kind during
+      this follow-up**, including read-only re-verification (already
+      confirmed clean by D2's own checks, not repeated here).
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
