@@ -6,6 +6,7 @@ from app.models.content_identity_group import (
     ContentIdentityAlgorithm,
     ContentIdentityGroup,
     ContentIdentityKind,
+    ContentPipelineState,
 )
 from app.models.source_instance import SourceInstance
 
@@ -72,7 +73,21 @@ class ContentIdentityService:
         identity_kind: ContentIdentityKind,
         identity_algorithm: ContentIdentityAlgorithm,
         identity_hash: str,
+        initial_pipeline_state: ContentPipelineState = ContentPipelineState.DISCOVERED,
     ) -> ContentIdentityGroup:
+        """`initial_pipeline_state` (added for the Controlled Ingestion
+        Implementation gate) is used ONLY when this call actually
+        creates a new row - it has no effect when an existing group is
+        found and returned. Defaults to `DISCOVERED` (the model
+        column's own default), preserving every existing caller's
+        behavior unchanged. The ingestion pipeline passes `EXTRACTED`
+        here specifically: by the time identity resolution or archive
+        extraction has computed a hash, the underlying bytes have
+        necessarily already been read - there is no separate
+        "extraction" work left to claim for such a group, so it starts
+        life past that step rather than needing a redundant EXTRACTING
+        claim for work that's already done.
+        """
         existing = self._find(identity_kind, identity_algorithm, identity_hash)
         if existing is not None:
             return existing
@@ -81,6 +96,7 @@ class ContentIdentityService:
             identity_kind=identity_kind,
             identity_algorithm=identity_algorithm,
             identity_hash=identity_hash,
+            pipeline_state=initial_pipeline_state,
         )
         self.db.add(group)
         try:

@@ -1540,6 +1540,78 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       (extraction/normalization/chunking/embedding) built on these
       primitives — still no T7 access, real ingestion jobs, or
       embeddings until that is separately opened.
+- [x] Controlled Ingestion Implementation — the pipeline itself, built
+      on `6491dad`'s design and `ce50875`'s claim/attempt primitives,
+      entirely against synthetic fixtures. **Zero schema changes** —
+      archive-completion tracking reuses the existing `IngestionAttempt`
+      table (a prior `SUCCEEDED` attempt against an archive's own
+      `SourceInstance` means "already processed") instead of adding a
+      column. Six new services under `app/classification/`:
+      `eligibility_service` (suffix-only `ELIGIBLE`/`EXCLUDED`/
+      `UNSUPPORTED` decision, never opens a file), `workspace` (shared
+      layout helpers), `identity_resolution_service` (claims + hashes
+      + resolves a loose file's identity), `archive_processing_service`
+      (claims + recursively extracts an archive, idempotent
+      check-before-create member discovery — crash-safe by
+      construction, not by wrapping the walk in one transaction),
+      `normalization_service` (claims `EXTRACTED` → creates `Document`
+      → `NORMALIZED`), `chunking_service` (claims `NORMALIZED` →
+      `DocumentChunk` rows with `embedding=NULL` → `CHUNKED` —
+      deliberately not reusing `EmbeddingService.embed_document`'s
+      atomic chunk+embed, since the frozen state machine needs these
+      as two independently resumable steps), `pipeline_embedding_service`
+      (claims `CHUNKED`/`EMBEDDED`, embeds only `WHERE embedding IS
+      NULL`, advances to `INGESTED` once none remain — resumability is
+      structural, not special-cased). `ContentIdentityService.
+      get_or_create_group` gained an `initial_pipeline_state` parameter
+      (default unchanged); `DocumentCreate`/`DocumentService.
+      create_document` gained `content_identity_group_id`.
+      `FileAccessService` hardened per `6491dad`'s recommendation: an
+      explicit `source_type` allow-list (`{"filesystem"}`), verified via
+      `grep` to cost zero behavior change for any existing caller.
+
+      **All nine required test scenarios proven**, real Postgres where
+      concurrency/crash behavior is at stake: same identity → one
+      group; concurrent workers → one owner per work item (10 identity-
+      resolution workers/10 files, 6 archive workers/6 archives, 8
+      normalization workers/8 groups — every item processed exactly
+      once); worker crash → recoverable claim (inherited from `ce50875`,
+      unchanged); retry → no duplicated Document/Chunk/embedding state;
+      archive crash halfway → resumable without duplicate members
+      (proven by pre-creating one member row, simulating the crash);
+      unsupported/corrupt input → durable `FAILED`/`UNSUPPORTED` — a
+      real bug found and fixed here: `extract_text()` can raise
+      library-specific exceptions from `pypdf`/`docx`/`pptx`/`openpyxl`,
+      not only `UnicodeDecodeError`/`OSError` — the original narrower
+      handler would have let such an exception escape uncaught instead
+      of recording a durable `FAILED` attempt; excluded input →
+      `EXCLUDED`, never `FAILED`; embedding crash → resumable/idempotent
+      (proven via a fake embedding client's call log confirming an
+      already-embedded chunk is never re-sent); T7-unavailable
+      simulation → source remains represented, no destructive behavior.
+
+      A separate bug was found and fixed while writing the concurrency
+      tests themselves (not the pipeline code): synthetic file content
+      that wasn't unique per test invocation caused `ContentIdentityGroup`
+      rows to be legitimately shared across separate test runs —
+      correct production behavior, but it made a naive delete-by-id
+      test cleanup fail with a foreign-key violation against leftover
+      data from an earlier run. Fixed by making test content unique per
+      invocation and cleanup delete a group only if nothing still
+      references it.
+
+      Full suite: **711 passed, 1 skipped**, run three times, zero
+      flakiness (687 pre-existing + 24 new). The 3 concurrency tests
+      additionally run 10 consecutive times with no flakiness.
+      `aibrain_test` confirmed empty of synthetic rows after every run.
+      Main `aibrain` database completely untouched — no migration was
+      even needed this gate. No T7 access of any kind at any point. See
+      `AI_Brain_Architecture.md`'s "Controlled Ingestion Implementation"
+      section for the full report. **Next gate, not yet authorized**:
+      real T7 discovery-report ingestion into this pipeline, resource
+      limits/scheduling/orchestration for running multiple workers,
+      and eventually real extraction/embeddings against the actual T7 —
+      still no T7 access of any kind until each is separately opened.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

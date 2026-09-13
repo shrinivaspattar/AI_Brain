@@ -5895,6 +5895,249 @@ access of any kind occurred - `/media/personal/Seenu_T7SSD` and
 - Any API routes, Pydantic schemas, or UI for any of this - not
   requested, not built.
 
+## Controlled Ingestion Implementation: the pipeline itself
+
+A ninth T7 gate, opened after the ingestion schema-extension closed at
+`ce50875`. Implements the pipeline `6491dad` designed, using the
+schema and claim/attempt primitives `ce50875` built, entirely against
+synthetic fixtures - no T7 access, no real embeddings, no production
+ingestion UI/API, no logical document/version semantics, no dedup
+executor involvement, no delete/move/rename/quarantine of anything.
+**Zero database schema changes were needed for this gate** - a
+deliberate, notable outcome: archive-completion tracking reuses the
+existing `IngestionAttempt` audit table (see below) rather than adding
+a new column, exactly the kind of schema-avoidance this project favors
+when an existing mechanism already fits.
+
+### Modules built
+
+- **`app/classification/eligibility_service.py`** -
+  `classify_eligibility(path)`, a pure, suffix-only decision
+  (`ELIGIBLE`/`EXCLUDED`/`UNSUPPORTED`) made *before* any read is
+  attempted - `.c9r` is `EXCLUDED` (matching D2's established finding),
+  a small explicit denylist of binary/media extensions is
+  `UNSUPPORTED`, everything else is `ELIGIBLE`. Never opens a file;
+  works even on paths that don't exist.
+- **`app/classification/workspace.py`** - shared layout/helpers for
+  where a `ContentIdentityGroup`'s raw bytes live once available
+  (`documents/imports/.../group_<id>/content<suffix>`), and the
+  eligibility-to-initial-`pipeline_state` mapping, used identically by
+  identity resolution and archive processing.
+- **`app/classification/identity_resolution_service.py`** -
+  `IdentityResolutionService.resolve_next()`: claims one unresolved
+  root-level `SourceInstance`, reads it (the ONE legitimate read of
+  `root_t7_path` this design always intended - see the class docstring
+  for why this doesn't contradict "never dereferenced again"), hashes
+  it, classifies eligibility, calls the already-concurrency-proven
+  `ContentIdentityService.get_or_create_group`/`assign_content_identity`
+  from `1253a2e`, writes workspace content for eligible groups, records
+  an `IngestionAttempt`, releases the claim. T7-unavailable/permission-
+  denied/other-read-error are each their own `IngestionFailureCode`.
+- **`app/classification/archive_processing_service.py`** -
+  `ArchiveProcessingService.process_next_archive()`: claims one
+  top-level, not-yet-processed archive `SourceInstance` (via a new
+  `WorkerClaimService` query - see below), recursively extracts it
+  (reusing `ArchiveExtractor` unmodified, including its existing
+  path-traversal/expansion-ratio/disk-space/symlink guards, re-applied
+  at every nesting level), creates a `SourceInstance` for every member
+  including nested archives, and resolves every leaf member's identity
+  inline. **Idempotent by construction, not by wrapping the whole walk
+  in one database transaction**: before creating a member's
+  `SourceInstance`, it checks whether one already exists for the exact
+  `(classification_run_id, root_t7_path, member_path)` triple - a
+  crash-and-resume finds already-created members and completes only
+  what's still missing, never duplicating. An archive's own
+  `SourceInstance` never receives a `content_identity_group_id` (its
+  raw container bytes aren't "content"); "already fully processed" is
+  tracked by checking for a prior `SUCCEEDED` `IngestionAttempt`
+  against it - a legitimate reuse of the existing audit table for
+  exactly its intended purpose, needing no new schema.
+- **`app/classification/normalization_service.py`** -
+  `NormalizationService.normalize_next()`: claims a group at
+  `EXTRACTED`, runs the existing, unmodified `extract_text()`, creates
+  the `Document` row (the first point one exists for this identity),
+  advances to `NORMALIZED`. Idempotent: checks for an existing Document
+  before creating one (a retry after a state-reset finds and reuses
+  it, never creating a second - which the `UNIQUE` constraint would
+  reject anyway, but the service handles it cleanly rather than
+  crashing).
+- **`app/classification/chunking_service.py`** -
+  `ChunkingService.chunk_next()`: claims a group at `NORMALIZED`,
+  creates `DocumentChunk` rows with `embedding = NULL` - deliberately
+  NOT reusing the existing `EmbeddingService.embed_document()` (which
+  atomically chunks AND embeds together), because the frozen
+  `NORMALIZED -> CHUNKED -> EMBEDDED` state machine requires these as
+  two independently resumable steps; `DocumentChunk.embedding`'s
+  existing nullability already anticipated exactly this intermediate
+  state. Idempotent: if chunks already exist for the Document, this is
+  a no-op (never delete-and-recreate, which would discard any
+  embeddings a partially-completed embedding pass already computed).
+- **`app/classification/pipeline_embedding_service.py`** -
+  `PipelineEmbeddingService.embed_next()`: claims a group at `CHUNKED`
+  (or `EMBEDDED`, for a partially-embedded group needing to finish),
+  embeds only chunks with `embedding IS NULL`, and - once none remain -
+  advances through `EMBEDDED` straight to `INGESTED`. Resumability is
+  structural, not special-cased: querying `WHERE embedding IS NULL`
+  fresh on every claim means a crash after embedding some chunks simply
+  leaves the rest for the next claim to finish, with zero risk of
+  re-embedding (or re-billing an external call for) already-completed
+  work.
+
+### `WorkerClaimService` addition
+
+`claim_source_instance_for_archive_processing()` - a new claim query
+scoped to top-level (`member_path IS NULL`) archive-suffixed
+`SourceInstance`s not yet successfully processed (see the
+`IngestionAttempt`-based "already done" check above). Nested archives
+are never claimed here - per the frozen design, they're discovered and
+resolved entirely within their parent's single claimed unit of work.
+
+### `ContentIdentityService.get_or_create_group` extension
+
+Gained an optional `initial_pipeline_state` parameter (default
+`DISCOVERED`, preserving every existing caller's behavior exactly).
+The ingestion pipeline passes `EXTRACTED` when creating a group from
+identity resolution or archive extraction: by the time a hash is
+computed, the underlying bytes have necessarily already been read -
+there is no separate `EXTRACTING` claim left to perform for that case,
+so the group starts life past that step rather than needing redundant
+work claimed for something already done.
+
+### `Document` creation wiring
+
+`DocumentCreate` and `DocumentService.create_document` gained
+`content_identity_group_id` (nullable, defaults to `None` - every
+existing personal-corpus-import caller unaffected). This was the one
+piece of `1253a2e`'s explicitly-deferred scope ("no API routes or
+Pydantic schemas... not requested") this gate actually needed, since
+creating a pipeline `Document` requires setting this field.
+
+### `FileAccessService` hardening (the item named at `6491dad`, built here)
+
+`_allowed_roots()` now filters by an explicit `source_type` allow-list
+(`{"filesystem"}`), not merely `status == COMPLETED`. Verified via
+`grep` that every real caller in this codebase already uses
+`"filesystem"`, so this costs zero behavior change for anything that
+exists today; proven by a new integration test constructing a
+`COMPLETED` `ImportJob` with a synthetic non-filesystem `source_type`
+and confirming it is now correctly excluded. An allow-list, not a
+deny-list, per `6491dad`'s stated reasoning: it fails closed for any
+future `source_type` nobody thought to add yet.
+
+### Verified end to end, then formally tested
+
+Before writing the formal test suite, the full chain was run as a
+manual smoke test and confirmed to reach `INGESTED` exactly as
+designed: `SourceInstance(loose file) → IdentityResolutionService →
+ContentIdentityGroup(EXTRACTED) → NormalizationService →
+Document + NORMALIZED → ChunkingService → DocumentChunk(embedding=NULL)
++ CHUNKED → PipelineEmbeddingService → embeddings filled + INGESTED`.
+A second smoke test confirmed nested-archive recursion end to end
+(`outer.zip → top.txt` + `outer.zip → nested.zip → deep.txt`, with the
+correct `ProvenanceLink` chain at each depth), and a third confirmed
+crash-resume idempotency by pre-creating one member's `SourceInstance`
+(simulating a crash between member-creation and identity-resolution)
+and verifying re-processing completed it without creating a duplicate.
+
+### The nine required test scenarios - all proven, real Postgres where concurrency/crash behavior is at stake
+
+1. **Same identity → one `ContentIdentityGroup`** - two different
+   loose files with identical bytes converge on the same group
+   (reusing `1253a2e`'s already-proven mechanism, exercised here at the
+   pipeline level).
+2. **Concurrent workers → one owner per work item** - proven at the
+   PIPELINE level (not just the low-level claim primitives `ce50875`
+   already proved): 10 concurrent `IdentityResolutionService` workers
+   against 10 distinct files, 6 concurrent `ArchiveProcessingService`
+   workers against 6 distinct archives, and 8 concurrent
+   `NormalizationService` workers against 8 distinct groups - every
+   case: every work item processed exactly once, verified via a fresh
+   connection, not the ORM's local view.
+3. **Worker crash → recoverable claim** - inherited directly from
+   `ce50875`'s already-proven stale-claim recovery, unchanged and
+   reused by every new service here (all built on `WorkerClaimService`).
+4. **Retry → no duplicated Document/Chunk/embedding state** - a group
+   forced back to `EXTRACTED` after a successful normalize and
+   re-normalized reuses the existing `Document`, never creates a
+   second one.
+5. **Archive crash halfway → resumable without duplicate members** -
+   proven by pre-creating one member's row (simulating the crash) and
+   confirming re-processing completes it without duplication.
+6. **Unsupported/corrupt input → durable `FAILED`/`UNSUPPORTED`** -
+   proven for both: a known-binary extension durably lands at
+   `UNSUPPORTED` at identity-resolution time (never attempted); a
+   `.pdf`-named file containing garbage bytes durably lands at `FAILED`
+   with `CORRUPT_INPUT`, via a broadened exception handler around
+   `extract_text()` (a real bug found and fixed while writing this
+   test: `extract_text()` can raise library-specific exceptions from
+   `pypdf`/`docx`/`pptx`/`openpyxl`, not only `UnicodeDecodeError`/
+   `OSError` - the original narrower handler would have let such an
+   exception escape uncaught out of a claimed worker instead of
+   recording a durable `FAILED` attempt).
+7. **Excluded input → `EXCLUDED`, not `FAILED`** - a `.c9r` file lands
+   at `EXCLUDED` directly, with zero attempt ever made and no
+   `IngestionAttempt` recorded (matching `29d6864`'s stated rule that
+   `EXCLUDED`/`UNSUPPORTED` reasoning never lives in the same place as
+   `FAILED`'s).
+8. **Embedding crash → resumable/idempotent** - a group with one
+   chunk already embedded (simulating a prior partial attempt) and the
+   rest `NULL`: re-running embeds only the `NULL` ones (proven via the
+   fake embedding client's call log, confirming the already-embedded
+   chunk's content was never re-sent) and correctly reaches `INGESTED`.
+   A parallel test confirms a genuine embedding-backend failure lands
+   the group at `FAILED` with zero chunks marked embedded - never a
+   partial, ambiguous state.
+9. **T7-unavailable simulation → source remains represented, no
+   destructive behavior** - a `SourceInstance` pointing at a path that
+   never exists: the row is never deleted or mutated destructively,
+   stays unresolved, and gets a durable `FAILED`/`T7_UNAVAILABLE`
+   attempt explaining why.
+
+### Full suite
+
+**711 passed, 1 skipped**, run three times, zero flakiness (687
+pre-existing + 24 new: 15 pipeline execution tests, 5 eligibility unit
+tests, 3 pipeline-level concurrency tests, 1 `FileAccessService`
+hardening test). The 3 concurrency tests were additionally run 10
+consecutive times with no flakiness. `aibrain_test` confirmed empty of
+synthetic rows after every run (one real leftover-data bug was found
+and fixed while writing the concurrency tests: synthetic file content
+that wasn't unique per test invocation caused `ContentIdentityGroup`
+rows to be legitimately shared across separate test runs - correct
+production behavior, but it made a blind delete-by-captured-id cleanup
+fail with a foreign-key violation when an earlier run's data hadn't
+been cleaned up yet; fixed by making test content unique per invocation
+and by making cleanup delete a group only if no `SourceInstance`
+anywhere still references it). The main `aibrain` database's schema and
+Alembic head (`ef65da409302`) remain completely untouched - this gate
+added no migration at all. No T7 access of any kind occurred at any
+point in implementation, smoke-testing, or formal verification.
+
+### What this implementation pass explicitly does NOT include
+- Any T7 access, real extraction, real embeddings, or real ingestion
+  jobs - every fixture in every test is synthetic, under a test's own
+  `tmp_path`.
+- Any API routes or UI for triggering or monitoring ingestion - not
+  requested, not built.
+- The `ImportJob`-as-outer-container convention `6491dad` sketched for
+  a future T7 ingestion run (e.g. `source_type = "classification_run:
+  <id>"`) - this gate's services are called directly, with no
+  `ImportJob` wrapper; wiring one in is deferred to whenever real T7
+  ingestion is authorized.
+- A bounded retry/backoff policy for `FAILED` groups, or an explicit
+  "give up permanently" terminal state distinct from `FAILED` -
+  `FAILED` remains indefinitely retryable by construction; policy
+  around when to stop retrying is not decided here.
+- Resource limits, concurrency caps, or scheduling/orchestration for
+  running many workers at once - each service exposes a single
+  `claim-one-and-process-it` method; anything coordinating multiple
+  workers across multiple stages is a future concern.
+- Logical document identity or document/version modeling (identity
+  layers 3/4) - unchanged, still deferred.
+- Any change to the dedup executor or to `EmbeddingService` (the
+  existing personal-corpus-import path) - both remain exactly as they
+  were.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

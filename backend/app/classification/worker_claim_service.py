@@ -1,10 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models.content_identity_group import ContentIdentityGroup, ContentPipelineState
+from app.models.ingestion_attempt import IngestionAttempt, IngestionAttemptOutcome
 from app.models.source_instance import SourceInstance
+
+_ARCHIVE_SUFFIXES = (".zip", ".7z")
 
 
 class WorkerClaimService:
@@ -166,3 +169,71 @@ class WorkerClaimService:
             .values(claimed_by=None, claimed_at=None)
         )
         self.db.commit()
+
+    def claim_source_instance_for_archive_processing(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+    ) -> SourceInstance | None:
+        """Claims one TOP-LEVEL (T7-visible, `member_path IS NULL`)
+        archive SourceInstance that has not yet been successfully
+        processed. Never claims a nested archive discovered during
+        extraction - per the frozen design, an archive's members
+        (including nested archives) are all discovered and resolved
+        together as part of processing the parent archive as one unit,
+        never claimed independently.
+
+        An archive's own SourceInstance never receives a
+        content_identity_group_id (its raw container bytes are not
+        "ingestible content" in the document sense - only its
+        EXTRACTED members are) - so `content_identity_group_id IS NULL`
+        alone cannot distinguish "not yet processed" from "successfully
+        processed, correctly has no identity forever." The distinguishing
+        signal reuses IngestionAttempt (no new schema column needed):
+        an archive with at least one SUCCEEDED attempt recorded against
+        it has already been fully processed and is excluded from this
+        claim query - a legitimate reuse of the existing per-attempt
+        audit table for exactly its intended purpose, not a new source
+        of truth.
+        """
+        stale_before = datetime.now(UTC) - lease_duration
+
+        already_processed = exists().where(
+            IngestionAttempt.source_instance_id == SourceInstance.id,
+            IngestionAttempt.outcome == IngestionAttemptOutcome.SUCCEEDED,
+        )
+
+        suffix_match = or_(
+            *(
+                SourceInstance.root_t7_path.ilike(f"%{suffix}")
+                for suffix in _ARCHIVE_SUFFIXES
+            )
+        )
+
+        candidate_id = self.db.execute(
+            select(SourceInstance.id)
+            .where(
+                SourceInstance.member_path.is_(None),
+                suffix_match,
+                SourceInstance.content_identity_group_id.is_(None),
+                ~already_processed,
+                (SourceInstance.claimed_by.is_(None))
+                | (SourceInstance.claimed_at < stale_before),
+            )
+            .order_by(SourceInstance.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ).scalar_one_or_none()
+
+        if candidate_id is None:
+            return None
+
+        self.db.execute(
+            update(SourceInstance)
+            .where(SourceInstance.id == candidate_id)
+            .values(claimed_by=worker_id, claimed_at=datetime.now(UTC))
+        )
+        self.db.commit()
+
+        return self.db.get(SourceInstance, candidate_id)

@@ -32,6 +32,7 @@ class DocumentService:
             source_type=document_data.source_type,
             content_hash=document_data.content_hash,
             import_job_id=document_data.import_job_id,
+            content_identity_group_id=document_data.content_identity_group_id,
         )
 
         try:

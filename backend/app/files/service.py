@@ -19,6 +19,21 @@ class FileAccessError(Exception):
     not found, or not decodable as text."""
 
 
+# Added for the Controlled Ingestion Implementation gate, per
+# "Controlled T7 -> AI_Brain Ingestion Design" (`6491dad`) round 2,
+# point 3: an explicit ALLOW-list, not a deny-list. Every real caller
+# in this codebase already uses "filesystem" (confirmed via `grep`
+# across app/ and tests/ before this change), so this costs zero
+# behavior change for anything that exists today. A future T7-sourced
+# ImportJob using a non-path reference (e.g. "classification_run:<id>")
+# for its source_path would use a DIFFERENT source_type - one NOT in
+# this set - and is therefore excluded here structurally, not merely
+# by the convention of its source_path never looking like a real path.
+# An allow-list fails closed for any future source_type nobody thought
+# to add yet; a deny-list would trust it by default.
+_FILESYSTEM_BACKED_SOURCE_TYPES = frozenset({"filesystem"})
+
+
 class FileAccessService:
     """Read-only access to files on disk - the first (and, deliberately,
     only) file-operation capability in AI_Brain.
@@ -44,7 +59,8 @@ class FileAccessService:
     def _allowed_roots(self) -> list[Path]:
         source_paths = self.db.scalars(
             select(ImportJob.source_path).where(
-                ImportJob.status == ImportStatus.COMPLETED
+                ImportJob.status == ImportStatus.COMPLETED,
+                ImportJob.source_type.in_(_FILESYSTEM_BACKED_SOURCE_TYPES),
             )
         )
 
