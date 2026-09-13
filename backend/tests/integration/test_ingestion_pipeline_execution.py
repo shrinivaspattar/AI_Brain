@@ -392,6 +392,174 @@ def test_archive_crash_halfway_is_resumable_without_duplicate_members(
     assert partial.content_identity_group_id is not None  # now completed
 
 
+def test_nested_archive_crash_resume_across_three_levels(db: Session, tmp_path) -> None:
+    """The synthetic-only pre-real-T7 review's required deeper case:
+
+        A.zip
+          `-- B.zip
+               |-- file1.txt
+               |-- file2.txt
+               `-- C.zip
+                    `-- file3.txt
+
+    Simulates a crash after PARTIAL member creation: B.zip's own
+    SourceInstance and file1.txt's SourceInstance + identity were
+    already created and resolved by an earlier, crashed attempt;
+    file2.txt and C.zip (and file3.txt inside it) were not yet
+    discovered at all. Required outcomes on resume, all checked
+    explicitly: existing members (B.zip, file1.txt) are REUSED, not
+    duplicated; only the missing members (file2.txt, C.zip, file3.txt)
+    are created; no duplicate SourceInstances anywhere; no duplicate
+    ProvenanceLinks for the pre-existing member; file1.txt's already-
+    recorded evidence_snapshot is byte-for-byte unchanged; the full,
+    correct 4-link provenance chain exists for the newly-discovered
+    deepest file (file3.txt); and a second, immediate re-run (with
+    nothing left to do) is itself idempotent - no further changes,
+    still succeeds.
+    """
+    from app.classification.content_identity_service import ContentIdentityService
+    from app.classification.source_instance_service import ProvenanceStep, SourceInstanceService
+    from app.models.content_identity_group import ContentIdentityAlgorithm, ContentIdentityKind, ContentPipelineState
+    from app.models.provenance_link import ProvenanceLinkKind
+
+    c_zip = tmp_path / "C.zip"
+    with zipfile.ZipFile(c_zip, "w") as zf:
+        zf.writestr("file3.txt", "content of file 3")
+
+    b_zip = tmp_path / "B.zip"
+    with zipfile.ZipFile(b_zip, "w") as zf:
+        zf.writestr("file1.txt", "content of file 1")
+        zf.writestr("file2.txt", "content of file 2")
+        zf.write(c_zip, "C.zip")
+
+    a_zip = tmp_path / "source" / "A.zip"
+    a_zip.parent.mkdir(parents=True)
+    with zipfile.ZipFile(a_zip, "w") as zf:
+        zf.write(b_zip, "B.zip")
+
+    run = _classification_run(db)
+    root_instance = _archive_instance(db, run, a_zip)
+
+    # Simulate the partial prior attempt: B.zip discovered, file1.txt
+    # discovered AND identity-resolved; nothing else yet.
+    b_instance = SourceInstanceService(db).create_instance(
+        classification_run_id=run.id,
+        root_t7_path=str(a_zip),
+        member_path="B.zip",
+        evidence_snapshot={"discovered_during_extraction": True, "parent_source_instance_id": root_instance.id},
+        chain=[
+            ProvenanceStep(kind=ProvenanceLinkKind.T7_FILE, path=str(a_zip)),
+            ProvenanceStep(kind=ProvenanceLinkKind.ARCHIVE_MEMBER, path="B.zip"),
+        ],
+    )
+    file1_instance = SourceInstanceService(db).create_instance(
+        classification_run_id=run.id,
+        root_t7_path=str(a_zip),
+        member_path="B.zip/file1.txt",
+        evidence_snapshot={
+            "discovered_during_extraction": True,
+            "parent_source_instance_id": b_instance.id,
+            "pre_crash_marker": "must-survive-unchanged",
+        },
+        chain=[
+            ProvenanceStep(kind=ProvenanceLinkKind.T7_FILE, path=str(a_zip)),
+            ProvenanceStep(kind=ProvenanceLinkKind.ARCHIVE_MEMBER, path="B.zip"),
+            ProvenanceStep(kind=ProvenanceLinkKind.ARCHIVE_MEMBER, path="file1.txt"),
+        ],
+    )
+    import hashlib
+
+    file1_hash = hashlib.sha256(b"content of file 1").hexdigest()
+    group1 = ContentIdentityService(db).get_or_create_group(
+        identity_kind=ContentIdentityKind.EXTRACTED_CONTENT,
+        identity_algorithm=ContentIdentityAlgorithm.SHA256,
+        identity_hash=file1_hash,
+        initial_pipeline_state=ContentPipelineState.EXTRACTED,
+    )
+    ContentIdentityService(db).assign_content_identity(file1_instance.id, group1)
+
+    pre_existing_snapshot = dict(file1_instance.evidence_snapshot)
+    pre_existing_file1_link_ids = sorted(
+        link.id
+        for link in db.query(ProvenanceLink).filter(
+            ProvenanceLink.source_instance_id == file1_instance.id
+        )
+    )
+    workspace = tmp_path / "workspace"
+
+    result = ArchiveProcessingService(db).process_next_archive(
+        worker_id="resume-worker", workspace_root=workspace
+    )
+    assert result.id == root_instance.id
+
+    all_instances = (
+        db.query(SourceInstance)
+        .filter(SourceInstance.classification_run_id == run.id)
+        .all()
+    )
+    member_paths = [si.member_path for si in all_instances if si.member_path]
+    # No duplicates anywhere.
+    assert len(member_paths) == len(set(member_paths)), f"duplicate member(s) in {member_paths}"
+    assert set(member_paths) == {"B.zip", "B.zip/file1.txt", "B.zip/file2.txt", "B.zip/C.zip", "B.zip/C.zip/file3.txt"}
+
+    # Pre-existing members REUSED, not duplicated (same row ids).
+    db.refresh(b_instance)
+    db.refresh(file1_instance)
+    by_path = {si.member_path: si for si in all_instances}
+    assert by_path["B.zip"].id == b_instance.id
+    assert by_path["B.zip/file1.txt"].id == file1_instance.id
+
+    # evidence_snapshot on the pre-existing member is byte-for-byte unchanged.
+    assert file1_instance.evidence_snapshot == pre_existing_snapshot
+
+    # No duplicate ProvenanceLinks for the pre-existing member.
+    file1_link_ids_after = sorted(
+        link.id
+        for link in db.query(ProvenanceLink).filter(
+            ProvenanceLink.source_instance_id == file1_instance.id
+        )
+    )
+    assert file1_link_ids_after == pre_existing_file1_link_ids
+
+    # Only the missing members are newly created, and they're fully resolved.
+    file2_instance = by_path["B.zip/file2.txt"]
+    c_instance = by_path["B.zip/C.zip"]
+    file3_instance = by_path["B.zip/C.zip/file3.txt"]
+    assert file2_instance.content_identity_group_id is not None
+    assert c_instance.content_identity_group_id is None  # a container, never gets one
+    assert file3_instance.content_identity_group_id is not None
+
+    # Nested provenance ancestry is correct for the newly-discovered deepest file.
+    file3_links = (
+        db.query(ProvenanceLink)
+        .filter(ProvenanceLink.source_instance_id == file3_instance.id)
+        .order_by(ProvenanceLink.sequence_index)
+        .all()
+    )
+    assert [(link.sequence_index, link.kind, link.path) for link in file3_links] == [
+        (0, ProvenanceLinkKind.T7_FILE, str(a_zip)),
+        (1, ProvenanceLinkKind.ARCHIVE_MEMBER, "B.zip"),
+        (2, ProvenanceLinkKind.ARCHIVE_MEMBER, "C.zip"),
+        (3, ProvenanceLinkKind.ARCHIVE_MEMBER, "file3.txt"),
+    ]
+
+    # A second, immediate re-run has nothing left to do (the root
+    # archive's own SUCCEEDED attempt already excludes it from
+    # re-claiming) - proving the retry path itself is idempotent, not
+    # merely that a lucky first resume worked.
+    second_run_result = ArchiveProcessingService(db).process_next_archive(
+        worker_id="second-resume-worker", workspace_root=workspace
+    )
+    assert second_run_result is None
+
+    instances_after_second_run = (
+        db.query(SourceInstance)
+        .filter(SourceInstance.classification_run_id == run.id)
+        .count()
+    )
+    assert instances_after_second_run == len(all_instances)
+
+
 def test_corrupt_archive_records_durable_failed_attempt(db: Session, tmp_path) -> None:
     """"unsupported/corrupt input -> durable FAILED/UNSUPPORTED", the
     archive-level case: a file with a .zip extension that is not
