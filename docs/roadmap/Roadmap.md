@@ -1229,6 +1229,95 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       Document → DocumentChunk`, still leaving logical-document/version
       semantics (identity layers 3/4) deferred — not immediate
       extraction.
+- [x] Schema/Model Design for `SourceInstance → ProvenanceLink →
+      ContentIdentityGroup → Document → DocumentChunk` — design pass
+      only, no T7 access, no migrations, no model/service code written.
+      **APPROVED and frozen after five review rounds.** Follows
+      two existing house patterns rather than inventing new ones:
+      `DuplicateReview`/`DuplicateReviewMember` (parent finding + N-way
+      child table) and `DedupExecutionPlan`/`DedupExecutionPlanAction`
+      (immutable, snapshotted audit rows with evidence duplicated onto
+      child rows). Five new tables sketched: `DiscoveryRun` (one row
+      per already-completed D0/D1/D2 run, deliberately **not** the
+      heavier atomic `CorpusSnapshot` concept — D0/D1/D2 are honestly
+      non-atomic, sequential runs against a live corpus; round 4 froze
+      the exact invariant: `report_sha256` proves which report artifact
+      was consumed, never that the T7 was quiescent while producing
+      it); `ClassificationRun` (one row per classification pass,
+      referencing up to one D0/D1/D2 `DiscoveryRun` each, plus — added
+      in round 4 — an immutable `classifier_version` column so two runs
+      over the identical D2 report that classify differently have a
+      durable explanation); `SourceInstance` (physical occurrence, with
+      an immutable JSONB `evidence_snapshot` for filesystem facts +
+      D1/D2 machine inference — round 4 froze this as historical
+      evidence at classification time, never a live filesystem view —
+      structurally separate from mutable `canonical_status`/
+      `canonical_status_reason`/`canonical_status_decided_by`/
+      `canonical_status_decided_at` columns for human decisions only,
+      with round 4 stating explicitly that `canonical_status_reason` is
+      a decision annotation, never source evidence; a `CHECK` constraint
+      sketch enforces that `NON_CANONICAL` requires the same evidentiary
+      bar as `CANONICAL`); `ProvenanceLink` (self-referential
+      `parent_link_id` + `sequence_index`, replacing the earlier opaque
+      `archive_chain` with something a plain indexed query can walk);
+      `ContentIdentityGroup` (round 4 added an explicit `identity_kind`
+      + `identity_algorithm` domain alongside `identity_hash`, so the
+      four hash layers from `29d6864` can never be silently compared
+      across layers — the `UNIQUE` constraint now covers all three
+      columns together; `pipeline_state` carries a round-4-refined
+      lifecycle: the earlier catch-all `QUARANTINED` is retired in
+      favor of four distinct terminal/review states —
+      `NEEDS_REVIEW`/`UNSUPPORTED`/`EXCLUDED`/`FAILED` — so a
+      non-processing outcome, like `.c9r` ciphertext being explicitly
+      out of scope, is never forced into language implying a failure it
+      isn't; this remains the single per-group idempotency boundary,
+      never duplicated onto `SourceInstance`). `Document` gains exactly
+      one new nullable, UNIQUE `content_identity_group_id` column, with
+      round 4 stating the invariant explicitly: one `ContentIdentityGroup`
+      represents one ingestible content identity, and at most one
+      `Document` currently represents it today — not a claim that two
+      semantically different representations can never relate;
+      `DocumentChunk` is unchanged (provenance reaches it transitively
+      through the existing `document_id` FK). Migration is purely
+      additive — zero columns dropped, existing `Document` rows start
+      with the new column NULL, backfill logic explicitly deferred.
+
+      **Round 5 (pre-freeze cross-table invariant check, APPROVED)**:
+      before freezing, every edge was verified as a single table
+      (cardinality, optional/required, immutability, unique
+      constraints, creating event, allowed-to-change event) rather than
+      only as prose, specifically checking for contradictions between
+      immutable `evidence_snapshot`, mutable `canonical_status`, the
+      `ContentIdentityGroup` lifecycle, nullable identity pre-hash, and
+      nullable `Document` pre-processing. Found and fixed one real
+      classification error: `SourceInstance.content_identity_group_id`
+      is **write-once** (starts `NULL`, set exactly once, then fixed),
+      not "fully immutable" as round 4 implied — and the
+      deferred-identity case is **not archive-member-exclusive**: D1's
+      size-collision filter also skipped uniquely-sized loose files, so
+      those start `NULL` too. Added two missing `CHECK` constraints:
+      `ClassificationRun` must reference at least one `DiscoveryRun`;
+      `ProvenanceLink`'s `sequence_index = 0` position must be exactly
+      the `T7_FILE` root (previously only prevented by convention, not
+      the schema). Pinned down a rule round 4 left implicit: `Document`
+      existence is not synonymous with `pipeline_state = INGESTED` — a
+      `Document` must exist by `CHUNKED` at the latest, since
+      `DocumentChunk.document_id` requires a parent; `INGESTED` marks
+      the whole pipeline (through `EMBEDDED`) finishing, a related but
+      different fact. Walked the specific scenario named in the
+      pre-freeze request (a second, later `SourceInstance` resolving to
+      an already-`INGESTED` group's `identity_hash`) and confirmed it
+      is the idempotency key working as designed, with no contradiction
+      among the five flagged concepts; named one genuine open question
+      as explicitly deferred to implementation (concurrent-discovery
+      race serialization over the same `identity_hash`), not a schema
+      gap. See `AI_Brain_Architecture.md`'s "Schema/Model Design"
+      section for the full, frozen proposal, including the round-5
+      invariant table and cardinality/checklist walkthroughs. **Next
+      gate, not yet authorized**: implementation (actual migration +
+      model + service code) of this design — still no T7 access,
+      extraction, ingestion, or embeddings until that is separately
+      opened.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

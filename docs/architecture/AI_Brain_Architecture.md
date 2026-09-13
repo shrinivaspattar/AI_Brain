@@ -4076,6 +4076,568 @@ not its state machine (see Ingestion state, above).
   ingestion codebase; no new scan, hash, or read of either T7 path
   occurred to produce it or this correction.
 
+## Schema/Model Design: SourceInstance → ProvenanceLink → ContentIdentityGroup → Document → DocumentChunk (APPROVED and frozen — no implementation yet)
+
+A fifth T7 gate, opened after the Ingestion & Representation Design
+froze at `29d6864`. Scope, stated explicitly at authorization:
+**schema/model design only**. No T7 scanning, no extraction, no
+real-corpus ingestion, no embeddings, no production implementation, no
+database migrations, no model implementation, no dedup execution, no
+deletion/quarantine, no logical-document/version implementation. The
+deliverable is a precise proposed schema and relationship model — code
+sketches below are illustrative, not files to be created. Went through
+five review rounds (the fourth review's six corrections, then a fifth,
+pre-freeze cross-table invariant check that itself found and fixed one
+real mutability-classification error and added two missing CHECK
+constraints) before being approved. **Status: frozen** — the next gate
+is implementation (an actual migration, model, and service code) of
+this design, not yet authorized.
+
+### Grounding: precedent already in this codebase
+
+Before inventing new patterns, two existing tables were read closely
+because they already solve a structurally similar problem and set the
+house style this design follows:
+
+- **`DuplicateReview` + `DuplicateReviewMember`**
+  (`app/models/dedup_review.py`) — a parent "finding" row plus an
+  N-way child table of members with a role, specifically because "a
+  group is genuinely N-way... fixed columns would silently truncate a
+  real 3+-way group." `ContentIdentityGroup` + `SourceInstance` is the
+  same shape for the same reason.
+- **`DedupExecutionPlan` + `DedupExecutionPlanAction`**
+  (`app/models/dedup_execution_plan.py`) — immutable, snapshotted audit
+  rows ("every regeneration is a new row, not an edit"), with evidence
+  duplicated onto child rows for self-description without a join. This
+  design's `SourceInstance` and `ProvenanceLink` rows follow the same
+  immutability convention.
+
+Both use: `Integer` surrogate primary keys, `SQLEnum(Enum, name=
+"snake_case")` for status columns with a matching `server_default`,
+UTC-lambda `created_at`/`updated_at`, `JSONB` for point-in-time evidence
+snapshots (`DuplicateReview.evidence`), and `UniqueConstraint` for
+N-way relationship integrity. Every table below follows these
+conventions rather than inventing new ones.
+
+### The five new/extended tables
+
+**`DiscoveryRun`** — one row per already-completed D0/D1/D2 run. This
+is deliberately **not** the heavier, atomic `CorpusSnapshot` concept
+from the dormant backlog — D0/D1/D2 are three separate, sequential,
+non-atomic runs against a live corpus (D2 ran ~2 hours after D1, with
+Syncthing active throughout both, as D2's own documentation already
+states). This table does not pretend otherwise; it just gives each
+already-real run a durable, referenceable identity.
+
+**Invariant, stated explicitly per review (round 4)**: *a `DiscoveryRun`
+identifies an observed analysis/report, not a transactionally
+consistent filesystem snapshot.* `report_sha256` proves which exact
+report artifact a later `ClassificationRun` consumed — it proves
+nothing about whether the T7 filesystem itself was unchanging while
+that report was being produced, and no code or documentation may ever
+read it as such. This sentence belongs verbatim in the eventual
+model's docstring, not just in this design document.
+
+```
+DiscoveryRun
+  id                  Integer, PK
+  run_kind            Enum: D0_INVENTORY | D1_DUPLICATE_ANALYSIS
+                            | D2_PROVENANCE_ANALYSIS
+  source_root         Text        -- T7 root as recorded (inert metadata)
+  report_sha256       String(64)  -- hash of the report JSON file itself -
+                                      proves WHICH REPORT was consumed,
+                                      never that the T7 was quiescent
+                                      while producing it (see invariant above)
+  run_started_at      DateTime
+  run_completed_at    DateTime
+  created_at          DateTime
+```
+
+**`ClassificationRun`** — one row per execution of the classification
+stage (from the `29d6864` pipeline). Re-classification is expected and
+first-class, mirroring D2's own `load_raw_from_previous_report`
+philosophy of reprocessing without re-touching the T7.
+
+**Addition per review (round 4)**: a `classifier_version` column
+identifies *which classification behavior* produced this run's
+`SourceInstance` rows — a lightweight, immutable implementation
+identifier (e.g. a semantic version or short code identifier the
+classification module reports about itself), not a full
+`Processor`/`ProcessorVersion` architecture (that remains the dormant
+"pipeline versioning" backlog item). Without it, two
+`ClassificationRun`s over the identical D2 report could disagree in
+their resulting classification and nothing durable would explain why.
+
+```
+ClassificationRun
+  id                     Integer, PK
+  classifier_version     String, NOT NULL   -- immutable identifier for
+                          the classification logic that ran; the
+                          durable answer to "why did this run classify
+                          differently from that one over the same report"
+  d0_discovery_run_id    Integer, FK -> discovery_runs.id, nullable
+  d1_discovery_run_id    Integer, FK -> discovery_runs.id, nullable
+  d2_discovery_run_id    Integer, FK -> discovery_runs.id, nullable
+  started_at             DateTime
+  completed_at           DateTime, nullable
+  created_at             DateTime
+
+  CHECK (d0_discovery_run_id IS NOT NULL OR d1_discovery_run_id IS NOT NULL
+         OR d2_discovery_run_id IS NOT NULL)   -- added in round 5: a
+         ClassificationRun consuming zero DiscoveryRuns is meaningless
+```
+
+**`SourceInstance`** — one physical observed occurrence, per the
+`29d6864` design, now given concrete columns.
+
+```
+SourceInstance
+  id                            Integer, PK
+  classification_run_id         Integer, FK -> classification_runs.id, NOT NULL, index
+  content_identity_group_id     Integer, FK -> content_identity_groups.id,
+                                 NULLABLE, WRITE-ONCE  -- null until this
+                                 occurrence's content identity is known.
+                                 NOT archive-member-exclusive (round 5
+                                 correction): ANY path D1 never hashed -
+                                 including a uniquely-sized LOOSE file,
+                                 which D1's size-collision filter also
+                                 skips - starts here too. Set exactly
+                                 once, by whichever step first computes
+                                 this instance's hash (classification
+                                 itself, if a D1 hash already exists;
+                                 otherwise a later extraction/hashing
+                                 step), then never changed again. May
+                                 resolve to an ALREADY-EXISTING group
+                                 (another instance got there first - the
+                                 idempotency key working as designed) or
+                                 a brand new one.
+  root_t7_path                  Text, NOT NULL   -- the outermost t7_file
+                                 path (denormalized from the root
+                                 ProvenanceLink for query convenience,
+                                 matching DedupExecutionPlanAction's own
+                                 denormalization convention)
+  member_path                   Text, nullable   -- path within the
+                                 innermost archive; null for a loose file
+                                 (root_t7_path already names it fully)
+  evidence_snapshot             JSONB, NOT NULL  -- IMMUTABLE, copied
+                                 verbatim at classification time: D1's
+                                 group_kind/group_key/category if this
+                                 path was part of a D1 group, D2's
+                                 inference_code/confidence/evidence_codes/
+                                 structured_facts/requires_human_review
+                                 if D2 covered it, source-file hash if D1
+                                 computed one. Never rewritten after
+                                 creation - a correction is a new
+                                 ClassificationRun, not an edit here,
+                                 matching this project's existing
+                                 evidence-snapshot convention
+                                 (DuplicateReview.evidence, Message.citations).
+  canonical_status               Enum: UNRESOLVED | CANONICAL | NON_CANONICAL
+                                 default UNRESOLVED, MUTABLE (the one
+                                 mutable evidentiary field on this row)
+  canonical_status_reason        Text, nullable   -- REQUIRED (see CHECK
+                                 constraint below) whenever status is not
+                                 UNRESOLVED - the explicit evidence/
+                                 decision, never inferred
+  canonical_status_decided_by    Text, nullable   -- "human" today; a
+                                 future narrowly-scoped automated policy
+                                 would name itself here explicitly,
+                                 never silently
+  canonical_status_decided_at    DateTime, nullable
+  created_at                     DateTime, NOT NULL   -- immutable once written
+```
+
+**`evidence_snapshot` semantics, frozen per review (round 4)**:
+*`evidence_snapshot` is historical evidence captured from the
+discovery/classification inputs that existed at `classification_run_id`'s
+`started_at` — it is never a live filesystem view, and no code may
+ever re-read or re-validate it against the T7's current state as if it
+were current truth.* If the T7 changes after classification, this row
+does not know and must not claim to; a fresh observation is a new
+`SourceInstance` from a new `ClassificationRun`, never a reason to
+mutate this JSON. Symmetrically, **`canonical_status_reason` is a
+decision annotation, not source evidence** — it explains a human's (or
+future policy's) choice about this row, and must never be read, copied
+into, or treated as if it were part of `evidence_snapshot`. The two are
+kept in genuinely different columns (see checklist item 13) specifically
+so this distinction cannot be blurred by a future developer reaching
+for "the JSON blob" without noticing which one they meant.
+
+Constraint sketch (illustrative, not final SQL): `CHECK
+(canonical_status = 'UNRESOLVED' OR (canonical_status_reason IS NOT
+NULL AND canonical_status_decided_by IS NOT NULL AND
+canonical_status_decided_at IS NOT NULL))` — makes the review-round-3
+requirement ("`NON_CANONICAL` requires its own explicit evidence,
+exactly like `CANONICAL`") a schema-level guarantee, not just a
+documented convention a future developer could accidentally violate.
+
+**`ProvenanceLink`** — the structural archive-ancestry chain from
+`29d6864`, now with concrete columns supporting real ancestry queries
+(the review-round-2 requirement: "not an opaque free-form
+`archive_chain`").
+
+```
+ProvenanceLink
+  id                   Integer, PK
+  source_instance_id   Integer, FK -> source_instances.id, NOT NULL, index
+  parent_link_id       Integer, FK -> provenance_links.id, nullable
+                        (null only for the root t7_file link)
+  sequence_index       Integer, NOT NULL  -- 0 for the root link,
+                        increasing per nesting level; makes "immediate
+                        container" / "nesting depth" queries index-
+                        friendly without a recursive CTE every time
+  kind                 Enum: T7_FILE | ARCHIVE_MEMBER
+  path                 Text, NOT NULL   -- T7 path for a t7_file link;
+                        member-internal path for an archive_member link
+  created_at           DateTime  -- immutable
+
+  UniqueConstraint(source_instance_id, sequence_index)
+  CHECK ((sequence_index = 0) = (kind = 'T7_FILE' AND parent_link_id IS NULL))
+    -- added in round 5: position 0 in a chain must be exactly the
+    -- t7_file root; every other position must be an archive_member
+    -- with a parent. Without this, the UNIQUE constraint alone
+    -- prevents two roots but not a semantically-wrong root.
+```
+
+A query like "every `SourceInstance` whose chain passed through this
+specific archive path" is now `SELECT DISTINCT source_instance_id FROM
+provenance_links WHERE path = :archive_path` — a plain indexed lookup,
+not a JSONB containment scan.
+
+**`ContentIdentityGroup`** — the first-class object introduced in
+review round 3, now with concrete columns.
+
+**Identity domain, made explicit per review (round 4)**: `identity_hash`
+alone, unqualified, does not say which of the four hash layers (source
+file / archive member / extracted document content / normalized-content)
+it lives in — and asserting equivalence across layers by accident is
+exactly the kind of silent conflation this whole design exists to
+prevent. Two columns make the namespace unambiguous, even though this
+milestone populates only one combination of them:
+
+```
+ContentIdentityGroup
+  id                  Integer, PK
+  identity_kind       Enum: SOURCE_BYTES | EXTRACTED_CONTENT | NORMALIZED_CONTENT
+                       -- this milestone populates EXTRACTED_CONTENT
+                       exclusively (matching the "always the extracted
+                       document content hash, never an enclosing
+                       archive's source-file hash" rule below); the
+                       other two values exist in the enum now so the
+                       namespace is unambiguous if a future milestone
+                       ever needs them, NOT because this design
+                       proposes populating them
+  identity_algorithm  Enum: SHA256   -- named explicitly rather than
+                       assumed forever; today's D1/ingestion hashing is
+                       exclusively SHA-256, but the algorithm is a
+                       stated fact of this row, not an implicit default
+  identity_hash       String(64), NOT NULL
+  pipeline_state      Enum: DISCOVERED | CLASSIFIED | EXTRACTING | EXTRACTED
+                       | NORMALIZED | CHUNKED | EMBEDDED | INGESTED
+                       | NEEDS_REVIEW | UNSUPPORTED | EXCLUDED | FAILED
+                       default DISCOVERED, MUTABLE - see the dedicated
+                       discussion below; this is THE ingestion
+                       idempotency boundary: the pipeline runs once per
+                       group, never per SourceInstance (see
+                       Q9/idempotency below)
+  created_at          DateTime  -- immutable
+  updated_at          DateTime  -- pipeline_state transitions touch this
+
+  UniqueConstraint(identity_kind, identity_algorithm, identity_hash)
+```
+
+The `UNIQUE` constraint moved from `identity_hash` alone to the
+`(identity_kind, identity_algorithm, identity_hash)` triple specifically
+so that — even though only one combination is used today — the schema
+itself, not just a convention, prevents two different identity spaces
+from ever being compared as if they were the same one.
+
+**`pipeline_state`'s non-processing outcomes, corrected per review
+(round 4)**: the original four-state catch-all `QUARANTINED` conflated
+three genuinely different outcomes and forced them all through language
+that implied failure. Retired in favor of four distinct terminal or
+review-pending states, none of which is a euphemism for another:
+- `NEEDS_REVIEW` — a D2-flagged group blocked pending a human decision;
+  may later transition onward once resolved. Unchanged from `29d6864`.
+- `UNSUPPORTED` — classification determined, ahead of any extraction
+  attempt, that this content's format/type is not currently handled
+  (e.g. no extractor exists for it yet). A durable, known fact about
+  the format, not an error.
+- `EXCLUDED` — classification deliberately decided, by policy, that
+  this content identity is out of scope for ingestion (e.g. `.c9r`
+  Cryptomator ciphertext, per D2's own established finding). **`EXCLUDED`
+  is not `FAILED`** — nothing was attempted and nothing broke; a
+  decision was made.
+- `FAILED` — an attempted step (`EXTRACTING`/`NORMALIZED`/`CHUNKED`/
+  `EMBEDDED`) genuinely errored (corrupt archive member, decode error,
+  embedding service unavailable). Retry semantics remain deferred, per
+  `29d6864`, but the state itself is now distinct from the other three
+  rather than sharing a bucket with them.
+
+Retiring the shared `QUARANTINED` name also has a second, smaller
+benefit: it removes any remaining possibility of confusion with the
+dedup executor's quarantine (already addressed once in `29d6864`) by
+simply not sharing a name with it at all anymore, on either side.
+
+**`Document`** (existing table, one new column) —
+
+```
+Document (existing columns unchanged: id, title, source, source_type,
+           content_hash, import_job_id, created_at, updated_at)
+  + content_identity_group_id   Integer, FK -> content_identity_groups.id,
+                                 UNIQUE, nullable during migration (see
+                                 Migration strategy)
+```
+
+`content_hash` is kept, not removed - its value must always equal the
+owning group's `identity_hash` (a documented invariant, denormalized
+for self-description exactly like `DedupExecutionPlanAction` duplicates
+`target_path`, not enforced by a DB trigger in this design pass).
+
+**`DocumentChunk`** — **no schema change proposed.** Provenance is
+preserved transitively through the existing `document_id` FK, now
+extended one hop further upstream by `Document.content_identity_group_id
+→ ContentIdentityGroup ← SourceInstance → ProvenanceLink`. Adding
+columns here would duplicate information already reachable by a join;
+this design deliberately does not do that.
+
+### Cardinality, stated explicitly (checklist item 1)
+
+```
+DiscoveryRun (D0/D1/D2, up to 3)  1..3 ── consumed by ──> 1  ClassificationRun
+ClassificationRun                        1 ── creates ──> N  SourceInstance
+SourceInstance                           N ── links ────> 1  ProvenanceLink chain (1..N links each)
+SourceInstance                           N ── may share ─> 0..1  ContentIdentityGroup  (nullable - see Hash semantics)
+ContentIdentityGroup                     1 ── produces ──> 0..1  Document  (nullable until pipeline runs)
+Document                                 1 ── chunks into ─> N  DocumentChunk  (unchanged)
+```
+
+The two **nullable** relationships in this diagram are the two places
+review rounds 2-3 specifically corrected: `SourceInstance.
+content_identity_group_id` is null exactly when an archive member's
+identity is not yet known (Hash semantics), and
+`ContentIdentityGroup.document_id`-via-`Document.
+content_identity_group_id` is null exactly when the group's pipeline
+hasn't produced a `Document` yet (a group sitting at `NEEDS_REVIEW` or
+simply not yet processed). Neither nullability is an oversight; both
+are the schema's way of refusing to assert an identity or a decision
+that evidence doesn't yet support.
+
+### Answering the checklist, in the order it was given
+
+**1. Exact cardinality and ownership** — see diagram above.
+
+**2. Immutable identifiers** — corrected in the round-5 consistency
+check (below): this design actually has **three** mutability classes,
+not two. Fully immutable, set at creation and never touched again:
+`ContentIdentityGroup.identity_kind`/`identity_algorithm`/
+`identity_hash`, every `ProvenanceLink` column, every `DiscoveryRun`/
+`ClassificationRun` column, and every `SourceInstance` column except
+`content_identity_group_id` and `canonical_status*`. **Write-once**
+(starts `NULL`, set exactly once when the value first becomes knowable,
+fixed forever after): `SourceInstance.content_identity_group_id` — see
+the round-5 correction below for why this is not simply immutable.
+**Freely mutable**: `SourceInstance.canonical_status` (+ its
+reason/decided_by/decided_at) and `ContentIdentityGroup.pipeline_state`
+(+ `updated_at`). A later observation of the same physical thing is
+always a **new** `SourceInstance` row from a new `ClassificationRun`,
+never an edit to an old one (matching `DedupExecutionPlan`'s "every
+regeneration is a new row").
+
+**3. Source/archive/content hash semantics** — unchanged in substance
+from the `29d6864` table (source file hash / archive member hash /
+extracted document content hash / normalized-content hash); this round
+adds an explicit `identity_kind` + `identity_algorithm` domain (above)
+so `ContentIdentityGroup.identity_hash` is always specifically the
+*extracted document content hash* (`identity_kind = EXTRACTED_CONTENT`),
+never a source-file hash of an enclosing archive, as a schema-enforced
+fact rather than a naming convention alone.
+
+**4. Archive-member provenance** — the `ProvenanceLink` chain, above.
+
+**5. Multiple physical occurrences → one content identity** —
+`SourceInstance.content_identity_group_id`, many-to-one, nullable.
+
+**6. `Document` ↔ `ContentIdentityGroup` relationship** — one-to-one,
+via a `UNIQUE` FK on `Document`, nullable until the group's pipeline
+actually produces a document (a group can legitimately have zero
+`Document`s — e.g. still `NEEDS_REVIEW`, `UNSUPPORTED`, `EXCLUDED`, or
+`FAILED`). **Invariant, stated explicitly per review (round 4)**: *a
+`ContentIdentityGroup` represents one ingestible content identity, and
+at most one derived `Document` currently represents that identity.*
+The `UNIQUE` constraint is a statement about how many `Document`s exist
+*today* for a given identity — one, at most — not a claim that two
+semantically different representations can never relate to each other.
+If a future logical-document layer (identity layers 3/4, still
+deferred) ever needs to merge multiple `ContentIdentityGroup`s under
+one logical document, that almost certainly means a *new* mapping
+table above this one — not a weakening of this `UNIQUE` constraint,
+which stays exactly as strict as it is today.
+
+**7. `DocumentChunk` provenance** — preserved transitively via the
+existing, unchanged `document_id` FK; no new columns on `DocumentChunk`.
+
+**8. Canonical-status ownership and evidence requirements** — lives on
+`SourceInstance` (scoped to its one `ContentIdentityGroup`, per review
+round 3), with a `CHECK` constraint sketch making "`NON_CANONICAL`
+requires the same evidentiary bar as `CANONICAL`" a schema guarantee.
+
+**9. Ingestion idempotency boundary** — `ContentIdentityGroup.
+pipeline_state` is the single per-group progress record; `SourceInstance`
+never carries its own copy of pipeline progress, which is what makes
+"one pipeline run, multiple provenance references" (the `29d6864`
+idempotency key) structurally true rather than merely a convention
+someone could violate by writing to the wrong row.
+
+**10. Lifecycle/state and uniqueness constraints** —
+`ContentIdentityGroup.pipeline_state` refines the `29d6864` lifecycle
+by replacing the earlier catch-all `QUARANTINED` with four distinct
+states (`NEEDS_REVIEW`/`UNSUPPORTED`/`EXCLUDED`/`FAILED`, above) so a
+non-processing outcome is never forced into language that implies a
+failure it isn't. Uniqueness: `content_identity_groups
+(identity_kind, identity_algorithm, identity_hash)` UNIQUE (not
+`identity_hash` alone — see the identity-domain discussion above);
+`documents.content_identity_group_id` UNIQUE; `provenance_links
+(source_instance_id, sequence_index)` UNIQUE.
+
+**11. Migration strategy from the existing `Document`/`DocumentChunk`
+model** — purely additive. Five new tables
+(`discovery_runs`, `classification_runs`, `source_instances`,
+`provenance_links`, `content_identity_groups`); exactly one new
+nullable column on `Document` (`content_identity_group_id`); zero
+changes to `DocumentChunk`; zero columns dropped anywhere.
+Any existing `Document` rows (from prior personal-corpus import
+testing, if any exist) start with `content_identity_group_id = NULL` —
+backfilling them (one `ContentIdentityGroup` per distinct existing
+`content_hash`) is real data-transformation logic, explicitly **not**
+designed in this pass, deferred to whenever implementation is
+authorized. New ingestion code, once built, always populates the
+column going forward. This keeps rebuildability intact at the schema
+level: nothing about this migration requires destroying or re-deriving
+existing rows to apply.
+
+**12. Snapshot/reference semantics for reproducibility** —
+`DiscoveryRun` + `ClassificationRun`, above — deliberately scoped down
+from the heavier, still-dormant `CorpusSnapshot` vision (item 9 /
+prior-art item 3 in the dormant backlog): this gives each already-real
+D0/D1/D2 run a durable, hash-verifiable identity without claiming an
+atomicity the live, Syncthing-active corpus never actually had.
+
+**13. Distinction between filesystem/source facts, inferred
+provenance, and human decisions** — structurally, not just
+conventionally, separated: `SourceInstance.evidence_snapshot` (JSONB,
+immutable, filesystem facts + D1/D2 machine inference only, snapshotted
+verbatim at classification time) versus `SourceInstance.canonical_status*`
+(real typed columns, mutable, human decisions only). A query for "what
+did a human decide" can never accidentally return inference JSON, and
+vice versa, because they are different column types in different parts
+of the row, not merely different keys inside one blob.
+
+### Cross-table invariant verification (round 5, pre-freeze consistency check)
+
+Requested explicitly before freezing: verify every edge as a single
+table (cardinality, optional/required, immutability, unique
+constraints, creating event, allowed-to-change event), not only as
+scattered prose, and check specifically for contradictions between
+immutable `evidence_snapshot`, mutable `canonical_status`, the
+`ContentIdentityGroup` lifecycle, nullable identity pre-hash, and
+nullable `Document` pre-processing. One real correction and two real
+constraint additions came out of doing this properly (below the table).
+
+**Note on the requested diagram's shape**: the edge drawn as
+"`ProvenanceLink` → leads to → `ContentIdentityGroup`" is a conceptual
+dependency, not a literal foreign key — there is no FK from
+`ProvenanceLink` to `ContentIdentityGroup` anywhere in this schema. The
+actual FK is `SourceInstance.content_identity_group_id`;
+`ProvenanceLink` only ever describes one `SourceInstance`'s own
+ancestry and has no relationship to `ContentIdentityGroup` at all. The
+table below uses the real FK graph.
+
+| Edge | Cardinality | Optional/Required | Immutability | Unique constraint | Created by | Allowed to change |
+|---|---|---|---|---|---|---|
+| `DiscoveryRun` → `ClassificationRun` | 1 `DiscoveryRun` : N `ClassificationRun` (via 3 separate per-kind FKs) | each of the 3 FKs individually nullable; **CHECK added (round 5)**: at least one must be non-null | both sides fully immutable | none (reuse across runs is expected and normal) | classification stage, at `ClassificationRun` creation | never |
+| `ClassificationRun` → `SourceInstance` | 1 : N | `SourceInstance.classification_run_id` NOT NULL | fully immutable | none | classification stage, per discovered path | never |
+| `SourceInstance` → `ProvenanceLink` | 1 : 1..N (chain length = nesting depth + 1) | every instance *should* have ≥1 link — an app-level invariant, not DB-enforced (same accepted limitation class as `DuplicateReview`'s un-enforced "≥1 member") | fully immutable | `(source_instance_id, sequence_index)`; **CHECK added (round 5)**: `sequence_index = 0 ⟺ kind = T7_FILE AND parent_link_id IS NULL` | classification stage, atomically with the owning `SourceInstance` | never |
+| `SourceInstance` → `ContentIdentityGroup` | N : 0..1 | nullable | **write-once** (round 5 correction, not fully immutable — see below) | none on this FK (many instances per group is the point) | whichever step first computes this instance's hash — classification itself if D1 already hashed it, otherwise a later extraction/hashing step | exactly one `NULL → value` transition, then fixed forever |
+| `ContentIdentityGroup` → `Document` | 1 : 0..1 | `Document.content_identity_group_id` required at creation for any new `Document` (nullable column exists only for pre-migration legacy rows) | immutable from `Document`'s creation moment onward | `documents.content_identity_group_id` UNIQUE | the pipeline step that first needs a `Document` row to exist — no later than immediately before the first `DocumentChunk` is written, since `DocumentChunk.document_id` requires a parent | never after creation |
+| `Document` → `DocumentChunk` | 1 : N (existing, unchanged) | `DocumentChunk.document_id` NOT NULL (existing) | `DocumentChunk` rows immutable (no `updated_at` exists on this table today) | `(document_id, chunk_index)` UNIQUE (existing) | chunking step | never |
+
+**The one real correction this check surfaced**: `SourceInstance.
+content_identity_group_id` cannot be "fully immutable" as round 4's
+prose implied — it is **write-once**, a third mutability class distinct
+from both "fully immutable" and "freely mutable." This also corrected
+a framing error carried since round 2: the deferred-identity case is
+**not archive-member-exclusive**. D1 only hashed files that shared a
+size with at least one other file (its size-collision filter) — a
+uniquely-sized *loose* T7 file was never hashed by D1 either, and its
+`SourceInstance` starts with `content_identity_group_id = NULL` for
+exactly the same reason an archive member does. Checklist item 2 above
+is corrected to reflect three mutability classes, not two.
+
+**Precise `Document`-existence rule, pinned down by this check** (round
+4 left this implicit): `Document` existence is **not** synonymous with
+`pipeline_state = INGESTED`. Since `DocumentChunk.document_id` requires
+a parent row, `Document` must exist no later than the transition that
+first produces chunks — i.e. by `CHUNKED`, at the latest.
+`pipeline_state` keeps advancing on the owning `ContentIdentityGroup`
+afterward (`EMBEDDED` → `INGESTED`) independent of the `Document` row
+already existing: "has a `Document`" means "reached at least `CHUNKED`";
+`INGESTED` means the whole pipeline — embeddings included — finished.
+These are related, not identical, facts, and no code should treat them
+as interchangeable.
+
+**Verifying the specific scenario the pre-freeze request named**: does
+a `ContentIdentityGroup` already at `INGESTED` (with a `Document`
+already produced) create any contradiction when a *second*,
+later-discovered `SourceInstance` (say, an archive member extracted
+weeks after the first loose-file copy was ingested) resolves to the
+same `identity_hash`? No — this is the idempotency key working exactly
+as designed: the second instance's write-once
+`content_identity_group_id` simply resolves to the **already-existing**
+group, gains a new `SourceInstance` row as a new provenance reference
+against the already-existing `Document`, and triggers no re-extraction,
+re-chunking, or re-embedding. No contradiction between the immutable
+`evidence_snapshot` (this new instance's own, separately recorded),
+mutable `canonical_status` (this new instance starts `UNRESOLVED` in
+its group, independent of any other instance's status), the group's
+`pipeline_state` (already `INGESTED`, untouched), and the group's
+existing `Document` (untouched). One genuine open question this
+scenario surfaces, **explicitly deferred to implementation, not a
+schema contradiction**: how concurrent classification/extraction races
+over the *same* `identity_hash` are serialized (e.g. two instances
+resolving their hash at nearly the same moment, both about to create a
+group) — ordinary database-level concurrency control (a unique
+constraint plus a retry-on-conflict, matching how this codebase already
+handles similar races elsewhere) is expected to be sufficient, but the
+exact mechanism is implementation detail, not schema design.
+
+**Result: no contradiction found between immutable `evidence_snapshot`,
+mutable `canonical_status`, the `ContentIdentityGroup` lifecycle,
+nullable identity pre-hash, and nullable `Document` pre-processing.**
+Two constraints were added (`ClassificationRun`'s "at least one input"
+CHECK, `ProvenanceLink`'s root-shape CHECK) and one mutability
+classification was corrected (`SourceInstance.content_identity_group_id`
+is write-once, not immutable, and its deferred-identity case is not
+archive-member-exclusive) as a direct result of doing this check
+properly rather than restating round 4's prose.
+
+### What this design pass explicitly does NOT decide or build
+- Any actual Alembic migration file, model file, or service code — the
+  sketches above are illustrative column lists, not files to create.
+- The `Document`/`ContentIdentityGroup` backfill logic for any existing
+  rows (checklist item 11's open sub-question).
+- The heavier, atomic `CorpusSnapshot` concept from the dormant
+  backlog — `DiscoveryRun`/`ClassificationRun` are a deliberately
+  smaller, honestly non-atomic answer to reproducibility, not that.
+- Any canonical-status *selection policy* — still just "a human
+  decided," per `29d6864`.
+- Logical document identity or document/version modeling (identity
+  layers 3/4) — still deliberately deferred, unchanged from `29d6864`.
+- Any T7 access, extraction, embeddings, or ingestion of any kind.
+  This section was written entirely from the existing codebase (models,
+  services, decisions 0001/0002) and the frozen `29d6864` design; no
+  new scan, hash, or read of either T7 path occurred to produce it.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
