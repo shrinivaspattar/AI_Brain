@@ -49,6 +49,27 @@ class Document(Base):
         index=True,
     )
 
+    # One ContentIdentityGroup represents one ingestible content
+    # identity, and at most one derived Document currently represents
+    # that identity - the UNIQUE constraint is a statement about how
+    # many Documents exist TODAY for a given identity (one, at most),
+    # not a claim that two semantically different representations can
+    # never relate to each other. A future logical-document layer, if
+    # built, would need a new mapping table above this one, not a
+    # weaker constraint here. Nullable because existing rows (from
+    # prior personal-corpus import testing, if any) predate this
+    # column and this migration is purely additive - new ingestion
+    # code should always populate it going forward. `content_hash`
+    # above is kept, not removed; its value must always equal the
+    # owning group's identity_hash (documented invariant, denormalized
+    # for self-description, not DB-enforced in this milestone).
+    content_identity_group_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("content_identity_groups.id"),
+        nullable=True,
+        unique=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,

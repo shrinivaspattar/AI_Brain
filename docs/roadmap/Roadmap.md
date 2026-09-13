@@ -1313,11 +1313,80 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       race serialization over the same `identity_hash`), not a schema
       gap. See `AI_Brain_Architecture.md`'s "Schema/Model Design"
       section for the full, frozen proposal, including the round-5
-      invariant table and cardinality/checklist walkthroughs. **Next
-      gate, not yet authorized**: implementation (actual migration +
-      model + service code) of this design — still no T7 access,
-      extraction, ingestion, or embeddings until that is separately
-      opened.
+      invariant table and cardinality/checklist walkthroughs.
+- [ ] Schema/Model Implementation for `SourceInstance → ProvenanceLink
+      → ContentIdentityGroup → Document → DocumentChunk` — implements
+      the `14b8063` design exactly, no T7 access, no real-corpus
+      ingestion, no embeddings. **Implementation complete, one
+      pre-commit review round done, not yet committed.** Five new
+      models (`DiscoveryRun`,
+      `ClassificationRun`, `ContentIdentityGroup`, `SourceInstance`,
+      `ProvenanceLink`) plus one new nullable, UNIQUE
+      `Document.content_identity_group_id` column; five new services
+      under `app/classification/`. Migration `b9a82d073399`
+      (`ef65da409302` → `b9a82d073399`) applied and verified against
+      `aibrain_test` only — upgrade/downgrade/upgrade all clean, every
+      constraint from the frozen design present (`uq_content_identity_
+      groups_identity`, `uq_provenance_links_source_instance_id_
+      sequence_index`, `uq_documents_content_identity_group_id`,
+      `ck_classification_runs_at_least_one_discovery_run`,
+      `ck_provenance_links_root_shape`, `ck_source_instances_canonical_
+      status_requires_evidence`). Write-once `content_identity_group_id`
+      enforced via an `UPDATE ... WHERE content_identity_group_id IS
+      NULL` + rowcount check, proven by test. **The user's explicit,
+      non-negotiable requirement for this gate** — same-`identity_hash`
+      concurrent claims proven by a real database concurrency test, not
+      merely assumed from the UNIQUE constraint — satisfied by
+      `test_content_identity_concurrency_execution.py`: two, then ten,
+      genuinely separate sessions/threads (same `threading.Barrier`
+      pattern as Chain 1's `execute()` race test) all converge on one
+      `ContentIdentityGroup` row with zero errors; a separate, ad-hoc,
+      forced-contention script confirmed the `IntegrityError`-then-
+      refetch path is actually exercised, not untested good luck; 15/15
+      consecutive runs with no flakiness. Test isolation via SQLAlchemy
+      2.0's `join_transaction_mode="create_savepoint"` — confirmed zero
+      leftover rows in `aibrain_test` after every run.
+
+      **Review round 6 (pre-commit audit, two real bugs found and
+      fixed)**: (1) `get_or_create_group`'s `except IntegrityError` was
+      catching ANY integrity failure, not specifically the identity
+      UNIQUE violation — fixed to inspect `exc.orig.diag.constraint_
+      name` and re-raise anything else, proven by 4 new mocked unit
+      tests in `tests/classification/`. (2) `ProvenanceLink`'s CHECK
+      constraint forbade a non-root row from looking like a root but
+      did NOT require it to have a parent — an orphan `ARCHIVE_MEMBER`
+      at `sequence_index > 0` with `parent_link_id = NULL` would have
+      been silently accepted; tightened to `(seq=0 AND T7_FILE AND
+      parent IS NULL) OR (seq>0 AND ARCHIVE_MEMBER AND parent IS NOT
+      NULL)`, verified against real Postgres. Also added the
+      explicitly-required real concurrency test for write-once
+      `SourceInstance.content_identity_group_id` under genuine
+      contention (two threads assigning DIFFERENT groups to the SAME
+      instance — exactly one wins, one cleanly refused, no silent
+      overwrite; 15/15 runs, no flakiness), and stated `evidence_
+      snapshot`'s immutability enforcement precisely (documented
+      contract + structural absence of any mutator — verified via
+      `grep` — NOT a DB constraint or trigger, matching this design's
+      own accepted precedent for `Document.content_hash`). Transaction
+      scope was verified and documented (not redesigned, per explicit
+      instruction): every classification service commits its own
+      transaction, matching house convention throughout this codebase.
+      `ClassificationRun`'s minimum-one-`DiscoveryRun` cardinality was
+      re-verified directly against the running schema, no defect found.
+
+      Full suite after this round: **659 passed, 1 skipped** (652 +
+      7 new), run three times, no flakiness. `aibrain_test` still
+      empty of synthetic rows afterward; the main `aibrain` database
+      remains untouched (still at `ef65da409302`) — this migration is
+      ready to apply there whenever a future gate calls for it. **Not
+      yet committed** — holding for review per this project's standing
+      discipline. **Next gate, not yet authorized**: real T7
+      discovery-report ingestion into this schema (populating real
+      `DiscoveryRun`/`ClassificationRun`/`SourceInstance` rows from the
+      actual D0/D1/D2 reports), followed eventually by real
+      extraction/ingestion — still no T7 access beyond what D0/D1/D2
+      already performed, no embeddings, no
+      real-corpus mutation, until each is separately opened.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

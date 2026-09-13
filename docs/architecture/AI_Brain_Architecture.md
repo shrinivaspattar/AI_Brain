@@ -75,7 +75,8 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist, and computes `Document.content_hash` (SHA-256, streamed) for exact-duplicate detection; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`, `DedupExecutionPlan`, `DedupExecutionPlanAction`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`, `DedupExecutionPlan`, `DedupExecutionPlanAction`, `DiscoveryRun`, `ClassificationRun`, `ContentIdentityGroup`, `SourceInstance`, `ProvenanceLink`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it; `Document.content_identity_group_id` links it to its `ContentIdentityGroup` (see `classification/`, below — schema/model implementation only, no ingestion pipeline calls this yet). |
+| `classification/` | Implemented (schema/model layer only — no ingestion pipeline calls it yet) | `DiscoveryRunService`, `ClassificationRunService`, `ContentIdentityService` (`get_or_create_group` — the database-concurrency-safe claim for a `ContentIdentityGroup`; `assign_content_identity` — write-once `SourceInstance.content_identity_group_id`), `SourceInstanceService` (creates a `SourceInstance` + its full `ProvenanceLink` ancestry chain atomically), `CanonicalDecisionService` (records a canonical-status decision with required evidence). Implements the `29d6864`/`14b8063` frozen design — see "Schema/Model Implementation," below. No T7 access anywhere in this module. |
 | `services/` | Implemented | `DocumentService` (persistence, `list_documents`), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection, tool-calling loop). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory, tools, dedup. |
 | `db/` | Implemented | Session/engine setup, health checks. |
@@ -4637,6 +4638,230 @@ properly rather than restating round 4's prose.
   This section was written entirely from the existing codebase (models,
   services, decisions 0001/0002) and the frozen `29d6864` design; no
   new scan, hash, or read of either T7 path occurred to produce it.
+
+## Schema/Model Implementation: SourceInstance / ProvenanceLink / ContentIdentityGroup / Document / DocumentChunk
+
+A sixth T7 gate, opened after the `14b8063` schema design froze.
+Implements exactly that design - no T7 access, no extraction, no
+real-corpus ingestion, no embeddings, no dedup execution, no
+deletion/quarantine, no canonical-copy selection beyond the frozen
+schema semantics. Every synthetic-fixture test uses `aibrain_test`
+only; the main `aibrain` database's Alembic head was left untouched at
+`ef65da409302` - the new migration was applied and verified against
+`aibrain_test` alone, and is ready to apply to `aibrain` whenever a
+future gate calls for it.
+
+**Files added**: `app/models/discovery_run.py`, `classification_run.py`,
+`content_identity_group.py`, `provenance_link.py`, `source_instance.py`
+(one model/enum module each, matching this codebase's one-model-per-file
+convention); `app/classification/` (new module: `discovery_run_service.py`,
+`classification_run_service.py`, `content_identity_service.py`,
+`source_instance_service.py`, `canonical_decision_service.py`);
+`alembic/versions/b9a82d073399_*.py`;
+`tests/integration/test_content_identity_schema_execution.py` (17
+tests) and `test_content_identity_concurrency_execution.py` (2 tests).
+**Files modified**: `app/models/document.py` (one new nullable, UNIQUE
+`content_identity_group_id` column) and `app/models/__init__.py`
+(registers the five new models).
+
+**Migration `b9a82d073399`** (`ef65da409302` → `b9a82d073399`): five new
+tables (`discovery_runs`, `classification_runs`, `content_identity_groups`,
+`source_instances`, `provenance_links`) plus one new nullable column on
+`documents`, with every constraint from the frozen design present:
+`uq_content_identity_groups_identity` (the `identity_kind`/
+`identity_algorithm`/`identity_hash` triple), `uq_provenance_links_
+source_instance_id_sequence_index`, `uq_documents_content_identity_
+group_id`, `ck_classification_runs_at_least_one_discovery_run`,
+`ck_provenance_links_root_shape`, `ck_source_instances_canonical_
+status_requires_evidence`. Verified against real `aibrain_test`:
+`upgrade` → `downgrade` → `upgrade` all ran cleanly with no manual
+intervention; `\d` on every new table confirmed the constraints landed
+exactly as designed.
+
+**Model relationships/cardinality**: implemented exactly as the
+`14b8063` round-5 invariant table specifies - see that section for the
+full table. One clarification surfaced during implementation, not a
+change to the design: SQLAlchemy's `Enum` type persists a Python
+`str, Enum` member by its `.name` (e.g. `'T7_FILE'`), matching this
+codebase's existing convention (`DedupPlanStatus.GENERATED.name` as
+`server_default`, etc.) - every `CHECK` constraint's string literals
+(e.g. `kind = 'T7_FILE'`) were written against that convention and
+verified to match what Postgres actually stores.
+
+**How write-once `content_identity_group_id` is enforced**:
+`ContentIdentityService.assign_content_identity` issues `UPDATE
+source_instances SET content_identity_group_id = :group_id WHERE id =
+:id AND content_identity_group_id IS NULL`, then checks the row count.
+Under Postgres's default READ COMMITTED isolation, the `WHERE` clause
+is re-evaluated against the latest committed data at `UPDATE` time, so
+a second attempt against an already-assigned instance affects zero
+rows; the service treats `rowcount == 0` as a hard `ValueError` rather
+than a silent no-op, so a caller can never mistake "already set" for
+"successfully set." `test_assign_content_identity_is_write_once`
+proves the second attempt is refused and the first value is preserved.
+
+**How same-`identity_hash` concurrent claims are serialized**:
+`ContentIdentityService.get_or_create_group` is a check-then-insert
+that relies on the database's own `UNIQUE` constraint as the actual
+race-safety mechanism, not a Python-side lock (which cannot protect
+against two separate connections/processes). It queries first; if
+nothing exists, it inserts and commits. If a concurrent transaction won
+the race, the `INSERT` raises `IntegrityError` on commit; the loser
+rolls back, re-queries, and returns the winner's row instead of
+raising. **Both callers succeed** - this is a convergence, not a
+winner/loser race like Chain 1's `execute()` lock (which deliberately
+lets exactly one caller win and the other fail cleanly). The
+distinction matters: two classification passes discovering the same
+content identity from different physical occurrences should both walk
+away with a usable, correct answer, never a spurious error.
+
+**The concurrency test itself** (the user's explicit, non-negotiable
+requirement for this gate - "proven by an actual database concurrency
+test, not merely assumed from the unique constraint"): two, then ten,
+genuinely separate `Session`/connection pairs, synchronized with a
+`threading.Barrier` so every caller starts its own `get_or_create_group`
+call at (as close as threads allow) the same moment - the same pattern
+already used for Chain 1's `test_concurrent_execute_calls_only_one_
+claims_and_mutates`. Both tests assert: no thread raises; every thread
+returns the identical `ContentIdentityGroup.id`; exactly one row exists
+in the database afterward (checked via a fresh connection, not the
+ORM's local identity map, so a bug that created two Python objects
+sharing an id by accident could not hide a real second row). A
+separate, ad-hoc, non-committed verification script forced genuine
+contention (slowing one thread's commit to guarantee the other's
+`INSERT` raced against an uncommitted row) and confirmed the
+`IntegrityError`-then-refetch path is actually exercised, not merely
+untested good luck from fast sequential execution - both threads still
+converged on one row under forced contention. The two permanent tests
+passed 15/15 consecutive runs with no flakiness.
+
+**Test isolation**: every new test binds its `Session` to a connection
+held in an explicit outer transaction, using SQLAlchemy 2.0's
+`join_transaction_mode="create_savepoint"` - the services under test
+correctly call `session.commit()` internally (real production
+behavior), so each such commit only releases a `SAVEPOINT`; the outer
+transaction is rolled back at teardown, so no synthetic row from any
+test in this milestone was ever left behind in `aibrain_test`.
+Verified directly via `psql` before and after the full run: zero rows
+in all five new tables both times.
+
+**Regression results**: full suite run three times, `652 passed, 1
+skipped` every time (633 pre-existing + 17 schema/service tests + 2
+concurrency tests), zero flakiness. The main `aibrain` database's
+tables and Alembic head were confirmed unchanged throughout.
+
+**What this implementation pass does NOT include** (unchanged scope
+boundary from the authorization): no API routes or Pydantic schemas
+for these new tables (not requested); no backfill logic for existing
+`Document` rows lacking `content_identity_group_id` (explicitly
+deferred in `14b8063`); no logical-document/version modeling (identity
+layers 3/4, still deferred); no canonical-selection policy beyond a
+human explicitly calling `CanonicalDecisionService.decide`; the
+migration was not applied to the main `aibrain` database; no T7 access,
+extraction, embeddings, or real-corpus ingestion of any kind.
+
+### Review round 6 (pre-commit code/schema audit) — two real bugs found and fixed
+
+Requested before committing `b9a82d073399`: verify six specific
+invariants against the actual code and running Postgres schema, not
+just against the design document. Two of the six surfaced real defects,
+fixed below; the other four were verified correct as implemented.
+
+**1. `ClassificationRun` → `DiscoveryRun` cardinality** — verified, no
+defect. One `ClassificationRun` references 0–1 `DiscoveryRun` per kind
+(D0/D1/D2) via three separate nullable FK columns; `\d
+classification_runs` confirms `ck_classification_runs_at_least_one_
+discovery_run` is present, and a direct-insert test bypassing the
+service (`test_classification_run_requires_at_least_one_discovery_
+run_db_level`) confirms the database itself - not merely the service -
+refuses a row with all three null.
+
+**2. `identity_hash` race handling — real defect, fixed.** The original
+`except IntegrityError` caught ANY integrity failure on commit, not
+specifically the `uq_content_identity_groups_identity` violation -
+meaning an unrelated bug (a stray FK violation, a different constraint)
+could have been silently reinterpreted as "lost the identity race" and
+masked. Fixed: the handler now inspects `exc.orig.diag.constraint_name`
+and re-raises anything that isn't exactly
+`uq_content_identity_groups_identity`, including the case where the
+driver exposes no constraint name at all. Proven by four new mocked
+unit tests in `tests/classification/test_content_identity_service.py`
+(real Postgres isn't needed for this - it's pure exception-dispatch
+logic, verified separately from the real-database race behavior).
+
+**3. Transaction scope — verified, documented, not redesigned.**
+`get_or_create_group` and `assign_content_identity` both call
+`session.commit()`/`rollback()` directly, matching every other service
+in this codebase (`DocumentService.create_document`,
+`SourceInstanceService.create_instance`, etc.) - each service call
+owns its entire transaction. A `rollback()` here would discard ANY
+other uncommitted work sharing that session. No current caller composes
+these methods inside a larger shared transaction, so per the explicit
+instruction not to redesign absent an actual contract requiring it,
+this was documented precisely in both methods' docstrings (including
+the fact that a future composable caller would need its own
+`session.begin_nested()` SAVEPOINT, which nothing here provides) rather
+than restructured.
+
+**4. `ProvenanceLink` structural validation — real defect, fixed.** The
+original CHECK constraint (`(sequence_index = 0) = (kind = 'T7_FILE'
+AND parent_link_id IS NULL)`) correctly forbade a non-root row from
+looking like a root, but did NOT require a non-root row to actually
+HAVE a parent - an `ARCHIVE_MEMBER` row at `sequence_index = 1` with
+`parent_link_id = NULL` would have passed. Fixed by tightening the
+constraint to `(sequence_index = 0 AND kind = 'T7_FILE' AND
+parent_link_id IS NULL) OR (sequence_index > 0 AND kind =
+'ARCHIVE_MEMBER' AND parent_link_id IS NOT NULL)`, verified against
+real Postgres (the orphan case is now rejected;
+`test_provenance_link_root_shape_check_constraint_accepts_a_valid_non_
+root_link` confirms the fix doesn't also reject legitimate chains).
+Two cross-row invariants remain explicitly NOT database-enforced
+(a single-row CHECK cannot see sibling rows) and are named precisely in
+the model's docstring as accepted, service-enforced-only limitations:
+that `parent_link_id` points to a link in the SAME `source_instance`
+at a lower `sequence_index`, and that `sequence_index` values are
+contiguous - both are guaranteed only because
+`SourceInstanceService.create_instance` is the sole creation path and
+always builds a chain in order.
+
+**5. `SourceInstance` write-once concurrency — real test gap, closed.**
+The original test suite only proved write-once under sequential
+same-thread double-calls, not real concurrent contention. Added
+`test_write_once_under_real_concurrent_sessions_exactly_one_assignment_
+wins`: two separate sessions/threads, barrier-synchronized, attempt to
+assign TWO DIFFERENT `ContentIdentityGroup`s to the SAME
+`SourceInstance` simultaneously. Confirmed: exactly one assignment
+succeeds, the other fails with the documented write-once `ValueError`,
+and the database ends up holding exactly one of the two groups - never
+both, never neither, never silently overwritten. 15/15 consecutive
+runs, no flakiness. Mechanism: Postgres's row-level write lock
+serializes the two `UPDATE`s on the same row; the second one to reach
+it blocks until the first commits, then re-evaluates its `WHERE
+content_identity_group_id IS NULL` clause against the now-non-null
+value and affects zero rows.
+
+**6. `evidence_snapshot` immutability — stated precisely, as requested,
+no defect found.** NOT a database CHECK constraint or trigger (neither
+exists, and a plain CHECK cannot compare old vs. new values). Enforced
+by (a) documented contract and (b) the structural absence of any
+mutating code path - `SourceInstanceService.create_instance` is
+verified (`grep`) to be the only place in the codebase that ever
+assigns this column, and it does so exactly once, at construction. A
+direct `UPDATE` bypassing the ORM, or a future careless service
+method, could still mutate it - nothing at the database level would
+stop that. This is stated explicitly now in the model's docstring
+rather than left merely implied, matching this design's existing,
+accepted precedent for `Document.content_hash`'s consistency invariant.
+
+**Final numbers after this review round**: focused tests
+(`tests/classification/` + the two `test_content_identity_*_execution.py`
+files) - 26/26 passing. Full suite - `659 passed, 1 skipped`, run three
+times, zero flakiness (652 from the pre-review implementation + 7 new:
+4 mocked exception-scoping tests, 2 `ProvenanceLink` CHECK tests, 1
+write-once concurrency test). `aibrain_test` confirmed empty of
+synthetic rows after every run; the main `aibrain` database's schema
+and Alembic head (`ef65da409302`) remain untouched. No T7 access of
+any kind occurred during this review round.
 
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
