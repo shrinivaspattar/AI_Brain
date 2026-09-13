@@ -7306,6 +7306,1198 @@ behavior while preserving every architectural contract already frozen
 at `f2b9815`. Implementation itself remains a further, later gate
 beyond that.
 
+## Scaled Real-T7 Ingestion — Implementation Design Pass (design pass, APPROVED and frozen — no implementation yet)
+
+Docs-only, sitting on top of the frozen architecture (`f2b9815`) and
+frozen numeric/policy layer (`3d37ec0`). No T7 access, no code, no
+schema/migration. Grounded in direct re-verification of the current
+codebase (not assumption) — two real findings surfaced by that
+re-verification are called out explicitly below because they change
+what "translate the frozen design into code" actually requires.
+
+### Two real findings from re-reading the current code
+
+1. **`EmbeddingClient.embed()` is confirmed all-or-nothing** (verified
+   by reading `app/embeddings/client.py`, not assumed per instruction):
+   it makes exactly one `ollama.Client.embed(model=..., input=texts)`
+   call for the *entire* list of texts and returns all vectors, or the
+   call raises and none are produced. There is no partial-success mode
+   to design around.
+2. **`ArchiveExtractor.extract()` is atomic per archive, not
+   incremental** (verified by reading `app/ingestion/archive.py`): it
+   validates members/expansion/disk-space *once*, then calls
+   `archive.extractall(destination)` in a single library call. There is
+   no hook to abort partway through writing members. This means the
+   frozen "monitor extracted bytes *during* extraction, abort if
+   exceeded" language cannot be implemented as literal mid-extraction
+   monitoring — the actually-achievable mechanism is a **pre-flight
+   check**: sum `member.file_size` across the archive's central
+   directory (the same computation `_validate_disk_space` already
+   does) *before* calling `extract()` at all, and refuse to start if
+   the projected total would exceed the batch's remaining budget. This
+   achieves the same invariant (never a durable partial artifact) via
+   prevention rather than interruption — a clarification of *how*, not
+   a weakening of *what was frozen*. Also worth noting: `ArchiveExtractor`
+   already has its own hardcoded `HARD_FREE_SPACE_BYTES = 10GiB` — the
+   same order of magnitude as the new batch-level workspace reserve;
+   the two checks are complementary layers, not a replacement for each
+   other, and both remain in effect.
+
+### 1. `IngestionBatch` model — exact fields
+
+```
+id                       Integer, PK, autoincrement
+classification_run_id    Integer, FK -> classification_runs.id, UNIQUE, NOT NULL
+                          (UNIQUE enforces the frozen 1:1 exclusive ownership
+                          at the DB level, not merely by service convention)
+status                   Enum(BatchStatus), NOT NULL, default PLANNED
+stop_reason              Enum(BatchStopReason), NULLABLE
+stop_reason_detail       Text, NULLABLE
+review_required          Boolean, NOT NULL, default False
+                          (set once at creation from the projection check -
+                          orthogonal to status, per the frozen three-tier model;
+                          NOT itself a status transition)
+
+-- envelope (immutable once set; NOT NULL once a batch actually exists -
+-- CALIBRATION_REQUIRED is a statement that batch CREATION must be refused
+-- until a human supplies a real number, never a stored NULL sentinel)
+max_source_instances     Integer, NOT NULL
+max_source_bytes         BigInteger, NOT NULL
+max_extracted_bytes      BigInteger, NULLABLE (NULL = "not applicable", e.g.
+                          Class 1 admits no archives - a real, meaningful NULL,
+                          distinct from CALIBRATION_REQUIRED's "not yet decided")
+max_embeddings           Integer, NOT NULL
+max_runtime_seconds      Integer, NOT NULL
+
+-- selection-time facts (immutable once set)
+eligible_source_count    Integer, NOT NULL
+policy_filtered_count    Integer, NOT NULL
+selectable_count         Integer, NOT NULL
+source_instances_selected Integer, NOT NULL
+source_bytes_selected    BigInteger, NOT NULL
+selection_fingerprint    String(64), NOT NULL   (SHA-256 hex)
+selection_policy_version String, NOT NULL
+ordering_version         String, NOT NULL
+
+-- runtime counters (mutable ONLY via narrow atomic service methods,
+-- never raw ORM attribute sets from calling code)
+extracted_bytes_consumed BigInteger, NOT NULL, default 0
+embeddings_reserved      Integer, NOT NULL, default 0
+monotonic_runtime_seconds_consumed  Float, NOT NULL, default 0
+
+-- timestamps (wall-clock, audit-only - NEVER used for runtime-budget
+-- decisions; monotonic_runtime_seconds_consumed is authoritative for that)
+created_at               DateTime(timezone=True), NOT NULL, default now
+started_at               DateTime(timezone=True), NULLABLE
+completed_at             DateTime(timezone=True), NULLABLE
+```
+
+`BatchStatus`: `PLANNED | RUNNING | PAUSED | COMPLETED | ABORTED`
+(exact transitions in point 12).
+
+`BatchStopReason` (set only when leaving `RUNNING`; distinguishes
+*designed* envelope exhaustion, which is a normal path to `COMPLETED`,
+from *unplanned* interruption, which is `PAUSED`/`ABORTED` — see point
+12's mapping table):
+```
+SOURCE_WORK_EXHAUSTED            (no eligible work remains - normal COMPLETED path)
+EXTRACTED_BYTES_ENVELOPE_EXHAUSTED   (normal COMPLETED path)
+EMBEDDINGS_ENVELOPE_EXHAUSTED        (normal COMPLETED path)
+RUNTIME_BUDGET_EXCEEDED              (normal COMPLETED path)
+WORKSPACE_SOFT_STOP               -> PAUSED (resumable)
+POSTGRES_SOFT_STOP                -> PAUSED (resumable)
+MANUAL_PAUSE                      -> PAUSED (resumable)
+WORKSPACE_HARD_STOP               -> ABORTED (terminal)
+POSTGRES_HARD_STOP                -> ABORTED (terminal)
+OLLAMA_PERSISTENTLY_UNREACHABLE   -> ABORTED (terminal)
+SAFETY_INVARIANT_VIOLATION_DETECTED  -> ABORTED (terminal)
+```
+
+**Immutability rule**: `classification_run_id`, every `max_*` field,
+`eligible_source_count`/`policy_filtered_count`/`selectable_count`/
+`source_instances_selected`/`source_bytes_selected`,
+`selection_fingerprint`, `selection_policy_version`, `ordering_version`
+are written exactly once, at creation, inside the batch-creation
+transaction (point 2), and never updated by any later code path — no
+service method exposes updating them. Only `status`, `stop_reason`,
+`stop_reason_detail`, the three runtime counters, and the three
+timestamps are ever mutated post-creation, each through a specific,
+narrow method (mirroring `WorkerClaimService`'s existing pattern of
+purpose-built methods rather than generic setters).
+
+**`selection_fingerprint` semantics**: SHA-256 hex digest of a
+canonical serialization of `(D0 report_sha256, selection_policy_version,
+ordering_version, envelope values in a fixed field order, the sorted
+list of selected (root_t7_path, member_path) pairs)` — computed once,
+after selection completes and before commit.
+
+**`selection_policy_version` semantics**: identifies which selection
+*predicate* was used (e.g. `"batch-class-1-text-document-v1"`) —
+bumped only when the predicate logic changes, never for a numeric
+envelope change (per the frozen numeric pass).
+
+**`ordering_version` semantics**: identifies the deterministic ordering
+algorithm (e.g. `"lexicographic-path-v1"`) — versioned separately so a
+future ordering change is distinguishable from a policy change.
+
+### 2. Batch creation transaction
+
+**Two phases, not one**: a read-only *computation* phase (D0 report
+read, eligibility, policy filtering, ordering, envelope-aware
+selection — pure functions over already-committed data and the D0 JSON
+file, no writes) followed by one **atomic write phase**:
+
+```
+BEGIN
+  pg_advisory_xact_lock(lock_key)   -- see exact key derivation below
+  re-verify eligibility under the lock (a second, authoritative read -
+     the computation phase's read was necessarily unlocked and could be stale)
+  IF selected is empty: ROLLBACK, return None (no ClassificationRun or
+     IngestionBatch is created for a vacuous batch)
+  INSERT ClassificationRun (this batch's dedicated, never-shared run)
+  INSERT SourceInstance rows for every selected path (member rows are
+     NOT created here - only container/loose rows; members are created
+     later, during archive extraction, per point 11)
+  compute selection_fingerprint from the now-known IDs/paths
+  INSERT IngestionBatch (status=PLANNED)
+COMMIT
+```
+
+**Advisory lock precision, stated exactly (per review)**:
+- **Scope**: one lock per `DiscoveryRun` — two batch-creation attempts
+  against *different* `DiscoveryRun`s never contend; only two attempts
+  against the *same* `DiscoveryRun` serialize.
+- **Key derivation**: `lock_key = deterministic 64-bit hash of the
+  namespaced string "ingestion_batch_creation:discovery_run:{discovery_run_id}"`
+  — namespaced (not the raw `discovery_run_id` integer used directly)
+  so a future, unrelated use of advisory locks elsewhere in this
+  codebase cannot collide with this one merely by sharing a small
+  integer id space. Deterministic so repeated calls for the same
+  `DiscoveryRun` always target the same lock.
+- **Transaction lifetime**: `pg_advisory_xact_lock` specifically (the
+  transaction-scoped variant), never the session-scoped
+  `pg_advisory_lock`. It is released automatically at `COMMIT` or
+  `ROLLBACK` of the enclosing transaction — no explicit unlock call
+  exists anywhere in this design, and no lock can leak past the
+  transaction's own lifetime.
+- **What it serializes**: only the "read current eligibility, then
+  materialize `SourceInstance` rows" sequence *during batch creation*
+  for one `DiscoveryRun`. It has no effect on and does not serialize
+  batch *execution* (claiming, embedding, extraction) — those keep
+  their own, already-existing, unrelated concurrency primitives.
+- **What still provides correctness independently of the lock — per
+  review, the lock is not a substitute for a DB constraint**: today,
+  verified directly, `SourceInstance` has no `UNIQUE` constraint
+  preventing two rows from ever representing the same
+  `(classification_run_id, root_t7_path, member_path)` triple. The
+  advisory lock provides practical, non-blocking serialization for the
+  *normal* code path; a `UNIQUE` constraint on exactly that triple is
+  recommended as implementation-time hardening — the invariant of last
+  resort if some future code path ever fails to take the lock
+  correctly, exactly the same defense-in-depth relationship
+  `IngestionBatch.classification_run_id`'s own `UNIQUE` constraint
+  already has to service-level discipline elsewhere in this design.
+- **Crash/rollback behavior**: if the creating transaction crashes or
+  rolls back after acquiring the lock, Postgres releases it the instant
+  the transaction ends — automatically, with no manual cleanup and no
+  orphaned-lock recovery logic needed. A rollback leaves zero
+  `ClassificationRun`/`SourceInstance`/`IngestionBatch` rows, per the
+  transaction-atomicity design below.
+
+**Why the advisory lock, not optimistic retry**: this project's
+established pattern for "prevent two things from claiming the same
+work" is a DB-native primitive (`SELECT ... FOR UPDATE SKIP LOCKED` for
+per-row claims elsewhere in this codebase) — an advisory lock is the
+same *class* of primitive applied to "no row exists yet to lock,"
+serializing the eligibility-check-then-materialize sequence rather than
+inventing a new optimistic-concurrency scheme — but, per the point
+above, it is deliberately paired with a recommended DB constraint, not
+relied upon alone.
+
+**Failure handling, without inventing cross-transaction guarantees**:
+- No sources qualify: refuse to create a batch at all (return `None`),
+  matching the existing pattern where `resolve_next()`/
+  `process_next_archive()` return `None` rather than create an empty
+  placeholder attempt.
+- Envelope boundary reached during selection: not an error — normal
+  termination of the selection loop (point 5); the batch is created
+  with whatever was selected.
+- Concurrent operation on the same `DiscoveryRun`: serialized by the
+  advisory lock; the second caller blocks, then re-evaluates eligibility
+  fresh once the first transaction commits or rolls back.
+- `SourceInstance` materialization race: prevented structurally by the
+  lock; as defense-in-depth, any DB-level constraint violation rolls
+  back the whole transaction — fails safe, retriable, no partial rows.
+- Fingerprint construction fails, or anything fails before `COMMIT`:
+  standard ACID rollback — zero side effects. Nothing beyond that single
+  transaction's atomicity is promised (no claim about coordinating
+  across a crash *after* `COMMIT` but before the caller observes
+  success — the data is durably correct either way; only the caller's
+  knowledge of the outcome could be delayed, never the data's
+  integrity).
+
+### 3. Immutable membership — implementation constraints
+
+- **Membership query**: `SELECT * FROM source_instances WHERE
+  classification_run_id = :batch.classification_run_id` — this *is*
+  membership, in full, given exclusive 1:1 ownership (point 1's UNIQUE
+  constraint).
+- **Resume avoids reselection structurally**: the worker loop for an
+  existing `IngestionBatch` never calls the selection algorithm again —
+  it only ever calls `WorkerClaimService` methods, which (per the
+  required change below) are scoped by `classification_run_id`.
+  Selection is invoked exactly once, inside batch creation (point 2).
+- **Required change surfaced by this design**: today's
+  `WorkerClaimService` claim queries (`claim_source_instance_for_
+  identity_resolution`, `claim_source_instance_for_archive_processing`)
+  filter *globally* across all `SourceInstance` rows — verified by
+  reading their exact `WHERE` clauses — with **no
+  `classification_run_id` filter at all**. Without adding one, a worker
+  processing batch N could claim a `SourceInstance` belonging to a
+  *different* batch. This must become a required parameter on both
+  methods (point 10 covers the trickier case of
+  `claim_content_identity_group`, which is reached only indirectly).
+- **Code/policy changes cannot retroactively alter membership**:
+  membership is a materialized fact (already-committed rows), not a
+  recomputed query result — no later code change can affect which rows
+  already exist. The only way membership could appear to change would
+  be something inserting a new `SourceInstance` under an *existing*
+  batch's `classification_run_id` from outside its creation transaction
+  — explicitly forbidden as an invariant; nothing in this design does
+  that.
+- **A later `DiscoveryRun` legitimately re-observing the same path**:
+  eligibility for `DiscoveryRun_2`'s batch is scoped to `DiscoveryRun_2`'s
+  own observations (per the frozen architecture) — a path already
+  materialized under `DiscoveryRun_1`'s batch is simply a *different*
+  observation/run scope and remains eligible for `DiscoveryRun_2`,
+  producing a genuinely new `SourceInstance` row. `get_or_create_group`
+  independently determines convergence or divergence from the bytes
+  actually read this time — unchanged, already-proven mechanism.
+
+### 4. Policy engine
+
+Small, pure functions extending `eligibility_service.py`'s existing
+suffix-only pattern — deliberately not a heavyweight "engine" class:
+
+```
+classify_source_category(path) -> SourceCategory        # pure, suffix/path only
+classify_workload_category(path) -> WorkloadCategory     # pure, suffix only
+classify_risk_tier_estimated(source_category, workload_category,
+                              declared_size_bytes) -> RiskTier   # pure
+classify_backup_sync_context(path) -> BackupSyncContext | None
+    # STILL DEFERRED - always returns None until a future gate defines
+    # the pattern list; an explicit stub, never a guess
+```
+
+**Normalization decision, closing the numeric pass's open question**:
+`classify_workload_category` **does** strip Syncthing's `_<digits>`
+conflict-rename suffix before mapping to a workload (e.g.
+`.pdf_1768918262` → `.pdf` → `TEXT_DOCUMENT`) — the numeric pass's
+analytical normalization is hereby adopted as the real classification
+rule too, since treating 8,000+ real files as `UNKNOWN` merely because
+of a sync tool's rename convention would be a needless, avoidable
+misclassification. This is a concrete decision, not left open.
+
+**Archive source-admission policy**: `admits_archive(source_size_tier,
+batch_class_policy) -> bool`, evaluated only against container-level
+facts (declared size, suffix) — never opens the file, never touches
+member data (point 11 enforces this is impossible at this stage since
+members don't exist yet).
+
+**Archive member policy**: applied *after* extraction, to each
+newly-created member `SourceInstance`, using the *same*
+`classify_workload_category`/eligibility functions already used for
+loose files — no member-specific logic beyond running the same
+classifiers on the member's own relative path.
+
+**D1 exact-duplicate archive representative scheduling**: a selection-
+time function grouping candidate archive paths by their D1
+duplicate-group id (already computed by D1), admitting only the
+lexicographically-first path per group — per the frozen policy, this
+is scheduling only, never a mutation of the other copies' rows.
+
+**Deferred/special content**: a static, explicit frozenset (matching
+`_EXCLUDED_SUFFIXES`/`_KNOWN_UNSUPPORTED_SUFFIXES`'s existing pattern),
+never auto-inferred.
+
+**Explainability**: each classifier's inputs/version are recorded in
+the *existing* `SourceInstance.evidence_snapshot` JSONB field — no new
+column needed for "why," reusing the field that already exists for
+exactly this purpose. The `eligible → policy_filtered → selectable →
+selected` funnel counts (point 1's new fields) are captured once,
+during selection, since `eligible`/`policy_filtered`/`selectable` are
+properties of a specific point in time during selection and cannot be
+reconstructed later purely from the final `SourceInstance` rows.
+
+### 5. Selection algorithm — exact behavior
+
+```
+eligible = compute_eligible(discovery_run)   # D0 paths, scoped per point 1 above
+eligible_source_count = len(eligible)
+ordered = sorted(eligible, key=relative_path_string)   # ordering_version="lexicographic-path-v1"
+policy_filtered = [p for p in ordered if batch_class_policy.matches(p)]  # order preserved
+policy_filtered_count = len(policy_filtered)
+
+selected, running_instances, running_bytes = [], 0, 0
+for path in policy_filtered:                 # single forward pass, in order
+    if running_instances + 1 > max_source_instances: break
+    declared_size = d0_declared_size(path)
+    if running_bytes + declared_size > max_source_bytes: break
+    selected.append(path)
+    running_instances += 1
+    running_bytes += declared_size
+selectable_count = index reached before the break (or len(policy_filtered) if none)
+source_instances_selected = len(selected)
+source_bytes_selected = running_bytes
+```
+
+**Exact tie-breaking decision, per instruction not to invent a
+different algorithm implicitly**: the *first* item that would exceed
+*either* limit **stops selection entirely (`break`)** — it is never
+skipped in favor of continuing to scan for smaller items later in
+order. This keeps the algorithm simple, reproducible, and non-
+reordering, at the cost that one oversized item early in lexicographic
+order can truncate a batch well short of `max_source_instances`. A
+"skip instead of stop" variant is a genuinely different algorithm and
+would need its own `ordering_version`/policy, not a silent substitution
+here.
+
+**Preserved explicitly, per review, as load-bearing for reproducibility
+— not an arbitrary tie-break**: because selection stops rather than
+skips, the exact same input state (D0 report, already-materialized
+`SourceInstance` rows, policy, envelope) always produces the exact same
+selected set, and therefore the exact same `selection_fingerprint`
+(point 1). A hypothetical skip-and-continue variant could still be made
+deterministic in principle, but changing between the two behaviors is a
+change to the selection *algorithm itself* and requires a new
+`ordering_version`/`selection_policy_version` — this stop-not-skip rule
+is treated as part of what "reproducible" means for this design, not a
+detail that could be silently swapped later without changing those
+version identifiers.
+
+**What happens when**:
+- A source is no longer present, or its metadata differs from D0:
+  **not detectable at selection time** — selection never touches T7,
+  only D0's declared metadata. These surface later, at actual read
+  time, via the already-frozen `T7_UNAVAILABLE` /
+  `SOURCE_CHANGED_AFTER_SELECTION` outcomes — no presence check is
+  added to selection.
+- Policy evaluation cannot confidently classify a source: it falls
+  through to `UNKNOWN`/`SPECIAL` and simply fails to match any Class
+  1–7 policy predicate — it remains technically eligible for a future,
+  differently-classed batch, just not selected now. No forced
+  classification.
+
+### 6. `BatchResourceGuard`
+
+```
+class BatchResourceGuard:
+    def check_before_claim(batch) -> GuardResult          # workspace + Postgres free space
+    def check_before_expensive_operation(batch, kind) -> GuardResult  # e.g. before
+                                                            # starting archive extraction,
+                                                            # or immediately before an
+                                                            # embedding call specifically
+    def check_ollama_reachable() -> bool
+```
+- **Before claiming work**: workspace + Postgres free space (cheap,
+  fast) — every claim-attempt cycle, before calling any
+  `WorkerClaimService` method.
+- **During work**: the extracted-bytes running counter (point 7) and
+  monotonic elapsed runtime (point 9), checked at the same per-cycle
+  cadence.
+- **Before expensive operations**: Ollama reachability checked
+  immediately before an actual embedding call (not merely once per
+  cycle); workspace free space re-checked immediately before starting
+  archive extraction specifically, since that is the operation that
+  could consume a large chunk of it.
+- **`PAUSED`**: a soft-stop threshold fires (workspace <15GB, Postgres
+  <8GB free — the reserve-vs-measurement distinction from the numeric
+  pass applies identically here) or an operator issues a manual pause —
+  resumable.
+- **`ABORTED`**: a hard-stop threshold fires (workspace <10GB, Postgres
+  <5GB free), Ollama unreachability persists past its threshold, or a
+  safety-invariant violation is detected — terminal, never resumable.
+- **Interaction with isolated staging**: a guard failure *during*
+  archive extraction (e.g. disk fills further from something else
+  entirely on the machine) receives the identical disposition as an
+  extracted-bytes envelope overflow (point 7): staging discarded
+  wholesale, claim released, no `IngestionAttempt` recorded.
+- **Persistence**: `status` and `stop_reason`/`stop_reason_detail` are
+  set together in one `UPDATE`, never as two separate writes that could
+  leave them inconsistent.
+- **`review_required`** (point 1's new field) is computed once, at
+  batch creation, from the projection check — purely advisory,
+  orthogonal to `status`, never itself pausing or aborting anything.
+- No DB-growth projection formula is introduced here either — per the
+  frozen numeric pass, `BatchReportService` measures actual DB-size
+  delta (before/after `pg_database_size()`) post hoc, never predicts it.
+
+### 7. Extracted-bytes accounting
+
+**No wording implies `ArchiveExtractor` interrupts extraction member-
+by-member** — finding 2 (verified: `extractall()` is one atomic call)
+governs the entire design below. **Three distinct quantities, never
+conflated**:
+```
+declared_member_bytes           - sum(member.file_size for non-dir members),
+                                   read from the archive's own central directory
+                                   via metadata inspection ALONE (zipfile.ZipFile(path)
+                                   .infolist() / the py7zr equivalent) - zero bytes
+                                   extracted yet, this is an ESTIMATE from metadata,
+                                   never proof of what will actually be written
+actual_durable_extracted_bytes  - sum(DiscoveredFile.size for each REAL extracted
+                                   file, via ArchiveExtractor's own existing
+                                   _discover_extracted_files, which Path.stat()s
+                                   each real file after extraction) - MEASURED,
+                                   not estimated, and only known after extract()
+                                   returns successfully
+peak/transient staging usage    - actual disk consumption while files sit in
+                                   _staging/ before promotion or deletion - a
+                                   live-disk-pressure concern, protected by the
+                                   resource guard's shutil.disk_usage check
+                                   (point 6), NOT by extracted_bytes_consumed at all
+```
+
+Exact sequence:
+```
+1. archive metadata inspection (no extraction): open the archive's central
+   directory only
+2. declared_member_bytes = sum(member.file_size for non-dir members)   [ESTIMATE]
+3. compare against remaining envelope - atomic conditional admission,
+   using the ESTIMATE (same discipline as embedding reservation):
+     UPDATE ingestion_batches SET extracted_bytes_consumed = extracted_bytes_consumed + :declared_member_bytes
+     WHERE id = :batch_id AND extracted_bytes_consumed + :declared_member_bytes <= max_extracted_bytes
+     RETURNING extracted_bytes_consumed
+   IF no row returned: REFUSE BEFORE EXTRACTION - extract() is never called;
+     delete any pre-existing staging dir for this source_instance_id (idempotent
+     cleanup, see crash/retry below); release claim; no IngestionAttempt
+     recorded; item deferred, worker moves on
+4. IF admitted: extract atomically into workspace_root/_staging/<source_instance_id>/
+   (extractall(), all members or an exception - never partial per finding 2)
+5. ON SUCCESS: measure actual_durable_extracted_bytes from the real extracted
+   files (step above) - this MEASURED value, not the step-2 estimate, is what
+   the durable counter is reconciled to:
+     delta = actual_durable_extracted_bytes - declared_member_bytes   (can be
+             positive, negative, or zero - declared size is NEVER assumed to
+             equal actual bytes written)
+     UPDATE ingestion_batches SET extracted_bytes_consumed = extracted_bytes_consumed + :delta
+     WHERE id = :batch_id   (a plain, unconditional correction - the admission
+     decision already happened in step 3; this only makes the reported total
+     accurate to what was REALLY written, never re-litigates admission)
+   promote staging -> archive_<id>/ (the final, non-staging location)
+6. ON EXTRACTION FAILURE (extract() raises): delete staging wholesale; release
+   the ORIGINAL declared_member_bytes reservation exactly (symmetric to step 3,
+   since no actual bytes durably exist to reconcile against):
+     UPDATE ingestion_batches SET extracted_bytes_consumed = extracted_bytes_consumed - :declared_member_bytes
+     WHERE id = :batch_id
+```
+**Declared size is never treated as proof of actual bytes written** —
+step 5's reconciliation exists specifically because a real archive's
+central-directory metadata could in principle diverge from what is
+actually written to disk; the durable counter always converges to the
+*measured* value, with the declared estimate serving only the
+admission decision in step 3.
+
+The step-3 conditional `UPDATE` is the actual safety net (closing a
+real race between two workers reading a stale counter); the pre-flight
+metadata inspection is an efficiency optimization avoiding wasted
+extraction work on something that was never going to fit, not itself
+the safety mechanism.
+
+- **Durable extracted bytes** = the reconciled, measured value from
+  step 5 — never counted while still in staging, and never simply
+  equated to the step-2 estimate.
+- **Transient staging bytes** are never added to
+  `extracted_bytes_consumed` at all; discarding staging (overflow,
+  guard failure, or extraction error) never touches the durable
+  counter beyond the symmetric release in step 6, satisfying "discarded
+  staging does not count as durable extracted consumption."
+- **Peak physical workspace usage vs. cumulative extracted bytes**:
+  kept fully distinct — the resource guard's live `shutil.disk_usage`
+  check (point 6) is what protects against peak physical usage
+  (measures actual free space on disk, regardless of any counter); the
+  `extracted_bytes_consumed` counter tracks the batch's *cumulative
+  durable allowance*, a policy-level accounting concept that does not
+  by itself reflect current disk pressure from other sources.
+- **Crash/restart**: before any (re)extraction attempt for a given
+  `source_instance_id`, delete any pre-existing staging directory for
+  it first (idempotent cleanup) — a genuinely new requirement, since no
+  staging concept exists in the current implementation to clean up
+  after.
+- **Retry**: identical to crash/restart — always starts from a clean
+  staging directory.
+
+### 8. Embedding reservation — fenced lifecycle, including crash recovery
+
+**Round 2's design had a real hole, correctly identified**: a
+presence-only predicate (`reserved_embeddings IS NOT NULL`) cannot
+distinguish "no one holds a reservation" from "*someone else, later,*
+holds a reservation." A worker delayed rather than dead (a classic
+zombie-worker scenario, not merely a crash) can wake after recovery has
+already reclaimed its row and a *new* claimant has reserved fresh
+capacity — the old worker's release would match the new reservation
+purely because both happen to leave the column non-NULL. Presence
+alone is not ownership.
+
+**Frozen invariant, strengthened**: a reservation may be consumed or
+released only by the exact claim-generation identity that created it,
+or by an explicitly authorized recovery operation acting on that exact
+generation — never by a state-only predicate that a later, unrelated
+generation could accidentally satisfy.
+
+**Fencing mechanism — one new integer alongside the existing markers,
+still no new table**: `ContentIdentityGroup.claim_generation: Integer,
+NOT NULL, default 0`, incremented by exactly 1 every time the row is
+claimed — whether that claim is fresh (`claimed_by`/`claimed_at` were
+NULL) or a stale-reclaim (they were set, but expired). Every claim
+returns its own `claim_generation` value to the caller, who holds it
+for the lifetime of that attempt. `reserved_embeddings` (unchanged from
+Round 2: `Integer | NULL`) now co-exists with this fence: every
+mutating operation on the reservation — reserve, consume, release,
+recover — includes `AND claim_generation = :my_generation` in its
+`WHERE` clause. A delayed worker's `:my_generation` is, by definition,
+*older* than whatever generation the row has moved to once it has been
+reclaimed — so its operation matches zero rows and is a safe no-op,
+**structurally**, not by luck of timing.
+
+**Exact lifecycle**:
+```
+claim (generation N):
+    UPDATE content_identity_groups
+    SET claimed_by = :worker_id, claimed_at = now(), claim_generation = claim_generation + 1
+    WHERE id = :group_id AND (claimed_by IS NULL OR claimed_at < stale_before)
+    RETURNING claim_generation
+    -- the caller remembers :my_generation = the returned value for this attempt's lifetime
+
+reserve (generation N):
+    UPDATE content_identity_groups SET reserved_embeddings = :n
+    WHERE id = :group_id AND claim_generation = :my_generation
+    -- fenced: if the row has since moved to generation N+1 (this worker is stale),
+    -- this matches zero rows - the worker MUST check for this and abort rather than
+    -- proceed to call embed() at all
+    AND (same logical operation):
+    UPDATE ingestion_batches SET embeddings_reserved = embeddings_reserved + :n
+    WHERE id = :batch_id AND embeddings_reserved + :n <= max_embeddings
+    RETURNING embeddings_reserved
+    -- IF either UPDATE fails to match/return: roll back whichever part succeeded;
+    -- release claim; no embed() call; no IngestionAttempt recorded; item deferred
+
+embed (generation N):
+    EmbeddingClient.embed(texts) - confirmed all-or-nothing (finding 1):
+    either all :n chunks receive vectors, or an exception is raised and none do
+
+consume (generation N, success):
+    - chunk embeddings persisted (existing DocumentChunk.embedding update)
+    - clear the reservation, FENCED to this generation (same idempotent
+      operation as release/recover below, invoked from the success path)
+    - embeddings_reserved on the batch is NOT decremented (monotonic - unchanged)
+    - release claim normally, ALSO fenced: only generation N's own worker may
+      clear claimed_by/claimed_at for generation N
+
+release (generation N, failure - embed() raises) OR
+recover (authorized recovery of a stale generation N, performed by
+whichever worker's claim attempt observes staleness):
+    BOTH paths use the exact SAME idempotent, OWNERSHIP-CHECKED operation:
+      UPDATE content_identity_groups
+      SET reserved_embeddings = NULL
+      WHERE id = :group_id AND claim_generation = :my_generation
+        AND reserved_embeddings IS NOT NULL
+      RETURNING reserved_embeddings
+    IF a row is returned (won the fenced NOT NULL -> NULL transition FOR
+      THIS EXACT GENERATION): UPDATE ingestion_batches SET embeddings_reserved
+      = embeddings_reserved - :released_n WHERE id = :batch_id
+    IF no row returned - EITHER already NULL (released by a concurrent/prior
+      operation for the SAME generation), OR the generation has already moved
+      on (this caller is stale): do nothing further - both cases are
+      indistinguishable from the caller's point of view, and both correctly
+      require no action from a stale caller
+```
+
+**Recovery is authorized precisely because it reads under the row
+lock, not because it is a special-cased caller**: the *same*
+`SELECT ... FOR UPDATE SKIP LOCKED` claim query that reclaims a stale
+row (by construction — no separate recovery service, unchanged from
+this codebase's existing design) reads the row's *current*
+`claim_generation`/`reserved_embeddings` fresh, under lock, immediately
+before incrementing the generation. It therefore always acts on the
+*true current* generation, never a remembered, potentially-stale one —
+this is the structural difference between "recovery" (always
+current-generation, lock-authorized) and "a stale worker's own late
+release" (always a remembered, possibly-outdated generation, fenced
+out the moment it no longer matches).
+
+**Exact recovery sequence**:
+```
+generation N becomes stale (claimed_at < stale_before, existing mechanism)
+  -> the reclaiming SELECT ... FOR UPDATE reads generation N's current
+     reserved_embeddings under lock
+  -> releases generation N's reservation via the fenced operation above
+     (matches, because this read is fresh/current, not remembered)
+  -> claim_generation increments to N+1; claimed_by/claimed_at set fresh
+  -> generation N is now invalidated - any operation later presented with
+     :my_generation = N will match zero rows, permanently, for this row
+  -> generation N+1 may claim and reserve independently, exactly as if
+     starting fresh
+```
+
+**Why cross-batch identity convergence cannot create ownership
+ambiguity**: `ContentIdentityGroup.claimed_by`/`claimed_at`/
+`claim_generation` are a *single* set of columns on *one* row — at most
+one `(worker, generation)` pair can hold them at any instant, guaranteed
+by the existing `SELECT ... FOR UPDATE SKIP LOCKED` claim mechanism,
+regardless of how many different batches' `SourceInstance` rows happen
+to reference that group. If `Batch A → SourceInstance A → Group X` and
+`Batch B → SourceInstance B → Group X`, only one of A's or B's workers
+can hold Group X's claim at a given moment; the fencing token scopes
+the reservation to *that* specific claim attempt, not to "batch A" or
+"batch B" as a label — there is structurally never a moment where two
+different batches' work on the same group could hold simultaneous,
+ambiguous reservations. A reservation is therefore always attributable
+to the exact claim-generation lifecycle that created it, independent of
+and never relying solely on which `ContentIdentityGroup` is involved.
+
+**Why no new table is needed — explicit justification across all four
+axes named in review**:
+```
+content identity  - the row IS the ContentIdentityGroup; one row per identity,
+                     no ambiguity possible
+work item          - at this pipeline stage, the "work item" IS the
+                     ContentIdentityGroup itself (normalize/chunk/embed
+                     operate on groups, not on SourceInstances) - work-item
+                     identity and content identity coincide exactly
+batch              - never needs encoding here: the claim is globally
+                     exclusive (one worker at a time, regardless of which
+                     batch's SourceInstance made the group eligible), so
+                     batch-level ambiguity cannot arise structurally (see above)
+claim generation   - the new claim_generation integer, incremented on every
+                     claim/reclaim - the exact, and only, dimension needed to
+                     distinguish "this attempt" from "a later attempt on the
+                     same row"
+```
+Co-locating `reserved_embeddings` and `claim_generation` alongside the
+pre-existing `claimed_by`/`claimed_at` on `ContentIdentityGroup` is
+therefore sufficient; a separate reservation table would add a join and
+a second source of truth for no additional safety.
+
+- **Concurrency**: all conditional `UPDATE`s serialize via Postgres
+  row-level locking on the single row they target — correct, though a
+  known point of contention under very high concurrency (acceptable at
+  this project's scale; not a scenario this design needs to optimize
+  for).
+- **Batch pause/stop with reservations outstanding**: reservations are
+  *not* released merely because the batch pauses — they represent real,
+  potentially still-in-flight work; only the stale-claim-triggered
+  recovery path above ever clears one, always fenced to the generation
+  it actually belongs to.
+
+**New schema surfaced by this correction**: two columns on
+`ContentIdentityGroup` — `reserved_embeddings: Integer | NULL` (Round 2)
+and `claim_generation: Integer, NOT NULL, default 0` (this round) —
+noted in the design gap register (point 19) as `DECIDED/FROZEN`, not
+deferred; the mechanism above is a complete, closed design, not an open
+question.
+
+### 9. Runtime accounting — honest guarantees
+
+```
+process start / resume:  session_start = time.monotonic()  (a NEW timer each
+                          session - the prior session's monotonic value is
+                          meaningless across a process restart)
+pause / graceful stop / completion:
+    session_delta = time.monotonic() - session_start
+    UPDATE ingestion_batches SET monotonic_runtime_seconds_consumed =
+        monotonic_runtime_seconds_consumed + :session_delta WHERE id = :batch_id
+crash (no graceful exit):
+    the delta since the LAST checkpoint is LOST - never recorded.
+```
+**Explicit, honest limitation, per instruction not to overclaim**:
+exact runtime accounting across an *unclosed* (crashed) process is
+**not guaranteed** — only graceful pause/stop/completion checkpoints
+are accounted for; `monotonic_runtime_seconds_consumed` is therefore a
+lower bound on true wall-clock time whenever a crash occurs without an
+intervening checkpoint, never a promised-exact figure.
+
+**Recommended, not frozen**: a periodic heartbeat checkpoint (e.g.
+every N claim-cycles) would bound the worst-case undercounting from a
+crash. This is a design recommendation for the implementation to
+consider, not a requirement the frozen architecture mandated.
+
+### 10. Claim / batch interaction
+
+**Frozen implementation invariant**: a batch worker may claim only
+`SourceInstance` rows belonging to that batch's dedicated
+`ClassificationRun`.
+
+**Exact claim predicate** (extending, not replacing, the existing
+`SELECT ... FOR UPDATE SKIP LOCKED` mechanism — verified directly that
+neither method filters by it today):
+```
+claim_source_instance_for_identity_resolution(
+    *, worker_id: str, lease_duration: timedelta, classification_run_id: int
+) -> SourceInstance | None:
+    WHERE classification_run_id = :classification_run_id
+      AND content_identity_group_id IS NULL AND member_path IS NULL
+      AND NOT (root_t7_path archive-suffixed)
+      AND (claimed_by IS NULL OR claimed_at < stale_before)
+
+claim_source_instance_for_archive_processing(
+    *, worker_id: str, lease_duration: timedelta, classification_run_id: int
+) -> SourceInstance | None:
+    WHERE classification_run_id = :classification_run_id
+      AND member_path IS NULL AND (root_t7_path archive-suffixed)
+      AND content_identity_group_id IS NULL AND NOT already_processed
+      AND (claimed_by IS NULL OR claimed_at < stale_before)
+```
+Both simply gain `classification_run_id = :classification_run_id` as
+one more `AND` term — the row-lock/claim mechanism itself is unchanged.
+
+**How batch identity reaches the claim**: explicit parameter passing
+only — the orchestrating worker loop holds its `IngestionBatch` (and
+therefore `batch.classification_run_id`) as its own state and passes it
+into every `WorkerClaimService` call it makes, exactly matching this
+codebase's existing style (every service here takes explicit keyword
+arguments; nothing uses global or thread-local implicit context).
+
+**Adversarial concurrency test, required**: Batch A and Batch B (two
+real `IngestionBatch` rows, each with its own dedicated
+`ClassificationRun` and disjoint `SourceInstance` sets) run
+concurrently against the same worker infrastructure, using
+`threading.Barrier`-synchronized real-Postgres workers (this project's
+established, non-negotiable concurrency-test standard — never mocked).
+Assert, over many interleaved claim attempts, that **every claimed
+row's `classification_run_id` exactly matches the `classification_run_id`
+argument used to claim it** — zero cross-batch claims, proven, not
+merely argued. Added to the test matrix (point 16).
+
+**A genuinely tricky case, decided explicitly rather than left open —
+and clarified further per review (see also point 6 below)**:
+`claim_content_identity_group` claims a `ContentIdentityGroup`, which
+has no direct `classification_run_id` — and, per the already-proven
+duplicate-convergence behavior, a single group can legitimately be
+pointed at by `SourceInstance` rows from *different* batches. This does
+**not** conflict with the frozen invariant above, because it is a
+different claim entirely: the invariant governs `SourceInstance`-level
+claims specifically (the ones that represent "this batch's selected
+work" and are the only claims that ever read T7 bytes); `claim_content_
+identity_group` operates on already-resolved, purely-database-internal
+content identity, a later pipeline stage that never touches T7 again.
+**Decision, unchanged from Round 1**: `claim_content_identity_group`
+remains a *global* claim (no batch filter) — whichever batch's worker
+claims an eligible shared group first legitimately advances it, and
+`embeddings_reserved` is charged to *that* batch. This is a known,
+accepted imprecision in cross-batch budget attribution (the underlying
+work itself is still correctly deduplicated and only processed once;
+only which batch's ledger records the cost is approximate in this rare
+case), not a correctness bug, and not a violation of batch isolation —
+named here rather than silently assumed.
+
+**Three distinct concepts, stated explicitly so they are never
+conflated**:
+```
+batch membership              - which SourceInstance rows were selected/
+                                 materialized under THIS batch's ClassificationRun.
+                                 Structural, immutable, per-batch (points 1/3).
+content identity convergence  - which ContentIdentityGroup a SourceInstance's
+                                 bytes resolve to. A property of BYTES, global,
+                                 and MAY legitimately span multiple batches.
+worker ownership               - which specific claim (claimed_by/claimed_at)
+                                 currently owns a row for active processing.
+                                 Transient, per-attempt.
+```
+Different batches may legitimately contain `SourceInstance`s that later
+converge on the same `ContentIdentityGroup` — this is not an error, it
+is the same duplicate-content-reuse behavior already proven twice on
+real data. What must never happen, and is what the frozen predicate
+above actually prevents: **identity convergence must never allow a
+worker to claim a `SourceInstance` belonging to another batch.**
+`SourceInstance`-level claims stay strictly batch-scoped, full stop;
+only the later, T7-independent `ContentIdentityGroup`-level claim
+(a different claim, on a different kind of row, representing already-
+resolved shared truth about bytes) is intentionally global — and that
+distinction is precisely why the two are different methods with
+different scoping rules, not an inconsistency between them.
+
+- **Claim ownership recovery**: unchanged existing `claimed_at <
+  stale_before` mechanism; now additionally scoped by
+  `classification_run_id` for the two `SourceInstance`-level methods.
+- **Batch pauses while an item is claimed**: the claim is left as-is;
+  it naturally goes stale after its lease and becomes reclaimable on
+  resume (by the same or a different worker) — no special "batch
+  pause" handling needed at the claim level, this falls out of the
+  existing lease mechanism.
+- **Hard-stop cleanup**: on `ABORTED`, a worker releases any claim it
+  currently holds immediately, rather than leaving it to expire
+  naturally — avoiding an unnecessary wait through the full
+  `lease_duration` before a future retry batch can pick the item up.
+- **Avoiding false terminality**: `COMPLETED` is set only after a
+  reconciliation query confirms zero claimable/in-progress work remains
+  for this batch's rows (every `SourceInstance`/`ContentIdentityGroup`
+  has reached a terminal state, or is provably unreachable within
+  remaining envelope) — never merely because one claim attempt
+  returned `None`, which could just mean a transient lack of
+  currently-claimable work while other items are mid-flight elsewhere.
+
+Existing execute-vs-recovery race semantics and domain-error
+convergence (Chain 1's dedup-executor precedent) are unaffected —
+Chain 2's claim discipline remains its own, separate lazy-reclaim
+mechanism, not retrofitted with Chain 1's `recover_stale_execution`
+pattern.
+
+### 11. Archive processing integration
+
+```
+source admission (selection time, point 5)
+    -> container-level SourceInstance created, source_category=ARCHIVE,
+       workload_category=CONTAINER, risk_tier_estimated set from declared
+       size (point 4) - all set AT CREATION, before any read
+    -> archive source claim (claim_source_instance_for_archive_processing,
+       now classification_run_id-scoped)
+    -> pre-flight extracted-bytes reservation (point 7)
+    -> isolated staging extraction (point 7)
+    -> member SourceInstance creation (existing _extract_recursive loop,
+       unchanged structurally) - EACH member gets source_category=
+       LOOSE_FILE or ARCHIVE (if itself a nested archive), workload_category
+       via classify_workload_category(member.relative_path), risk_tier_estimated
+       from its own size - all set HERE, at member-creation time, since this
+       is the first point a member's own path/extension is known
+    -> member policy (point 4) - evaluated per member, same classifiers as
+       loose files
+    -> identity resolution proceeds exactly as today (unchanged) for
+       eligible members
+```
+**Explicit non-negotiable**: archives are never opened during initial
+source selection (point 5) — `source_category=ARCHIVE`/
+`workload_category=CONTAINER`/`risk_tier_estimated` for the container
+are set from D0's declared metadata alone; only extraction (a later,
+execution-time step, per a claimed batch) ever reads archive bytes.
+
+### 12. Batch state machine — exact transitions
+
+```
+PLANNED   --(first claim-cycle begins)-->  RUNNING
+RUNNING   --(soft-stop OR manual pause)-->  PAUSED           [stop_reason set]
+RUNNING   --(hard-stop OR persistent Ollama failure
+             OR safety-invariant violation)-->  ABORTED      [stop_reason set, TERMINAL]
+RUNNING   --(reconciliation confirms zero remaining
+             claimable/in-progress work)-->  COMPLETED       [stop_reason =
+             SOURCE_WORK_EXHAUSTED / *_ENVELOPE_EXHAUSTED / RUNTIME_BUDGET_EXCEEDED]
+PAUSED    --(operator resumes)-->  RUNNING
+PAUSED    --(operator aborts explicitly)-->  ABORTED
+```
+- **`PLANNED`**: the batch exists (created, immutable membership fixed)
+  but no worker has yet begun a claim cycle against it.
+- **`RUNNING`**: actively being processed.
+- **`PAUSED`**: resumable — same batch, same `IngestionBatch` row,
+  membership and all counters preserved exactly as they stood.
+- **`COMPLETED`**: reached when envelope exhaustion or genuine work
+  exhaustion is the reason execution stopped — a *designed*, successful
+  end to this batch's scope, not a failure. Terminal.
+- **`ABORTED`**: reached only via a genuine resource-guard hard-stop or
+  safety violation — an *unplanned* interruption. **Terminal — retrying
+  requires a brand-new `IngestionBatch` (new `ClassificationRun`, new
+  selection, new fingerprint)**, never resuming an aborted one, per the
+  frozen architecture.
+- **Human review points**: `review_required=True` (set at creation) is
+  advisory and does not gate any transition by itself; a `stop_reason`
+  in the "review-required" category (per point 9 of the numeric pass:
+  first scaled batch of a class, unusually large archive encountered, a
+  new failure-code class) is a *process* signal for the human overseeing
+  the batch, not a code-enforced gate — consistent with how every other
+  gate in this project has worked.
+
+### 13. `BatchReportService` — design specification
+
+Computes, for a given `IngestionBatch`, all fields the frozen
+architecture requires:
+```
+eligible_source_count, policy_filtered_count, selectable_count   <- read directly
+                                                    from the immutable IngestionBatch row
+source_instances_selected, source_bytes_selected   <- read directly (immutable)
+unattempted_selected_count  = source_instances_selected - attempted_source_count
+attempted_source_count      = COUNT(DISTINCT SourceInstance) under this batch's
+                               classification_run_id with >=1 IngestionAttempt
+terminal_source_count       = COUNT of those whose resolved ContentIdentityGroup.pipeline_state
+                               IN (INGESTED, EXCLUDED, UNSUPPORTED, FAILED, NEEDS_REVIEW)
+successful_ingestion_count  = COUNT with pipeline_state == INGESTED specifically
+actual_source_bytes_read    = SUM of real bytes read at identity-resolution/extraction
+                               time (from evidence_snapshot, not D0's declared estimate)
+extracted_bytes_consumed, embeddings_reserved, runtime_consumed
+                             <- read directly from IngestionBatch's counters
+risk_tier_estimated vs risk_tier_actual distribution
+                             <- GROUP BY on SourceInstance, including the NULL
+                               ("insufficient evidence") bucket explicitly
+drift outcomes               <- classified per SourceInstance at read time
+                               (OBSERVED_AT_SELECTION / SOURCE_PRESENT_AT_EXECUTION /
+                               SOURCE_CHANGED_AFTER_SELECTION / SOURCE_MISSING_AT_EXECUTION)
+stop_reason, stop_reason_detail   <- read directly
+```
+**Denominator reconciliation rule**: `source_instances_selected ==
+attempted_source_count + unattempted_selected_count` must hold exactly
+at all times (a query-level invariant to assert in the report, not
+merely hope for) — any discrepancy indicates a bug (e.g. a claim
+released without either completing or remaining cleanly unattempted).
+`terminal_source_count <= attempted_source_count <=
+source_instances_selected` must also hold. No implementation of this
+service is written in this pass.
+
+### 14. Failure / retry semantics — batch-level vs. item-level
+
+| Condition | Level | Retryable? | Terminal for batch? |
+|---|---|---|---|
+| Envelope exceeded (extracted bytes / embeddings) for one item | item (deferred, no attempt recorded) | item eligible again in a *future* batch | no — batch continues with other work |
+| Resource soft stop | batch | batch resumable (`PAUSED`) | no |
+| Resource hard stop | batch | no — new batch required | yes (`ABORTED`) |
+| T7 unavailable | item (`IngestionAttempt` FAILED, existing) | yes, retryable | no |
+| Corrupt input | item (`IngestionAttempt` FAILED, existing) | yes (indefinitely, by construction) | no |
+| Unsupported content | item (`EXCLUDED`/`UNSUPPORTED`, no attempt) | n/a — durable terminal state | no |
+| Embedding unavailable | item (`IngestionAttempt` FAILED, existing) | yes | no |
+| Worker crash | item (claim goes stale, existing) | yes, via existing reclaim | no |
+| Stale claim recovery | item (existing mechanism) | n/a — recovery IS the retry path | no |
+| Database transaction failure | batch-creation-time: whole creation rolls back; mid-batch: item-level, existing session/transaction handling | yes, depends on where it occurred | no, unless it repeats and trips a resource guard |
+
+No new semantics conflict with the existing `IngestionAttempt` model —
+every item-level row above uses outcomes/failure codes already frozen
+in `ce50875`; this design only adds the *batch*-level layer on top,
+which the existing model never had a concept of before.
+
+### 15. Concurrency / transaction design — where read-then-act is unsafe
+
+| Operation | Unsafe pattern | Required atomic operation |
+|---|---|---|
+| Batch selection ownership | reading eligibility then materializing without a lock | `pg_advisory_xact_lock` for the whole creation transaction (point 2) |
+| Embedding reservation | check `embeddings_reserved < max` then `UPDATE` | single conditional `UPDATE ... WHERE ... <= max_embeddings RETURNING` (point 8) |
+| Extracted-bytes reservation | same shape as embeddings | same conditional `UPDATE` pattern (point 7) |
+| Claim ownership | already solved (`SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE`, existing) | unchanged, extended with `classification_run_id` filter |
+| Stale claim recovery | already solved (same claim query reclaims, by construction) | unchanged |
+| Batch terminalization | checking "no claimable work" without confirming no in-progress work elsewhere | reconciliation query (point 10), not a single claim-attempt result |
+
+**DB constraints vs. service-level invariants**: the `UNIQUE` constraint
+on `IngestionBatch.classification_run_id` is a DB-enforced guarantee
+(cannot be violated even by a bug). Envelope immutability, the
+`selection_fingerprint`'s correctness, and the funnel-count semantics
+are service-level invariants (enforced by narrow method design, not a
+DB constraint) — worth naming as a real limitation: a sufficiently
+wrong direct-SQL write could still violate them; the design relies on
+disciplined service boundaries, matching every other write-once field
+in this codebase (e.g. `SourceInstance.content_identity_group_id`'s
+"write-once" nature is also service-enforced, not DB-enforced, and
+that has held up through five real-data milestones already).
+
+### 16. Test design — the matrix implementation must satisfy
+
+All synthetic unless a future gate explicitly authorizes a real-T7
+test — matching every prior milestone's discipline:
+```
+- deterministic selection reproduces identical results for identical inputs
+- immutable membership: re-running "selection" logic against an existing
+  batch's ClassificationRun never adds/removes rows
+- a later DiscoveryRun creates a genuinely new SourceInstance for a path
+  already observed under an earlier DiscoveryRun's batch
+- envelope boundaries: exactly the item that would exceed a limit stops
+  selection (not skipped-and-continued)
+- concurrent embedding reservations cannot together exceed max_embeddings
+  (real Postgres concurrency test, this project's non-negotiable standard)
+- archive staging cleanup: an aborted/overflowing extraction leaves zero
+  files outside the deleted staging directory
+- resource soft stop -> PAUSED -> resume continues without reselection
+- resource hard stop -> ABORTED -> retry requires a new IngestionBatch
+- review_required is set correctly at creation, never blocks execution by itself
+- pause/resume: monotonic runtime accumulates correctly across a
+  simulated process restart
+- crash/recovery: a stale claim (including an orphaned embedding
+  reservation) is correctly reclaimed and released, and reclaiming it
+  concurrently from two workers never double-releases the reservation
+  (point 8's idempotency proof, exercised for real)
+- **adversarial cross-batch claim isolation (required, point 10)**:
+  Batch A and Batch B, disjoint `SourceInstance` sets, run concurrently
+  via `threading.Barrier`-synchronized real-Postgres workers; assert
+  every claimed row's `classification_run_id` matches the id used to
+  claim it, over many interleaved attempts
+- **adversarial late-worker reservation safety (required, point 8,
+  real Postgres, not mocked)**:
+  ```
+  1. Worker A claims a ContentIdentityGroup at generation N and reserves
+     embedding capacity for N.
+  2. A's claim goes stale (simulate via an already-expired claimed_at,
+     the existing test pattern for stale-claim scenarios).
+  3. Recovery reclaims generation N: releases N's reservation, advances
+     to generation N+1.
+  4. Worker B claims at generation N+1 and reserves NEW capacity.
+  5. Worker A (unaware of any of the above) now executes its own,
+     remembered generation-N release operation.
+  Assert:
+    - A's release matches zero rows (fenced out by claim_generation)
+    - B's reservation is untouched and intact
+    - ingestion_batches.embeddings_reserved reflects ONLY B's reservation
+      (N's was already correctly released at step 3, exactly once)
+    - B's subsequent successful embed()/consume completes with no leaked
+      or double-counted capacity
+  ```
+  Also test two concurrent recovery attempts for the SAME stale
+  generation racing each other — assert exactly one succeeds in
+  releasing/advancing, the other's `UPDATE` matches zero rows, and the
+  batch counter is decremented exactly once, not twice.
+- batch/item state independence: a PAUSED batch can coexist with a
+  FAILED, unrelated ContentIdentityGroup
+- archive admission never has access to member workload data (a
+  regression test analogous to the identity-resolution/archive-
+  exclusion tests already in this codebase)
+- D1 duplicate-archive scheduling admits exactly one representative per
+  group, deterministically
+- all three drift outcomes (present-unchanged / changed / missing)
+  produce their frozen, distinct dispositions
+- report denominator reconciliation holds across every scenario above
+- no test in this suite references any real T7 path, ever
+```
+
+### 17. Security / safety boundary — implementation-level invariants
+
+- **No write path to T7 exists anywhere in this design** — every new
+  component (selection, `BatchResourceGuard`, `IngestionBatch`
+  lifecycle) only ever reads D0's JSON file and already-committed
+  database rows; extraction writes exclusively under
+  `workspace_root`/`_staging`, never under `/media/personal/Seenu_T7SSD*`.
+- **Accidental extraction into the source corpus is prevented
+  structurally**: `destination` is always computed from
+  `WORKSPACE_ROOT`, never derived from `SourceInstance.root_t7_path`'s
+  own directory — the existing `ArchiveProcessingService` already does
+  this; the new staging layer adds a subdirectory under the same
+  workspace root, never a new root.
+- **No mutation of source files**: unchanged from every prior
+  milestone — nothing in this design adds a write/rename/delete
+  capability against a source path.
+- **No accidental dedup deletion/quarantine**: `DedupFilesystemExecutor`
+  and dedup execution/authorization are never invoked anywhere in this
+  design — the D1-duplicate-archive scheduling rule (point 4) only
+  affects which archive is *extracted first*, never anything about
+  Chain 1's dedup disposition machinery.
+- **`ImportJob.source_path` boundary preserved**: `FileAccessService`'s
+  existing allow-list (`_FILESYSTEM_BACKED_SOURCE_TYPES = {"filesystem"}`,
+  verified directly) is untouched by this design; nothing here creates
+  an `ImportJob` referencing a classification-derived T7 path, and the
+  existing hardening (a non-`"filesystem"` `source_type` can never
+  become a readable root) remains the only path by which a T7-adjacent
+  reference could ever reach `FileAccessService`.
+- **Policy changes cannot silently alter an existing batch**: per point
+  1's immutability rule, an `IngestionBatch`'s envelope, selection
+  policy version, and materialized membership are fixed permanently at
+  creation — a later change to `classify_workload_category` or a batch
+  class's predicate affects only *future* batch creations, never a
+  batch already `PLANNED`/`RUNNING`/`PAUSED`.
+
+### 18. Implementation order — independently reviewable milestones
+
+```
+1. Schema/model design review (IngestionBatch + 4 new SourceInstance columns) -
+   NOT the migration itself, a focused review of the exact DDL
+2. Migration (schema only, applied to aibrain_test first, per this project's
+   established pattern)
+3. Batch creation service (selection algorithm + advisory-lock transaction)
+4. Policy evaluator (classify_source_category/workload_category/risk_tier_estimated,
+   the D1-duplicate-representative rule)
+5. WorkerClaimService extension (classification_run_id-scoped claim methods)
+6. BatchResourceGuard (disk/Postgres/Ollama checks, three-tier stop logic)
+7. Extracted-bytes + embedding reservation (atomic counters, staging integration)
+8. Runtime accounting (monotonic + durable accumulation)
+9. Worker/claim integration (the loop that ties 3-8 together per batch)
+10. Archive-processing integration (staging, member classification at creation)
+11. BatchReportService (reporting, denominator reconciliation)
+12. Adversarial/concurrency tests (real Postgres, per this project's
+    non-negotiable standard - the LAST milestone, proving everything above,
+    not a substitute for testing incrementally within each prior milestone)
+```
+Each milestone is independently reviewable and, per this project's
+established discipline, independently authorized and committed — not
+assumed to land in one commit.
+
+### 19. Design gap register
+
+**DECIDED / FROZEN** (this pass, on top of `f2b9815`/`3d37ec0` —
+Round 2 corrections included, not left as open questions):
+```
+IngestionBatch exact schema (point 1), including review_required and the
+three selection-time funnel counts.
+
+Advisory-lock batch-creation transaction, with EXACT scope (per DiscoveryRun),
+key derivation (namespaced string hash, never a raw id), transaction-scoped
+lifetime (pg_advisory_xact_lock, auto-released on commit/rollback), and the
+explicit pairing with a recommended DB UNIQUE constraint as independent
+defense-in-depth - the lock is not a substitute for a constraint (point 2).
+
+classification_run_id required on SourceInstance-level claims, with the
+EXACT predicate for both claim methods and the mechanism (explicit parameter
+passing) by which batch identity reaches them (point 10) - required, not
+optional hardening.
+
+The embedding-reservation FENCED crash-recovery lifecycle IN FULL: two new
+ContentIdentityGroup columns (reserved_embeddings, claim_generation), every
+reserve/consume/release/recover operation checking BOTH reservation presence
+AND generation ownership, and the proof that a delayed (not merely crashed)
+worker from an old generation can never touch a newer generation's
+reservation, nor can concurrent recovery double-release (point 8) - this is a
+CLOSED design, not a named-but-unsolved gap. (A presence-only version of this
+was proposed in Round 2 and correctly identified as insufficient against a
+zombie-worker race in Round 3 - the fencing token above is the fix, not a
+patch on top of the old design.)
+
+classify_workload_category strips conflict-rename suffixes for real (point 4,
+closing the numeric pass's open question).
+
+Selection stops (never skips-and-continues) at the first envelope-exceeding
+item, explicitly tied to selection_fingerprint reproducibility (point 5).
+
+The three-way declared/actual/peak distinction for extracted-bytes accounting,
+including the post-extraction reconciliation step - declared size is never
+treated as proof of actual bytes written (point 7).
+
+claim_content_identity_group stays global; cross-batch convergence charges
+whichever batch claims first - and is explicitly NOT a batch-isolation
+violation, since SourceInstance-level claims (the ones that touch T7) remain
+strictly batch-scoped regardless (point 10, with the three-concept
+membership/convergence/ownership clarification).
+
+COMPLETED vs PAUSED vs ABORTED mapping by stop_reason category (point 12);
+denominator reconciliation invariant (point 13).
+```
+
+**REQUIRES IMPLEMENTATION-TIME VERIFICATION** (genuinely open questions
+only - the two Round-1 gaps above are no longer listed here, per
+review, since they are now fully decided):
+```
+Exact SQLAlchemy column types/DDL syntax for the new IngestionBatch table,
+the new SourceInstance columns, and ContentIdentityGroup.reserved_embeddings
+(this pass specifies semantics, not DDL syntax).
+
+The exact DDL for the recommended SourceInstance UNIQUE constraint
+(classification_run_id, root_t7_path, member_path) - whether to add it in
+the same migration as IngestionBatch or as a follow-up hardening change.
+
+The exact reconciliation query shape for point 10/13's "zero claimable/
+in-progress work remains" check (logically specified, not yet written as SQL).
+
+Whether a periodic runtime heartbeat is worth its complexity (recommended,
+not required, point 9).
+```
+
+**DELIBERATELY DEFERRED** (unchanged from earlier gates, not
+reinterpreted here):
+```
+Numeric envelope values for Class 2-5 (archive classes); max_embeddings
+for Class 1 itself (CALIBRATION_REQUIRED, per 3d37ec0); risk_tier_actual
+numeric boundaries; the backup/sync/snapshot context signal's structure
+and pattern list; Ollama embedding-latency ceiling; any actual
+implementation code, schema migration, or real-T7 access - all remain
+gated behind their own, separate future authorizations.
+```
+
+**This freeze approves the implementation design in full — it
+authorizes no code, no schema/migration, and no real-T7 access.**
+**Next gate, not yet authorized**: implementation itself, beginning
+with the first independently reviewable milestone from point 18's
+sequence (schema/model design review) rather than jumping directly to
+real-T7 execution — each subsequent milestone in that sequence remains
+its own, separately authorized step.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

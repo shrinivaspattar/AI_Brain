@@ -1984,6 +1984,126 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       contract frozen at `f2b9815` — implementation itself is a further,
       later gate beyond that.
 
+- [x] Scaled Real-T7 Ingestion — Implementation Design Pass —
+      **APPROVED and frozen**, design-only, sitting on top of both
+      frozen gates (`f2b9815` architecture, `3d37ec0` numeric/policy).
+      No T7 access, no code, no schema/migration.
+
+      Two real findings from directly re-reading the current code (not
+      assumed): `EmbeddingClient.embed()` is genuinely all-or-nothing —
+      one Ollama HTTP call for the whole chunk list, all vectors or an
+      exception. `ArchiveExtractor.extract()` is atomic per archive
+      (`extractall()` in one call, no mid-extraction hook) — meaning the
+      frozen "monitor extracted bytes during extraction" language is
+      implemented as a **pre-flight check** (sum declared member sizes
+      before calling `extract()`, refuse to start if it would overflow
+      the remaining budget) rather than literal interruption mid-write —
+      achieving the same "never a durable partial artifact" invariant
+      via prevention, not a weakening of what was frozen.
+
+      Full `IngestionBatch` schema specified (fields, types, nullability,
+      immutability rules, `BatchStatus`/`BatchStopReason` enums, a new
+      `review_required` boolean kept orthogonal to `status`), plus three
+      new selection-time count fields
+      (`eligible_source_count`/`policy_filtered_count`/
+      `selectable_count`) needed because those funnel counts can't be
+      reconstructed later from the final rows alone. Batch creation is a
+      two-phase design: read-only computation, then one atomic write
+      transaction serialized by a Postgres advisory lock keyed on the
+      `DiscoveryRun` (the same class of DB-native primitive this
+      codebase already uses elsewhere, applied where no row yet exists
+      to lock).
+
+      **Round 2 correction — batch isolation, now fully specified, not
+      merely flagged**: today's `WorkerClaimService` claim queries have
+      no `classification_run_id` filter at all (verified directly) —
+      the frozen fix adds it as a required parameter to both
+      `SourceInstance`-level claim methods, with batch identity reaching
+      the claim via explicit parameter passing only (no implicit/global
+      context, matching this codebase's existing style), plus a required
+      adversarial concurrency test (two batches, real-Postgres
+      `threading.Barrier` workers, proving zero cross-batch claims).
+      `claim_content_identity_group` stays global by explicit decision —
+      a shared group from cross-batch duplicate convergence is charged
+      to whichever batch claims it first (accepted budget-attribution
+      imprecision, not a correctness bug or an isolation violation,
+      since `SourceInstance`-level claims — the only ones that touch T7
+      — remain strictly batch-scoped regardless). Batch membership,
+      content-identity convergence, and worker ownership are now stated
+      as three explicitly distinct concepts to prevent conflating them.
+
+      **Round 2 correction, then Round 3 hardening — embedding-
+      reservation crash recovery, now a fenced, closed design**: Round 2
+      added `ContentIdentityGroup.reserved_embeddings` (co-located with
+      the existing `claimed_by`/`claimed_at` markers — no new table),
+      released via a presence-only conditional `UPDATE ... WHERE
+      reserved_embeddings IS NOT NULL`. Round 3 correctly identified
+      that presence alone is insufficient: a worker merely *delayed*
+      (not crashed) can wake after recovery has already reclaimed its
+      row and a *new* worker has reserved fresh capacity — its stale
+      release could match the new reservation purely because both leave
+      the column non-NULL. **Fix**: a second new column,
+      `ContentIdentityGroup.claim_generation` (integer, incremented on
+      every claim/reclaim), fences every reserve/consume/release/
+      recover operation to the exact generation that created it — a
+      delayed worker's remembered, older generation value matches zero
+      rows once the row has moved on, structurally, not by timing luck.
+      Recovery is authorized precisely because it reads the row fresh
+      under its own claim lock, never a remembered value. Explicitly
+      proven sufficient across content-identity/work-item/batch/
+      generation axes without a new table, since the claim is globally
+      exclusive per row regardless of how many batches' `SourceInstance`s
+      reference the same group.
+
+      **Round 2 correction — archive extraction pre-flight, now
+      precisely distinguishes three quantities**: `declared_member_bytes`
+      (an estimate from the archive's central directory, before any
+      extraction), `actual_durable_extracted_bytes` (measured after a
+      successful atomic `extractall()`, via the extractor's own existing
+      per-file `stat()` mechanism), and peak/transient staging usage (a
+      live-disk-pressure concern for the resource guard, never the
+      extracted-bytes counter). Declared size is never treated as proof
+      of actual bytes written — a post-extraction reconciliation step
+      corrects the durable counter to the measured value.
+
+      **Round 2 correction — advisory lock, now exactly specified**:
+      scope (per `DiscoveryRun`), key derivation (a namespaced string
+      hash, never a raw integer id, avoiding future collision with
+      unrelated advisory-lock use), transaction-scoped lifetime
+      (`pg_advisory_xact_lock`, auto-released on commit/rollback, no
+      leak risk), and an explicit statement that the lock is paired
+      with, never a substitute for, a recommended `SourceInstance`
+      `UNIQUE` constraint as independent defense-in-depth.
+
+      Selection's stop-not-skip rule (point 5) is now explicitly tied to
+      `selection_fingerprint` reproducibility, not merely stated as a
+      simplicity preference. `COMPLETED` vs. `PAUSED` vs. `ABORTED`
+      remain mapped precisely by `stop_reason` category: envelope/work
+      exhaustion is a *designed* path to `COMPLETED`, never treated as a
+      failure; only genuine resource-guard hard-stops or safety
+      violations reach `ABORTED` (terminal — retry needs a brand-new
+      batch, never resuming one).
+
+      A required adversarial test is added for the fencing mechanism
+      specifically: a delayed worker's late release must be proven, on
+      real Postgres, to leave a subsequent claimant's reservation and
+      the batch counter completely untouched.
+
+      See `AI_Brain_Architecture.md`'s "Scaled Real-T7 Ingestion —
+      Implementation Design Pass" section for the full specification,
+      including the 12-milestone implementation order and the updated
+      decided/requires-verification/deferred gap register (all Round-2
+      and Round-3 corrections now live in "decided," not "requires
+      verification").
+
+      **APPROVED as the implementation design — this freeze authorizes
+      no code, schema/migration, or real-T7 access.** **Next gate, not
+      yet authorized**: implementation itself, beginning with the first
+      independently reviewable milestone from the 12-step sequence
+      (schema/model design review) rather than jumping directly to
+      real-T7 execution — each subsequent milestone remains its own,
+      separately authorized step.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time
