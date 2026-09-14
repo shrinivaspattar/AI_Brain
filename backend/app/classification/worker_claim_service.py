@@ -121,6 +121,23 @@ class WorkerClaimService:
     correct, frozen-design-verified layer for it, not the group claim
     itself. See `reserve_embeddings`'s docstring for the full generation
     -fenced reservation lifecycle this milestone adds.
+
+    SourceInstance CLAIM-GENERATION FENCING (added by Implementation
+    Milestone 5, generalizing `ContentIdentityGroup.claim_generation`
+    to `SourceInstance`): both `claim_source_instance_for_identity_
+    resolution` and `claim_source_instance_for_archive_processing`
+    increment `SourceInstance.claim_generation` by exactly 1 on every
+    grant (fresh or stale-reclaim), in the SAME atomic claim `UPDATE`
+    - the column lives on the model, so both claim queues are fenced
+    uniformly, not just the archive-processing one. `release_source_
+    instance_claim` requires and fences on this value, exactly
+    mirroring `release_content_identity_group_claim`'s Milestone-4
+    hardening. This closes a real ABA hole: a worker delayed (not
+    merely crashed) past its lease could otherwise call release AFTER
+    stale-claim recovery has already reclaimed the row for a different,
+    actively-working worker, wrongly clearing that worker's live claim.
+    See "Scaled Real-T7 Ingestion - Milestone 5 Design" (Design
+    Correction Pass, section 2) for the full derivation.
     """
 
     def __init__(self, db: Session):
@@ -366,7 +383,11 @@ class WorkerClaimService:
             self.db.execute(
                 update(SourceInstance)
                 .where(SourceInstance.id == candidate_id, *update_conditions)
-                .values(claimed_by=worker_id, claimed_at=datetime.now(UTC))
+                .values(
+                    claimed_by=worker_id,
+                    claimed_at=datetime.now(UTC),
+                    claim_generation=SourceInstance.claim_generation + 1,
+                )
                 .returning(SourceInstance.id)
             ).first()
             is not None
@@ -378,16 +399,32 @@ class WorkerClaimService:
         self.db.commit()
         return self.db.get(SourceInstance, candidate_id)
 
-    def release_source_instance_claim(self, instance_id: int) -> None:
-        """Clears a SourceInstance's identity-resolution claim. Does
-        NOT touch content_identity_group_id - that remains write-once,
-        set only via ContentIdentityService.assign_content_identity."""
-        self.db.execute(
-            update(SourceInstance)
-            .where(SourceInstance.id == instance_id)
-            .values(claimed_by=None, claimed_at=None)
+    def release_source_instance_claim(self, instance_id: int, *, claim_generation: int) -> bool:
+        """Clears a SourceInstance's identity-resolution/archive-
+        processing claim, fenced to `claim_generation` (Milestone 5) -
+        exactly mirroring `release_content_identity_group_claim`'s
+        Milestone-4 hardening. Does NOT touch content_identity_group_id
+        - that remains write-once, set only via ContentIdentityService.
+        assign_content_identity.
+
+        Returns `True` if this call's generation still matched (a real
+        release happened) or `False` if the row had already moved to a
+        later generation (a stale, safe no-op - never a raised
+        exception, never a wrongful clear of a newer owner's claim)."""
+        applied = (
+            self.db.execute(
+                update(SourceInstance)
+                .where(
+                    SourceInstance.id == instance_id,
+                    SourceInstance.claim_generation == claim_generation,
+                )
+                .values(claimed_by=None, claimed_at=None)
+                .returning(SourceInstance.id)
+            ).first()
+            is not None
         )
         self.db.commit()
+        return applied
 
     def claim_source_instance_for_archive_processing(
         self,
@@ -465,7 +502,11 @@ class WorkerClaimService:
             self.db.execute(
                 update(SourceInstance)
                 .where(SourceInstance.id == candidate_id, *update_conditions)
-                .values(claimed_by=worker_id, claimed_at=datetime.now(UTC))
+                .values(
+                    claimed_by=worker_id,
+                    claimed_at=datetime.now(UTC),
+                    claim_generation=SourceInstance.claim_generation + 1,
+                )
                 .returning(SourceInstance.id)
             ).first()
             is not None

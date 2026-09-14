@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from shutil import disk_usage
 from zipfile import ZipFile, is_zipfile
@@ -15,7 +16,14 @@ class ArchiveExtractor:
     HARD_FREE_SPACE_BYTES = 10 * 1024**3
     PREFERRED_FREE_SPACE_RATIO = 0.10
 
-    SUSPICIOUS_EXPANSION_RATIO = 100
+    # SUSPICIOUS_EXPANSION_RATIO removed (Milestone 5 design correction,
+    # gap register item 7): it was never given defined behavior by any
+    # prior design pass and was never read anywhere in this class - only
+    # HARD_EXPANSION_RATIO was ever enforced. Inventing new "soft
+    # warning" semantics for it now would be scope creep beyond
+    # resolving the dead code; a future, separate design pass remains
+    # free to propose a real soft-expansion-ratio signal if a genuine
+    # need emerges.
     HARD_EXPANSION_RATIO = 1000
 
     def extract(
@@ -58,6 +66,7 @@ class ArchiveExtractor:
             self._validate_disk_space(archive, destination)
 
             archive.extractall(destination)
+            self._audit_extracted_file_types(destination)
 
             return self._discover_extracted_files(archive, destination)
 
@@ -168,6 +177,7 @@ class ArchiveExtractor:
             self._validate_7z_disk_space(members, destination)
 
             archive.extractall(destination)
+            self._audit_extracted_file_types(destination)
 
             return self._discover_extracted_7z_files(members, destination)
 
@@ -181,10 +191,41 @@ class ArchiveExtractor:
         Symlinks are rejected outright: py7zr recreates real OS symlinks on
         extraction (ZipFile does not), so an archive-controlled symlink
         could otherwise point outside the destination.
+
+        CORRECTED FINDING (Milestone 5 implementation - the original
+        design pass's claim, based on reading py7zr's source only, was
+        empirically wrong and is corrected here): `py7zr.FileInfo` - the
+        actual public dataclass `SevenZipFile.list()` returns, verified
+        directly by introspecting a real instance - has exactly the
+        fields `filename/compressed/uncompressed/archivable/
+        is_directory/is_file/is_symlink/creationtime/crc32`. There is
+        NO `is_junction` and NO `is_socket` field on it (those names
+        exist only on a DIFFERENT, internal py7zr class used during
+        header parsing, never on the object this codebase actually
+        receives) - code that referenced them raised `AttributeError`
+        immediately, caught by this project's own regression suite.
+        `FileInfo.__post_init__`'s own docstring confirms the correct
+        model: "a file can't simultaneously be a directory, a regular
+        file, or a symlink, but it's allowed to be none of these (e.g.
+        a junction or a socket)" - i.e. py7zr represents a junction,
+        socket, or any OTHER special type it does not name via a
+        SINGLE shared signal: all three of `is_directory`/`is_file`/
+        `is_symlink` being `False` together. Rejecting exactly that
+        combination is therefore MORE robust than naming junction/
+        socket individually - it fails closed for any such member
+        type, named or not, without depending on library internals
+        this codebase cannot see. The general fail-closed backstop for
+        this residual category is also `_audit_extracted_file_types`,
+        below.
         """
         for member in members:
             if member.is_symlink:
                 raise ValueError(f"Unsafe 7Z member: symlink {member.filename}")
+            if not (member.is_directory or member.is_file):
+                raise ValueError(
+                    f"Unsafe 7Z member: neither a directory, file, nor symlink "
+                    f"(a junction, socket, or other special type): {member.filename}"
+                )
 
             target = (destination / member.filename).resolve()
 
@@ -261,6 +302,21 @@ class ArchiveExtractor:
         return discovered
 
     # -- shared ------------------------------------------------------------
+
+    def _audit_extracted_file_types(self, destination: Path) -> None:
+        """Fail-closed backstop (Milestone 5 design correction): verifies
+        the ACTUAL on-disk result of extraction, independent of which
+        library/version produced it. Every entry under `destination`
+        must be a regular file or a directory - anything else (a
+        symlink that should never have existed, a socket, a FIFO, a
+        device, or any future entry type this codebase has not yet
+        considered) fails closed rather than being silently accepted.
+        `lstat`, never `stat` - a symlink that should never exist must
+        never be followed to judge the safety of what it points at."""
+        for path in destination.rglob("*"):
+            entry_stat = path.lstat()
+            if not (stat.S_ISREG(entry_stat.st_mode) or stat.S_ISDIR(entry_stat.st_mode)):
+                raise ValueError(f"unsafe extracted entry type at {path}")
 
     def _calculate_expansion_ratio(
         self,

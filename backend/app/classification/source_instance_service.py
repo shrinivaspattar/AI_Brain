@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.models.provenance_link import ProvenanceLink, ProvenanceLinkKind
-from app.models.source_instance import SourceInstance
+from app.models.source_instance import RiskTierEstimated, SourceCategory, SourceInstance, WorkloadCategory
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,7 +34,18 @@ class SourceInstanceService:
         member_path: str | None,
         evidence_snapshot: dict,
         chain: list[ProvenanceStep],
+        source_category: SourceCategory | None = None,
+        workload_category: WorkloadCategory | None = None,
+        risk_tier_estimated: RiskTierEstimated | None = None,
     ) -> SourceInstance:
+        """`source_category`/`workload_category`/`risk_tier_estimated`
+        (Milestone 5 addition, all optional, default `None` preserving
+        every existing caller's behavior unchanged): dedicated,
+        queryable classification columns - see `SourceInstance`'s own
+        docstring for why these are NEVER folded into
+        `evidence_snapshot`. Set exactly once, at creation, same
+        write-once contract as every other immutable field this method
+        already writes."""
         if not chain:
             raise ValueError(
                 "A SourceInstance requires at least one ProvenanceLink "
@@ -53,6 +64,9 @@ class SourceInstanceService:
             root_t7_path=root_t7_path,
             member_path=member_path,
             evidence_snapshot=evidence_snapshot,
+            source_category=source_category,
+            workload_category=workload_category,
+            risk_tier_estimated=risk_tier_estimated,
         )
         self.db.add(instance)
         self.db.flush()  # assigns instance.id without committing yet

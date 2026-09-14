@@ -2104,6 +2104,109 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       real-T7 execution — each subsequent milestone remains its own,
       separately authorized step.
 
+- [x] Scaled Real-T7 Ingestion — Implementation Milestones 1–4 —
+      **committed** (`cc8dbec` schema/model, `4709ffd` batch creation +
+      deterministic selection, `ca3ab4e` resource guard + batch
+      runtime/state control, `6513948` batch-aware worker claims +
+      generation-fenced reservations), each independently reviewed and
+      separately authorized. 861 tests passed, 0 skipped as of the
+      Milestone 4 commit. `aibrain` remains at `fd9f81672e59`
+      (unmigrated) — every milestone's migration has been applied only
+      to `aibrain_test`; real-T7 access remains completely closed
+      throughout. See the individual commit messages and
+      `AI_Brain_Architecture.md`'s corresponding sections for each
+      milestone's exact scope.
+
+- [ ] Scaled Real-T7 Ingestion — Milestone 5 Design: Archive Processing
+      / Extraction — **design-only pass produced, not yet reviewed or
+      frozen**. Sits on top of the already-frozen implementation design
+      (`2fab4b3`) and the four committed milestones above; makes the
+      **already-existing, already-tested** archive pipeline from the
+      earlier "Controlled T7 -> AI_Brain Ingestion Design" chain
+      (`ArchiveExtractor`, `ArchiveProcessingService`, `ProvenanceLink`)
+      batch-aware and envelope-honest — explicitly not a from-scratch
+      redesign of archive extraction.
+
+      Confirms by reading the code directly (not assumed): extraction
+      is atomic per format (`extractall()`, no mid-write interruption
+      point), crash-resumability already exists via idempotency (not
+      transactional wrapping) through `_find_existing_member`, and
+      nested-archive recursion/provenance-chain construction already
+      work. Identifies the concrete gaps Milestone 5 must actually
+      close: the archive claim call site doesn't yet pass
+      `classification_run_id` (Milestone 4 already added the parameter
+      it needs); the current extraction destination
+      (`workspace_root/archive_<id>/depth_<n>_<stem>`) doesn't match
+      the frozen `_staging/<source_instance_id>/` isolation-and-cleanup
+      model; member-level classification
+      (`source_category`/`workload_category`/`risk_tier_estimated`) is
+      specified but not wired into the member-creation loop; and
+      `SourceInstance.risk_tier_actual` doesn't exist yet.
+
+      Freezes a reconciled staging/promotion model (staging root keyed
+      by the root archive's durable `SourceInstance.id`, nested
+      subdirectories named by a stable hash of each member's own full
+      internal path rather than an attacker/data-controlled string),
+      an envelope pre-flight/reconciliation algorithm generalized to
+      whole recursive claim attempts (not per nested level), and an
+      unconditional staging-cleanup rule at both the start and end of
+      every claim attempt.
+
+      **Design Correction Pass applied — the blocking finding is now
+      resolved at the design level.** Review correctly rejected the
+      original pass's proposed resolution for the `SourceInstance`
+      fencing gap (add the column, OR accept the risk with a shorter
+      lease) — a shorter lease narrows the race window but does not
+      remove the underlying correctness dependency. The correction
+      freezes a full `SourceInstance.claim_generation` design
+      (durable column, fenced acquisition/release, unchanged
+      stale-recovery mechanism), generalizing `ContentIdentityGroup`'s
+      Milestone 4 pattern exactly — remaining work is implementation-
+      only (one migration, two call-site updates). The same pass
+      empirically confirmed ZIP's symlink-mode extraction behavior
+      (a synthetic reproduction proved `extractall()` never creates a
+      real symlink) and, by reading `py7zr` 1.1.3's own source
+      directly, found and closed two previously-unknown, concrete
+      issues: `is_junction` (Windows-junction) members were never
+      checked by the existing 7z-member validation, and `is_socket`
+      members — which `py7zr` itself silently declines to write — would
+      have crashed the existing file-discovery step with an uncaught
+      `FileNotFoundError`. A general, library-version-independent
+      post-extraction file-type audit (regular files and directories
+      only, verified via `lstat`) closes the remaining irreducible
+      uncertainty (`py7zr` exposes no distinct hardlink flag) as a
+      fail-closed backstop. The `max_depth`-exceeded outcome is now an
+      exact, frozen terminal state (`FAILED`/`OVERSIZED_OR_EXPANSION_
+      LIMIT`/`retryable=False`), member classification has exact
+      verified function calls (with an explicit confirmation that
+      archive membership is never treated as a backup/sync/snapshot
+      signal), `SourceInstance.risk_tier_actual`'s exact shape and
+      input formula are specified, the dead `SUSPICIOUS_EXPANSION_
+      RATIO` constant is recommended for removal rather than given
+      invented semantics, and the archive-processing lease question is
+      tied to the SAME already-acknowledged per-class calibration gap
+      the numeric pass already named for other envelope fields — never
+      a newly-invented number. All eight original gaps now carry an
+      explicit final disposition (design-resolved, or a named,
+      bounded implementation-only remainder) rather than an open
+      question; all fifteen mandatory invariants were re-reviewed
+      against the corrected design — none weakened, one (zombie-worker
+      protection) newly satisfied for `SourceInstance`, four
+      strengthened by an added independent verification layer.
+
+      See `AI_Brain_Architecture.md`'s "Scaled Real-T7 Ingestion —
+      Milestone 5 Design: Archive Processing / Extraction" section for
+      the full specification, including the corrected claim/generation
+      design (section 2), the archive-member safety findings (section
+      4a), the frozen `max_depth` outcome (section 13), the resolved
+      gap register (section 19), the updated acceptance criteria
+      (section 20), and the invariant re-review (section 21).
+
+      **This pass authorizes no code, no migration, no test-code
+      changes, and no real-T7 access.** **Next gate, not yet opened**:
+      either a further design-review round or a separate, explicit
+      implementation authorization for Milestone 5.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

@@ -72,7 +72,10 @@ class IdentityResolutionService:
             # group_id is already set (write-once, unaffected by
             # releasing claimed_by/claimed_at); on failure the instance
             # remains unresolved and eligible for a future retry claim.
-            self.claims.release_source_instance_claim(instance.id)
+            # Fenced to the generation this call itself was granted
+            # (Milestone 5) - a safe no-op if a stale-claim recovery has
+            # since reclaimed this row for a different worker.
+            self.claims.release_source_instance_claim(instance.id, claim_generation=instance.claim_generation)
 
         self.db.refresh(instance)
         return instance

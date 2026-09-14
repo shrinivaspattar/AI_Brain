@@ -304,8 +304,9 @@ def test_release_source_instance_claim_clears_claim_only(db: Session) -> None:
     WorkerClaimService(db).claim_source_instance_for_identity_resolution(
         worker_id="worker-a", lease_duration=timedelta(minutes=10)
     )
+    db.refresh(instance)
 
-    WorkerClaimService(db).release_source_instance_claim(instance.id)
+    WorkerClaimService(db).release_source_instance_claim(instance.id, claim_generation=instance.claim_generation)
 
     db.refresh(instance)
     assert instance.claimed_by is None

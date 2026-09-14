@@ -163,9 +163,41 @@ class SourceInstance(Base):
     SUPPORTING evidence (e.g. D0's declared size, a D1 duplicate-group
     id) - never a second, shadow copy of the classification decision
     itself, which would create two sources of truth for the same fact.
-    `risk_tier_actual` (the post-extraction counterpart) is deliberately
-    NOT added yet - nothing in this codebase computes it until a future
-    archive-extraction milestone exists to produce real evidence for it.
+    `risk_tier_actual` (added by Milestone 5) is the post-extraction
+    counterpart to `risk_tier_estimated` - NULLABLE, write-once,
+    reusing the same `RiskTierEstimated` enum (no new enum type). Per
+    the frozen numeric pass's "two-phase, honestly nullable" design, it
+    is populated only once real post-extraction evidence exists (member
+    count, max depth reached, measured expansion ratio) and stays NULL
+    if extraction fails before that evidence exists. **HONEST GAP,
+    flagged rather than silently resolved**: no numeric mapping from
+    that evidence to LOW/MEDIUM/HIGH/EXTREME has ever been frozen
+    anywhere in this design chain - `risk_tier_estimated`'s own frozen
+    spec explicitly left ITS thresholds as a future calibration
+    decision, and no design pass has since specified DIFFERENT
+    thresholds for the post-extraction inputs either. This milestone
+    therefore adds the column (satisfying the schema requirement) but
+    no code path in this codebase yet WRITES to it - inventing a
+    mapping now would violate the explicit "do not invent the deferred
+    numeric thresholds" instruction. Populating it is deferred to a
+    future, separately-authorized calibration pass, exactly like
+    `max_embeddings` for Class 1.
+
+    CLAIM GENERATION (added by Milestone 5, generalizing `ContentIdentity
+    Group.claim_generation` - Milestone 1 - to this model): `claim_
+    generation` increments by exactly 1 every time `WorkerClaimService.
+    claim_source_instance_for_identity_resolution` or `claim_source_
+    instance_for_archive_processing` grants a claim on this row -
+    fresh or a stale-reclaim, identical semantics to `ContentIdentity
+    Group`'s own fencing token. `release_source_instance_claim` requires
+    and fences on this value, closing a real ABA hole a delayed (not
+    merely crashed) worker could otherwise exploit: without this fence,
+    a zombie worker's own release call, arriving after stale-claim
+    recovery has already reclaimed the row for a different worker,
+    would wrongly clear that new worker's live claim. See "Scaled
+    Real-T7 Ingestion - Milestone 5 Design: Archive Processing /
+    Extraction" (Design Correction Pass, section 2) for the full
+    derivation.
     """
 
     __tablename__ = "source_instances"
@@ -267,6 +299,20 @@ class SourceInstance(Base):
     claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # Generation-fenced claim primitive (Milestone 5) - see class
+    # docstring. Identical shape/semantics to ContentIdentityGroup.
+    # claim_generation (Milestone 1).
+    claim_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+    # Post-extraction risk evidence (Milestone 5) - see class docstring.
+    # NULLABLE, write-once; no code path populates it yet (numeric
+    # thresholds remain an explicit, undecided calibration gap).
+    risk_tier_actual: Mapped[RiskTierEstimated | None] = mapped_column(
+        SQLEnum(RiskTierEstimated, name="risk_tier_estimated"), nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(

@@ -8498,6 +8498,1535 @@ sequence (schema/model design review) rather than jumping directly to
 real-T7 execution — each subsequent milestone in that sequence remains
 its own, separately authorized step.
 
+## Scaled Real-T7 Ingestion — Milestone 5 Design: Archive Processing / Extraction (DESIGN ONLY — no code, no migration, no real-T7 access authorized by this section)
+
+Design pass for Implementation Milestone 5, opened after Milestones
+1-4 (`cc8dbec`/`4709ffd`/`ca3ab4e`/`6513948`) were committed and
+reviewed separately. This section freezes the archive-processing
+lifecycle, staging/workspace contract, extraction-envelope
+reconciliation, crash/resume semantics, nested-archive rules, and
+failure taxonomy that a later, separately-authorized implementation
+pass must be reviewed against. **No implementation code, migration, or
+real-T7 access is authorized by this section** — see "Implementation
+acceptance criteria" at the end.
+
+**Design Correction Pass applied**: the initial pass correctly
+identified `SourceInstance`'s lack of claim-generation fencing as an
+open gap but proposed resolving it with either a schema addition OR a
+conservative lease as alternatives; review rejected the lease as a
+substitute correctness mechanism and required the fencing design
+itself. Sections marked "CORRECTED"/"RESOLVED"/"UPDATED" below reflect
+that correction round, applied directly to this same document rather
+than left as a separate patch, since this design has not yet been
+frozen or committed. Section 21 re-reviews all fifteen mandatory
+invariants against the corrected design; section 19 gives the final
+disposition of all eight original gaps.
+
+### 0. What already exists — read before designing anything new
+
+This is not a green-field design. A real, already-committed,
+already-tested archive pipeline exists from the earlier "Controlled T7
+-> AI_Brain Ingestion Design" chain (`6491dad`, `ce50875`, `4e6f405`),
+built and proven **before** the Scaled Real-T7 Ingestion batch system
+existed. Milestone 5's job is to make THIS existing pipeline
+batch-aware and envelope-honest — exactly the same shape of task
+Milestone 4 already completed for `WorkerClaimService` — never to
+redesign archive extraction from scratch. Files inspected in full for
+this pass:
+
+```
+app/ingestion/archive.py                        - ArchiveExtractor (the atomic extractall() wrapper)
+app/classification/archive_processing_service.py - ArchiveProcessingService (the recursive walker)
+app/models/provenance_link.py                    - ProvenanceLink (the ancestry chain)
+app/classification/source_instance_service.py    - SourceInstanceService.create_instance
+app/classification/content_identity_service.py   - ContentIdentityService (get_or_create_group / assign_content_identity)
+app/classification/workspace.py                  - write_workspace_content / find_existing_workspace_content
+app/classification/eligibility_service.py        - classify_eligibility (EXCLUDED/UNSUPPORTED/ELIGIBLE)
+app/models/ingestion_attempt.py                  - IngestionFailureCode vocabulary
+app/classification/worker_claim_service.py       - claim_source_instance_for_archive_processing (Milestone 4)
+app/models/source_instance.py, ingestion_batch.py, content_identity_group.py - already-frozen schema
+```
+
+**Exact existing mechanics this design builds on, unchanged unless
+stated otherwise:**
+
+- `ArchiveExtractor.extract(files, destination)` wraps `ZipFile.
+  extractall()`/`py7zr.SevenZipFile.extractall()` — each is confirmed,
+  by reading the code directly, to be a single atomic call per format:
+  no per-file interruption point exists between "extraction started"
+  and "extraction finished," matching the design's own explicit
+  instruction to treat this as ground truth, not an assumption.
+  Existing safety checks, unmodified: path-traversal rejection
+  (`target.resolve().is_relative_to(destination)` per member), a hard
+  expansion-ratio bomb guard (1000x, `HARD_EXPANSION_RATIO`), a hard
+  workspace-free-space reserve check (10GB, `HARD_FREE_SPACE_BYTES`,
+  computed from the archive's own declared member sizes), and (7z
+  only) explicit symlink-member rejection.
+- `ArchiveProcessingService._extract_recursive` already recursively
+  walks nested archives (`max_depth=10`), already builds the full
+  `ProvenanceLink` ancestry chain per member via `SourceInstanceService
+  .create_instance(..., chain=full_chain)`, already resolves each leaf
+  member's content identity via `ContentIdentityService.
+  get_or_create_group`/`assign_content_identity`, and already achieves
+  crash-resumability through **idempotency**, not transactional
+  wrapping: `_find_existing_member` checks for an existing
+  `SourceInstance` (keyed on `classification_run_id, root_t7_path,
+  member_path`) before creating one, so a re-run after a crash
+  completes or skips each member exactly once, never duplicating a row.
+- `claim_source_instance_for_archive_processing` already gained an
+  optional `classification_run_id` parameter in Milestone 4 (batch
+  scoping + RUNNING-only admission, re-checked in the claim's own
+  `UPDATE`) — but `ArchiveProcessingService.process_next_archive`
+  **does not yet pass it**. Wiring this one call site is Milestone 5's
+  first, smallest task.
+
+**What does NOT yet exist and is this milestone's actual scope**:
+batch-envelope integration (`max_extracted_bytes`/
+`extracted_bytes_consumed`), the frozen staging/promotion model from
+the numeric pass (the current code extracts directly into
+`workspace_root/archive_<id>/depth_<n>_<stem>`, not into an isolated,
+cleaned-up `_staging/` tree), member-level classification
+(`source_category`/`workload_category`/`risk_tier_estimated`, required
+by "### 11. Archive processing integration" above but not present in
+`_extract_recursive` today), and `SourceInstance.risk_tier_actual`
+(named in "### 5. Risk tier" above as this milestone's own future
+column — does not exist in the schema yet).
+
+### 1. Lifecycle / state model
+
+```
+IngestionBatch RUNNING
+    |
+    v
+claim_source_instance_for_archive_processing(classification_run_id=batch's run)
+    -- gains the classification_run_id argument this milestone adds to
+       the actual call site; RUNNING-admission already enforced inside
+       the claim's own UPDATE (Milestone 4, unchanged)
+    |
+    v
+[idempotent staging cleanup]  -- delete any pre-existing staging_root
+                                  for this SourceInstance's id (crash-
+                                  orphan cleanup, see section 6)
+    |
+    v
+PRE-FLIGHT: extracted-bytes envelope admission (section 6)
+    -- conditional UPDATE on IngestionBatch.extracted_bytes_consumed
+       using the ROOT archive's own declared (D0) size as the estimate
+    -- FAILS -> staging deleted (nothing written yet), claim released,
+       NO IngestionAttempt recorded (deferred, not failed - matches
+       the frozen numeric pass's EXTRACTED_BYTES_ENVELOPE_EXCEEDED
+       disposition exactly)
+    |
+    v  (admitted)
+RECURSIVE EXTRACTION  (existing _extract_recursive, unchanged shape)
+    for each level (root, then every nested archive found):
+        extractor.extract([this level's file], this level's staging dir)
+        for each member:
+            find-or-create SourceInstance + ProvenanceLink (idempotent)
+            classify member (source_category/workload_category/
+              risk_tier_estimated) - NEW this milestone, at creation time
+            if member is itself ARCHIVE: recurse (depth+1)
+            else: resolve content identity (existing mechanism, unchanged)
+    -- raises at any point -> caught by the OUTER _process_claimed_archive
+       try/except (existing shape, unchanged) -> classified via
+       _classify_extraction_failure -> durable FAILED IngestionAttempt
+       on the ROOT SourceInstance
+    |
+    v
+POST-EXTRACTION RECONCILIATION (section 6)
+    -- sum every real file's measured size across every recursion level
+       actually reached; reconcile IngestionBatch.extracted_bytes_consumed
+       from the declared estimate to the measured total (delta can be
+       +/-/0, never re-litigates the pre-flight admission decision)
+    |
+    v
+risk_tier_actual set on the ROOT SourceInstance from real evidence
+(member count, max depth reached, measured expansion ratio) - NULL if
+extraction failed before this evidence existed (section 5, unchanged
+from the frozen numeric pass)
+    |
+    v
+[unconditional staging cleanup]  -- delete staging_root regardless of
+                                     success or failure (section 6)
+    |
+    v
+durable IngestionAttempt (SUCCEEDED or FAILED) recorded on the ROOT
+SourceInstance  (existing mechanism, unchanged)
+    |
+    v
+release_source_instance_claim(instance.id)  (existing `finally` block,
+                                              unchanged - see the
+                                              fencing gap in section 17
+                                              below, which this pass
+                                              does NOT close)
+```
+
+**Terminal vs. recoverable states, stated explicitly** (mandatory
+invariant: "stop means STOP, never skip-and-continue" applies to
+*admission* decisions, never to an already-granted, atomic
+`extractall()` call already in flight — see section 16):
+
+- **Recoverable**: claim staleness (`claimed_at < stale_before` on the
+  ROOT `SourceInstance`), envelope-exhausted deferral (no attempt
+  recorded — the item is simply not yet processed, exactly like a
+  batch-selection-time deferral), any `FAILED` `IngestionAttempt`
+  marked `retryable=True` (a fresh claim attempt, same or later batch,
+  starts over from the idempotent-resume state).
+- **Terminal** (for THIS `ClassificationRun`'s archive claim): the
+  ROOT archive's `IngestionAttempt` outcome is `SUCCEEDED` — no further
+  claim of this root `SourceInstance` for archive processing is ever
+  needed again (matches the existing "already processed" exclusion via
+  `IngestionAttempt.outcome == SUCCEEDED` in the claim query,
+  unchanged). A `FAILED` attempt with `retryable=False` (none of the
+  current `_classify_extraction_failure` mappings set this today — all
+  existing archive failures are recorded `retryable=True` in the
+  current code) would also be terminal if introduced later; this
+  design does not change that default.
+
+### 2. Claim and generation rules — CORRECTED (Design Correction Pass)
+
+**Original position, superseded**: this section originally stated that
+`SourceInstance` has no `claim_generation` column and that archive
+claim safety rests on `claimed_by`/`claimed_at` staleness alone,
+recording the consequence as an accepted, open gap (former section 17).
+**Review correctly rejected this as a blocking gap, not an acceptable
+residual risk** — a shorter lease narrows the race window but does not
+remove the underlying correctness dependency on unconditional claim
+release. This section now freezes the closing design in full,
+generalizing Milestone 4's `ContentIdentityGroup.claim_generation`
+pattern to `SourceInstance`.
+
+**Durable generation field**:
+```
+SourceInstance.claim_generation: Integer, NOT NULL, default 0, server_default '0'
+```
+Identical shape to `ContentIdentityGroup.claim_generation` (Milestone
+1) — no new concept, the same fencing token generalized to a second
+model. A migration adding this column is required before Milestone 5
+implementation proceeds (out of scope for this design-only pass, per
+its strict boundaries — see the gap register's final disposition).
+
+**Claim acquisition** — both `claim_source_instance_for_identity_
+resolution` and `claim_source_instance_for_archive_processing` gain the
+fencing uniformly (the column lives on the model, not on one use case;
+identity-resolution claims share the exact same "large file, long
+hash time, plausible zombie window" hazard archive processing does,
+so fencing only the archive path would leave an inconsistent,
+partially-hardened model):
+```
+UPDATE source_instances
+SET claimed_by = :worker_id,
+    claimed_at = now(),
+    claim_generation = claim_generation + 1
+WHERE id = :candidate_id
+  AND (claimed_by IS NULL OR claimed_at < :stale_before)
+  [AND classification_run_id = :run_id
+   AND EXISTS (running-batch check)]   -- Milestone 4 additions, unchanged, composed unmodified
+RETURNING claim_generation
+-- the caller retains this returned value as :my_generation for the
+-- lifetime of its attempt, exactly matching ContentIdentityGroup's
+-- existing contract
+```
+This is the SAME statement Milestone 4 already added the batch-scoping
+`AND` terms to (section 2's admission/RUNNING-requirement bullets,
+retained below) — the generation increment is one more value in the
+same `SET` clause, not a separate statement, preserving the existing
+single-atomic-UPDATE claim shape exactly.
+
+**Release fencing** — `release_source_instance_claim` gains a REQUIRED
+`claim_generation` parameter, mirroring `release_content_identity_
+group_claim`'s Milestone-4 hardening exactly:
+```
+UPDATE source_instances
+SET claimed_by = NULL, claimed_at = NULL
+WHERE id = :instance_id AND claim_generation = :my_generation
+RETURNING id
+-- applied = a row was returned; False = safe no-op (stale generation),
+-- never a raised exception, never a wrongful clear of a newer owner's claim
+```
+Both existing call sites (`identity_resolution_service.py`'s `finally`
+block, `archive_processing_service.py`'s `finally` block) must pass
+`claim_generation=instance.claim_generation` — the exact same
+mechanical, zero-behavior-change-for-the-honest-case update Milestone
+4 already made for every `release_content_identity_group_claim` call
+site. This is an implementation-time call-site change; the CONTRACT is
+frozen here.
+
+**Stale-claim recovery** — no separate recovery service, exactly as
+already established for `ContentIdentityGroup`: the SAME claim query
+above that grants a fresh claim also reclaims a stale one, incrementing
+`claim_generation` in the identical statement. Recovery is authorized
+because it reads the row fresh under the claim's own `WHERE`
+re-evaluation at `UPDATE`-execution time (Postgres READ COMMITTED,
+unchanged reasoning from every other fenced claim in this codebase) —
+never because of a special-cased caller identity.
+
+**Zombie-worker behavior, the exact scenario from the review now
+closed**: worker A claims (generation N); A is delayed, not crashed;
+recovery reclaims to generation N+1 for worker B; A eventually finishes
+and calls `release_source_instance_claim(instance.id, claim_generation
+=N)` — this now matches ZERO rows (the row is at generation N+1), so
+A's release is a safe no-op. B's `claimed_by`/`claimed_at` are
+untouched. A third worker C cannot be admitted into B's in-progress
+work via A's stale release, because A's release no longer has any
+effect on the row at all. The three-way-concurrent-write scenario
+section 17 originally described as a real, load-bearing consequence of
+the unfenced release is now structurally prevented — not merely made
+less likely by a shorter lease.
+
+**Admission** (unchanged from the original pass): `claim_source_
+instance_for_archive_processing` must be called with `classification_
+run_id` set to the claiming worker's batch's `ClassificationRun.id` —
+the smallest concrete code change this section requires at the call
+site (`ArchiveProcessingService.process_next_archive`). `None` (the
+pre-Milestone-4 default) must never be used for a batch-driven archive
+worker.
+
+**Batch-RUNNING requirement** (unchanged): enforced entirely inside the
+claim's own `UPDATE` (Milestone 4, unchanged) — no separate check is
+added or needed in `ArchiveProcessingService` itself.
+
+**Lease policy — frozen mechanism, per-class calibration explicitly
+tied to an existing gap, never invented here** (closes review point 7):
+staleness remains exactly `claimed_at < now() - lease_duration` (the
+existing formula, unchanged) — `lease_duration` remains an explicit
+parameter to `process_next_archive` (already its shape today), never a
+hardcoded constant inside `ArchiveProcessingService`. The existing
+default, `timedelta(minutes=10)` — the same default every other claim
+method in this codebase already uses — remains the correct value ONLY
+for the smallest extractable archive class (Class 2, "SMALL <10MB" per
+the frozen numeric pass's policy table). For Classes 3-5 (MEDIUM/
+LARGE/EXTREME), a materially larger `lease_duration` is required
+before real-T7 execution — this is **not a new, separately-invented
+gap**: it is the SAME `CALIBRATION_REQUIRED`/`TBD at gate` numeric
+envelope the frozen numeric pass already named for those classes'
+`max_runtime`/`max_extracted_bytes`/`max_embeddings` fields, now
+explicitly recognized as covering claim `lease_duration` too, governed
+by the same future calibration gate — never a number fabricated by
+this design pass.
+
+### 3. Staging/workspace contract
+
+**Frozen naming, reconciling the numeric pass's `_staging/
+<source_instance_id>/` model with the recursion the current code
+already performs:**
+
+```
+staging_root(root_source_instance_id) =
+    workspace_root / "_staging" / f"archive_{root_source_instance_id}"
+
+nested_staging_dir(root_source_instance_id, full_member_path) =
+    staging_root(root_source_instance_id) / sha256(full_member_path).hexdigest()[:16]
+```
+
+- **Per-source isolation**: every staging path is namespaced under the
+  ROOT archive's own durable `SourceInstance.id` — stable across
+  retries/resumes (same DB row, reclaimed), never derived from a
+  worker id, timestamp, or attempt counter.
+- **Deterministic naming, collision-safe**: the current code's
+  `depth_{depth}_{archive_path.stem}` naming can collide (two sibling
+  nested archives sharing a stem at the same depth); this design
+  replaces it with a **stable hash of the member's own full internal
+  path** (`full_member_path`, already tracked by the existing
+  recursion) — deterministic across resumes, collision-free by
+  construction, and avoids passing an attacker/data-controlled string
+  (an archive member's own name) directly into a real filesystem path
+  component.
+- **No writes anywhere under the source corpus**: `staging_root` is
+  always rooted under `workspace_root` (an `AI_Brain`-owned directory,
+  never a T7 path) — `ArchiveExtractor.extract()` itself never receives
+  a T7 path as its `destination` argument, and nothing in this design
+  changes that.
+- **"Promotion," precisely defined** (refining, not contradicting, the
+  numeric pass's "staging -> promoted" phrasing, which was written
+  before the recursive, per-member-incremental persistence model was
+  fully elaborated): there is no single, all-or-nothing filesystem
+  "promotion" step. Each ELIGIBLE leaf member's raw bytes are copied to
+  their **permanent, content-identity-addressed** location
+  (`workspace_content_path(workspace_root, group_id, suffix)` — the
+  same, already-established convention loose files already use) at the
+  moment that member's identity is resolved, exactly as the existing
+  code already does via `write_workspace_content`. The **staging tree
+  itself** (the raw, as-extracted archive structure) is always
+  transient: it is never a place `Document`/`DocumentChunk` content is
+  read from later, and it is deleted unconditionally at the end of
+  every claim attempt (section 6) — "promotion" means "durable content
+  already lives at its permanent, content-addressed home before
+  staging is discarded," never "the staging directory becomes the
+  permanent home."
+
+### 4. Extraction safety — pre-flight algorithm
+
+**Pre-flight envelope calculation, exactly once per root claim attempt
+(not recomputed per nested level):**
+
+```
+1. estimated_bytes = the ROOT archive SourceInstance's own D0-declared
+   size (evidence_snapshot["d0_declared_size_bytes"], already captured
+   at selection time per Milestone 2's BatchCreationService - never a
+   fresh filesystem stat, since D0 evidence is what selection already
+   committed to)
+2. UPDATE ingestion_batches
+   SET extracted_bytes_consumed = extracted_bytes_consumed + :estimated_bytes
+   WHERE id = :batch_id
+     AND max_extracted_bytes IS NOT NULL
+     AND extracted_bytes_consumed + :estimated_bytes <= max_extracted_bytes
+   RETURNING extracted_bytes_consumed
+3. IF no row returned:
+     - delete staging_root(root_instance_id) if it exists (idempotent,
+       matches crash-orphan cleanup - see section 6)
+     - release_source_instance_claim(root_instance_id)
+     - record NOTHING on IngestionAttempt (deferred, not failed)
+     - set IngestionBatch.stop_reason = EXTRACTED_BYTES_ENVELOPE_EXHAUSTED
+       via BatchControlService.complete()/pause() per the batch's own
+       state-machine rules (Milestone 3, unchanged) - this design does
+       not add a new stop reason, it reuses the already-frozen one
+     - return (no extraction attempted)
+4. IF max_extracted_bytes IS NULL (a batch class admitting no archives,
+   or one that has deliberately opted out of the envelope check):
+     - skip step 2/3 entirely; proceed directly to extraction. A NULL
+       envelope is a real, meaningful "not applicable," never treated
+       as "unlimited" by accident (matches IngestionBatch's own frozen
+       column semantics).
+```
+
+**Declared vs. actual vs. peak staging usage — the three distinct
+quantities, per the frozen numeric pass, restated precisely for the
+recursive case:**
+
+```
+declared_member_bytes (per-level)  - ArchiveExtractor's OWN existing
+    _validate_disk_space computation (sum of member.file_size across
+    THAT level's central directory) - a per-level, workspace-disk-only
+    check, already implemented, UNCHANGED by this design. Distinct
+    from the BATCH-envelope estimate above, which uses the ROOT
+    archive's own compressed size, not a recursive sum of every
+    nested level's declared content (unknowable without opening every
+    nested archive first - not attempted).
+actual_durable_extracted_bytes (whole-claim-attempt total) - the sum,
+    across EVERY recursion level actually reached, of every real
+    extracted file's measured size (Path.stat(), exactly as
+    _discover_extracted_files/_discover_extracted_7z_files already
+    measure per level) - accumulated via a running total threaded
+    through _extract_recursive's existing recursion, reconciled to
+    IngestionBatch.extracted_bytes_consumed exactly ONCE, at the end
+    of the whole claim attempt (not per nested level - see below).
+peak staging usage - transient, workspace-disk-only, protected by
+    ArchiveExtractor's own existing HARD_FREE_SPACE_BYTES check at
+    EVERY level's extractall() call (unchanged) - never counted
+    against extracted_bytes_consumed, matching the frozen numeric
+    pass's "peak/transient staging usage... a live-disk-pressure
+    concern... NOT by extracted_bytes_consumed at all."
+```
+
+### 4a. Archive-member safety — resolved via direct verification (Design Correction Pass)
+
+The original pass left ZIP-symlink safety as an unverified stdlib
+assumption and py7zr hardlink/special-file behavior as fully unknown.
+Review required this be resolved before implementation, not carried
+forward as belief. Both were investigated directly against the actual
+installed libraries this codebase uses (`zipfile` stdlib, Python 3.12;
+`py7zr` 1.1.3) — read-only introspection and a disposable, non-T7,
+non-committed synthetic reproduction, never touching application code,
+test code, or real archives.
+
+**ZIP symlink-mode entries — CONFIRMED EMPIRICALLY, not merely
+believed**: a ZIP entry crafted with `external_attr` marking it as a
+symlink (`stat.S_IFLNK`) was extracted via `zipfile.ZipFile.
+extractall()` on this project's actual Python 3.12 runtime. Result: a
+plain REGULAR FILE was written, containing the intended symlink
+TARGET STRING as its literal byte content — `zipfile.extractall()`
+never recreates a real symlink from ANY entry, regardless of its
+Unix-mode `external_attr` bits, because the stdlib implementation does
+not interpret those bits at all for extraction purposes. This is now a
+confirmed fact about this project's actual runtime, not an assumption
+about "well-known stdlib behavior" — the exact reproduction (craft a
+`ZipInfo` with `external_attr = (stat.S_IFLNK | 0o777) << 16`, write it
+via `writestr`, extract, assert `stat.S_ISREG` on the result) is
+specified here precisely so it becomes a real, committed test at
+implementation time (see the corrected test matrix, section 18).
+
+**py7zr `FileInfo` — read directly from `py7zr/py7zr.py` (installed
+1.1.3), not guessed**: the public shape-flag surface is exactly five
+properties: `is_directory`, `is_file`, `is_symlink`, `is_junction`,
+`is_socket`. There is **no separate `is_hardlink` property**. Three
+concrete findings follow directly from reading the extraction dispatch
+code (`SevenZipFile.extractall()`'s internal branch on these flags):
+
+```
+is_socket   - py7zr's OWN extraction code explicitly skips writing
+              anything for a socket entry ("ignore special files" /
+              "pass  # TODO: implement me" in the actual source) - no
+              file is ever created for it. SAFE by the library's own
+              construction, BUT a real, previously-undiscovered bug
+              follows from this: `_discover_extracted_7z_files` (in
+              THIS codebase's ArchiveExtractor) does NOT skip
+              is_socket members - it unconditionally calls
+              `path.stat()` on every non-directory member, which would
+              raise an UNCAUGHT FileNotFoundError for a socket entry
+              py7zr silently declined to write. Concrete fix required:
+              `_validate_7z_members` must reject `is_socket` members
+              BEFORE calling extractall() (fail closed, matching the
+              existing is_symlink rejection precedent), closing the
+              crash at its root rather than letting discovery hit it.
+
+is_junction - Windows-junction recreation in py7zr's own extraction
+              code is explicitly gated to `sys.platform == "win32"`.
+              This project runs on Linux exclusively (confirmed: every
+              path in this codebase is a Linux filesystem path) - but
+              `_validate_7z_members` today checks ONLY `is_symlink`,
+              never `is_junction`. Concrete fix required: reject
+              `is_junction` members alongside `is_symlink` in the
+              SAME existing check, on the SAME defense-in-depth
+              reasoning (never trust a third-party library's exact
+              cross-platform fallback behavior for an archive-
+              controlled entry type, when explicitly rejecting it
+              costs nothing).
+
+hardlinks   - no distinct `is_hardlink` flag exists on the public
+              FileInfo API; a 7z-internal "hardlink to another archive
+              member" concept is referenced only inside a private
+              method (`_find_link_target`, docstring: "Find the target
+              member of a symlink OR hardlink member") whose naming
+              strongly suggests hardlink-shaped entries are modeled
+              via the SAME `is_symlink` flag already rejected -
+              substantially reducing, but not fully eliminating
+              (short of constructing and extracting a real
+              hardlink-bearing .7z, which this design-only pass does
+              not do), the original uncertainty.
+```
+
+**Fail-closed policy, per the review's explicit instruction** ("if
+behavior cannot be established confidently, specify an explicit
+fail-closed policy"): rather than trying to enumerate every unsafe
+MEMBER type pre-extraction across every library version (a moving
+target), this design adds a **post-extraction file-type audit** as the
+actual backstop, on top of (never instead of) the tightened
+pre-extraction member checks above:
+
+```
+after extractall() returns, for every path under the destination tree
+(os.walk, or equivalently iterating the already-known member list's
+resolved paths):
+    st = path.lstat()   # lstat, never stat - must not follow a
+                         # symlink that should never have existed
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+        raise ValueError(f"unsafe extracted entry type at {path}")
+        # -> caught by the existing outer try/except, classified as
+        #    MALFORMED_ARCHIVE (an archive that, despite passing
+        #    format validation, produced something never legitimate
+        #    to write) - staging deleted per section 12, claim
+        #    released, FAILED IngestionAttempt recorded
+```
+
+This verifies the ACTUAL on-disk result, independent of which library
+produced it or which version is installed - it closes the residual
+uncertainty from both `is_junction`'s Linux fallback behavior and the
+hardlink question directly, without depending on either being fully
+traced through third-party source. Combined with the tightened
+pre-extraction checks, this closes review point 3 completely: nothing
+is left as an unverified assumption, and anything genuinely unresolved
+(a truly novel entry type no one has considered) still fails closed
+rather than silently succeeding.
+
+### 5. Extraction algorithm
+
+```
+def extract_one_level(file, staging_dir):
+    # existing ArchiveExtractor.extract([file], staging_dir) - UNCHANGED.
+    # Atomic per format (finding already verified by reading the code
+    # directly, per this milestone's explicit instruction). Internal
+    # safety checks (traversal, expansion ratio, disk space, 7z-symlink
+    # rejection) already run BEFORE extractall() is called, inside this
+    # existing method, unmodified.
+    return extractor.extract([file], staging_dir)
+
+def extract_recursive(file, depth, ...):
+    if depth >= max_depth: raise (-> OVERSIZED_OR_EXPANSION_LIMIT, see
+                                    section 13's failure-taxonomy fix)
+    staging_dir = nested_staging_dir(root_id, full_member_path) if depth > 0
+                  else staging_root(root_id)
+    extracted = extract_one_level(file, staging_dir)          # atomic
+    running_total += sum(m.size for m in extracted if m is a real file)
+    for member in extracted (excluding the archive file itself):
+        # existing idempotent find-or-create + classification + recursion
+        # + identity-resolution shape, EXTENDED this milestone to also
+        # call classify_source_category/classify_workload_category/
+        # classify_risk_tier_estimated (already-existing functions from
+        # policy_evaluator.py, Milestone 2) at member-creation time -
+        # per "### 11. Archive processing integration" above, which
+        # already specifies this and is not yet wired into the code.
+        ...
+```
+
+No per-file interruption exists inside `extract_one_level` — a crash
+during the atomic `extractall()` call leaves the staging directory in
+an arbitrary, possibly-partial state, discovered and discarded (never
+trusted) by the idempotent-cleanup-then-fresh-extract step the NEXT
+claim attempt performs (section 6).
+
+### 6. Post-extraction reconciliation algorithm
+
+```
+1. actual_total = the running_total accumulated across the ENTIRE
+   recursive walk (every level actually reached, summed once)
+2. delta = actual_total - estimated_bytes   (from section 4's pre-flight;
+   can be positive, negative, or zero - the declared D0 size is NEVER
+   assumed equal to the true recursive extracted total, especially
+   once nested archives are involved, since D0 only ever observed the
+   ROOT archive's own compressed size)
+3. UPDATE ingestion_batches
+   SET extracted_bytes_consumed = extracted_bytes_consumed + :delta
+   WHERE id = :batch_id
+   -- a plain, UNCONDITIONAL correction (the admission decision already
+   -- happened in section 4's step 2; this only makes the reported
+   -- total accurate to what was REALLY written, exactly matching the
+   -- frozen "### 7. Extracted-bytes accounting" pattern, generalized
+   -- from one archive to a whole recursive tree)
+4. Mismatch outcome, made explicit (closing design area #7's "define
+   mismatch outcomes" requirement): reconciliation NEVER converts an
+   incomplete extraction into a reported success. If extract_recursive
+   raised at ANY point (steps 1-2 above never execute for that claim
+   attempt), the pre-flight reservation from section 4 remains at its
+   estimated value UNTIL the failure path (section 13) explicitly
+   releases it - reconciliation and failure-release are mutually
+   exclusive paths, never both run for the same attempt.
+```
+
+### 7. Member materialization / resume algorithm — CORRECTED (Design Correction Pass, exact wiring)
+
+Unchanged from the existing, already-proven `_extract_recursive` shape
+(see section 0). The original pass named this wiring in principle but
+did not cite exact signatures - the review required the exact
+integration to be resolved, not left as "call the existing
+classifiers." Verified directly against `policy_evaluator.py`'s actual
+function signatures:
+
+```
+member_source_category = classify_source_category(
+    root_t7_path=root_t7_path, member_path=full_member_path)
+    # physical shape ONLY (ARCHIVE if the member's own suffix is
+    # .zip/.7z/.gz/.rar, LOOSE_FILE otherwise) - never a processing-
+    # capability judgment, matching classify_source_category's own
+    # frozen docstring exactly
+
+member_workload_category = classify_workload_category(
+    root_t7_path=root_t7_path, member_path=full_member_path,
+    source_category=member_source_category)
+    # CONTAINER if member_source_category is ARCHIVE (a nested
+    # archive is never itself content); otherwise the member's own
+    # content-type nature from its suffix (TEXT_DOCUMENT/
+    # STRUCTURED_DATA/MEDIA/SOFTWARE/ENCRYPTED/UNKNOWN)
+
+member_risk_tier_estimated = classify_risk_tier_estimated(
+    source_category=member_source_category,
+    declared_size_bytes=member.size)
+    # NAMING NOTE, stated explicitly rather than silently glossed
+    # over: this function's parameter is named `declared_size_bytes`
+    # for its ORIGINAL (selection-time, pre-extraction) loose-file use
+    # case, where the size truly is an unverified declaration. For an
+    # archive MEMBER, by the time this call happens the member has
+    # ALREADY been extracted - `member.size` (from the existing
+    # DiscoveredFile, itself from Path.stat() inside
+    # _discover_extracted_files/_discover_extracted_7z_files) is a
+    # REAL, MEASURED value, not a declaration. This is naming friction
+    # only, never a semantic error: risk_tier_ESTIMATED remains "what
+    # is known before full pipeline processing" regardless of whether
+    # the size input happened to come from a declaration or a real
+    # measurement for this particular row.
+```
+
+**Physical category vs. workload category, preserved exactly as
+already frozen** (review point 5's explicit instruction): the
+distinction is not re-litigated here - `source_category` answers "what
+IS this member physically" (never opened further than a suffix check),
+`workload_category` answers "what kind of content is this," and
+neither is inferred from, or conflated with, the other. Both are set
+once, at member-creation time, on their own dedicated columns -
+`evidence_snapshot` remains exactly `{"discovered_during_extraction":
+True, "parent_source_instance_id": root_instance_id}`, unchanged, per
+the already-frozen "physical category vs JSONB" correction from
+Milestone 2.
+
+**`classify_backup_sync_context` is explicitly NOT called for archive
+members** (closing review point 5's second instruction: "do not infer
+backup/sync/snapshot semantics from archive membership"). That
+classifier remains the existing, project-wide stub (`always None`,
+Round 4 of the earlier design chain) regardless of whether a
+`SourceInstance` is a loose file or an archive member - being
+physically located inside an archive is never treated as a
+backup/sync/snapshot signal in this design, and this milestone adds no
+new logic that would make it one.
+
+**`SourceInstance.risk_tier_actual` — exact specification, resolving
+review point 4** (the original pass correctly identified the column
+does not exist yet, but the review required this be resolved against
+the frozen architecture, not left as a bare "implementation must add
+it"):
+
+```
+Column:  SourceInstance.risk_tier_actual: RiskTierEstimated | None
+         (reuses the EXISTING RiskTierEstimated enum - no new enum
+         type, no new Postgres type to create)
+Nullable: yes - NULL is a real, meaningful "no evidence yet," never
+         fabricated as a stand-in value (frozen numeric pass, section
+         5, unchanged)
+Written: EXACTLY ONCE, on the ROOT archive SourceInstance, at the end
+         of a SUCCESSFUL whole-claim-attempt extraction (the same
+         moment section 6's reconciliation completes) - write-once,
+         matching every other immutable-fact column convention already
+         established (evidence_snapshot, the three classification
+         columns, etc.)
+Inputs (real evidence, per the frozen numeric pass's own naming -
+"member count, nesting depth, measured expansion ratio"):
+    total_member_count   = count of every SourceInstance created or
+                            reused across the ENTIRE recursive walk
+    max_depth_reached     = the highest `depth` value actually recursed
+                            into during this claim attempt
+    measured_expansion_ratio = actual_durable_extracted_bytes (section
+                            6's reconciled total) / the root archive's
+                            own on-disk compressed size
+Mapping: NOT decided by this pass, matching the frozen numeric pass's
+         OWN explicit deferral ("Values: LOW | MEDIUM | HIGH | EXTREME.
+         Numeric boundaries are deliberately not decided here") - this
+         design resolves WHAT feeds the computation and WHEN it runs,
+         without inventing the thresholds risk_tier_estimated's own
+         frozen spec already left as a future calibration decision.
+         Extraction failing before this evidence exists (any FAILED
+         outcome, including the section 4a fail-closed audit and the
+         section 13 max_depth fix) leaves risk_tier_actual NULL,
+         exactly as the frozen numeric pass requires.
+```
+
+A migration adding this column is required before Milestone 5
+implementation proceeds (out of scope for this design-only pass - see
+the gap register's final disposition, same status as `SourceInstance.
+claim_generation` above).
+
+**Resume, restated precisely as the required invariant proof:**
+`_find_existing_member`'s lookup key (`classification_run_id,
+root_t7_path, member_path`) is unaffected by staging-directory
+cleanup/recreation (section 3) - an existing member row is found and
+its `evidence_snapshot`/classification columns are never touched
+(write-once, existing convention), regardless of how many times the
+underlying staging tree has been wiped and rebuilt by intervening
+crashed attempts. Re-extraction of already-resolved members' raw bytes
+on a resumed attempt is an accepted, existing inefficiency (full
+`extractall()` is unconditional per level), never a correctness
+concern - explicitly named here rather than left implicit.
+
+### 8. Nested archive rules
+
+- **Depth limit**: `max_depth` (existing parameter, default 10),
+  unchanged.
+- **Resource accounting**: batch-envelope admission/reconciliation
+  happens ONCE per root claim attempt (sections 4/6), summing every
+  level's measured bytes into one running total - never a separate
+  pre-flight/reconciliation pair per nested level (the nested archive's
+  own declared size is unknowable without opening it, and is already
+  implicitly included in its own DECLARED_MEMBER_BYTES the moment its
+  PARENT level's `extractall()` runs, since the nested `.zip`/`.7z`
+  file itself is one of the parent's real extracted files).
+- **Provenance construction**: unchanged (`chain_prefix`/`full_chain`,
+  existing).
+- **Crash recovery**: proven by induction, not special-cased per depth
+  - the SAME idempotent find-or-create/staging-cleanup/re-extract
+  mechanism applies uniformly at every recursion level, since
+  `extract_recursive` is structurally identical regardless of depth.
+- **Duplicate nested members**: generalizes cleanly from section 13
+  below - no additional mechanism needed.
+- **Archive-member classification**: identical classifiers applied at
+  every depth (a nested-archive member gets `source_category=ARCHIVE`
+  if it is itself `.zip`/`.7z`, `LOOSE_FILE` otherwise - exactly the
+  depth-0 rule, unconditionally generalized).
+
+### 9. Provenance rules
+
+Frozen relationship (already correct in the existing schema and
+`SourceInstanceService`, restated as the explicit contract this
+milestone must not disturb):
+
+```
+archive SourceInstance (root_t7_path=archive path, member_path=NULL)
+   |
+   +-- ProvenanceLink[0] = T7_FILE, path=root_t7_path
+   |
+   +-- ArchiveProcessingService._extract_recursive
+          |
+          +-- member SourceInstance (root_t7_path=SAME archive path,
+          |     member_path=full internal path)
+          |      |
+          |      +-- ProvenanceLink[0] = T7_FILE (same root path)
+          |      +-- ProvenanceLink[1] = ARCHIVE_MEMBER (this member's
+          |            own relative path within its immediate container)
+          |
+          +-- nested archive member (source_category=ARCHIVE)
+                 |
+                 +-- recurse: its OWN members get ProvenanceLink[2],
+                       [3], ... - one link per nesting level, root
+                       first, exactly matching ProvenanceLink's own
+                       frozen "T7 file -> archive -> nested archive ->
+                       member -> ..." docstring
+```
+
+Every physical occurrence (every `SourceInstance` row, at every depth)
+retains its own, complete, independently-queryable ancestry chain -
+`ProvenanceLink` rows are never shared or merged across
+`SourceInstance` rows, even when two members converge to the same
+`ContentIdentityGroup` (section 13).
+
+### 10. Resource / accounting rules
+
+Integration points with the already-frozen `IngestionBatch` envelope,
+stated exhaustively (design area #15):
+
+```
+max_source_bytes        - enforced at SELECTION time only (Milestone 2,
+                           unchanged) - the archive CONTAINER's declared
+                           size counts once, at admission; extraction
+                           never re-checks or re-charges this envelope.
+max_extracted_bytes     - THIS milestone's own envelope (sections 4/6).
+max_runtime_seconds     - unaffected by this design; BatchControlService's
+                           existing monotonic accounting (Milestone 3)
+                           is not extended or duplicated here.
+workspace free space    - ArchiveExtractor's OWN existing per-level
+                           HARD_FREE_SPACE_BYTES check (unchanged) is a
+                           SEPARATE, complementary layer to
+                           BatchResourceGuard's own workspace-disk check
+                           (Milestone 3) - the batch-level guard is the
+                           coarser, claim-admission-time gate; the
+                           extractor's own check is a second,
+                           extraction-time safety net using the
+                           SPECIFIC archive's own declared bytes. Both
+                           exist; neither replaces the other (same
+                           "primary + defense in depth" relationship
+                           already established between BatchCreationService's
+                           advisory lock and its DB UNIQUE index).
+batch state              - RUNNING-only claim admission (section 2);
+                           pause/abort behavior for IN-FLIGHT extraction
+                           is section 16's own topic.
+hard/soft resource stops - BatchResourceGuard is consulted BEFORE a new
+                           archive claim is attempted (the same
+                           "admission control signal only" role it
+                           already plays for embedding reservations,
+                           Milestone 4) - never duplicated inside
+                           ArchiveExtractor itself.
+```
+
+**Whether failed/discarded staging contributes to durable
+consumption**: **no.** A failed extraction's pre-flight reservation
+(section 4) is released in full (section 13) - the batch's durable
+`extracted_bytes_consumed` counter reflects only bytes from claim
+attempts that reached the reconciliation step (section 6), success or
+partial-nested-failure alike is undefined here since any exception
+anywhere in the recursive walk is caught by the SAME outer try/except
+(existing shape) and treated as a whole-attempt failure - there is no
+"partial success, partial reconciliation" outcome in this design.
+
+### 11. Crash / recovery rules
+
+```
+Crash BEFORE extraction (claim granted, pre-flight not yet attempted):
+    -> claim goes stale by claimed_at, recovered by the existing
+       claim-query mechanism (unchanged); the recovering worker's OWN
+       idempotent-staging-cleanup step (section 3/6) finds nothing to
+       clean (staging never existed) and proceeds normally.
+
+Crash DURING/AROUND extractall() (atomic call in flight):
+    -> staging directory left in an arbitrary, untrusted state.
+       NEVER read from directly by anything else in this codebase
+       (staging is never the source Document/DocumentChunk content is
+       read from - section 3). The recovering worker's idempotent
+       cleanup (section 6) deletes it unconditionally before its own
+       fresh extractall() call - no partial staging content is ever
+       trusted or reused across attempts.
+
+Crash AFTER extraction, BEFORE member persistence:
+    -> extracted_bytes_consumed's PRE-FLIGHT reservation (section 4)
+       is durably persisted (it was a real, committed UPDATE) but never
+       reconciled (section 6 never ran) - it remains at its estimated
+       value until a LATER successful attempt reconciles it, or a
+       LATER failed attempt explicitly releases it (section 13). No
+       member SourceInstance rows exist yet for this crash point by
+       definition (staging existed, but nothing was persisted to
+       Postgres) - the next attempt starts member creation from empty.
+
+Crash DURING member persistence (some members created, some not, for
+this specific claim attempt):
+    -> already the exact scenario the EXISTING idempotency mechanism
+       is proven to handle (section 0/7) - unchanged by this design.
+       A member with content_identity_group_id already set is skipped;
+       one without it is completed (re-hashed, re-resolved) using the
+       SAME existing SourceInstance row, never a new one.
+
+Stale claim recovery:
+    -> the SAME `claimed_at < stale_before` mechanism as every other
+       SourceInstance-level claim (unchanged) - see section 17 for the
+       one place this has a real, not-fully-closed consequence for
+       archive processing specifically (concurrent staging writes
+       under a too-short lease).
+
+Cleanup/reuse of abandoned staging:
+    -> idempotent delete-then-recreate, keyed on the ROOT SourceInstance's
+       durable id (section 3) - the SAME mechanism handles "abandoned
+       by a crash" and "abandoned by stale-claim recovery" identically,
+       since both produce the same observable state: a claimed-but-
+       incomplete archive whose staging tree (if any) predates this
+       attempt.
+```
+
+### 12. Cleanup rules
+
+```
+staging_root(root_instance_id) is deleted UNCONDITIONALLY at the START
+of every claim attempt (idempotent - a no-op if nothing exists) AND
+UNCONDITIONALLY at the END of _process_claimed_archive, in a `finally`
+block alongside the existing release_source_instance_claim call -
+covering success, every FAILED outcome, and (per section 16) the
+"batch paused/aborted concurrently but this extraction already
+completed" case identically, since none of those distinguish the
+cleanup path - only whether persistence/reconciliation already
+happened before cleanup runs.
+```
+
+Cleanup NEVER touches `root_t7_path` or anything under the real T7 -
+`ArchiveExtractor.extract()`'s `destination` argument is always a
+`workspace_root`-rooted path (section 3); nothing in this design adds
+a code path that deletes, moves, or writes to a T7 path, matching the
+mandatory "cleanup is workspace-only" invariant exactly.
+
+### 13. Failure taxonomy — max_depth outcome FROZEN (Design Correction Pass)
+
+Reusing the existing `IngestionFailureCode` vocabulary (already
+sufficient - no new enum value proposed by this design-only pass):
+
+```
+CORRUPT_INPUT              - not currently reachable from
+                             _classify_extraction_failure (it maps to
+                             MALFORMED_ARCHIVE for a bad ZIP/7z magic
+                             number instead) - this design does not
+                             change that mapping; CORRUPT_INPUT remains
+                             reserved for non-archive content
+                             (NormalizationService's own usage,
+                             unchanged).
+MALFORMED_ARCHIVE          - is_zipfile()/is_7zfile() returning False,
+                             or any other ValueError not matching the
+                             expansion-ratio message - unchanged.
+OVERSIZED_OR_EXPANSION_LIMIT - expansion-ratio bomb (existing,
+                             unchanged) AND max_depth exceeded.
+EXTRACTION_ERROR_OTHER     - unchanged, the catch-all.
+T7_UNAVAILABLE             - FileNotFoundError - unchanged; see
+                             section 14 for drift specifically.
+INSUFFICIENT_DISK_SPACE    - OSError from ArchiveExtractor's own
+                             workspace-disk check - unchanged. Distinct
+                             from a batch-envelope-exhausted deferral
+                             (section 4), which records NO
+                             IngestionAttempt at all - this code is
+                             reserved for the extractor's OWN internal
+                             refusal, a genuine attempted-and-failed
+                             outcome.
+PERMISSION_DENIED          - unchanged.
+```
+
+**`max_depth`-exceeded — exact terminal outcome, frozen, not left to
+"implementation cleanup"** (review point 2's explicit requirement):
+today, `_extract_recursive` raising at the depth check falls through
+`_classify_extraction_failure`'s generic `ValueError` branch (which
+only special-cases the expansion-ratio message) into `MALFORMED_
+ARCHIVE` - semantically wrong, since a too-deeply-nested archive is
+not unreadable or corrupt, it is a structural limit deliberately being
+enforced. The frozen outcome:
+
+```
+outcome:       FAILED (never SUCCEEDED, never silently truncated -
+               reconciliation and risk_tier_actual assignment,
+               sections 6/7, both explicitly require a SUCCESSFUL
+               whole-claim-attempt to have completed first, so a
+               depth-limit failure structurally cannot leave either
+               looking like a success)
+failure_code:  OVERSIZED_OR_EXPANSION_LIMIT (reusing the existing
+               value, grouped with the expansion-ratio bomb guard as
+               the SAME category of frozen, deliberate hard structural
+               limit - never MALFORMED_ARCHIVE, never CORRUPT_INPUT).
+               A dedicated new enum value (e.g. a hypothetical
+               ARCHIVE_DEPTH_LIMIT_EXCEEDED) would be more precise,
+               but `IngestionFailureCode` is a Postgres ENUM type -
+               adding a value requires `ALTER TYPE ... ADD VALUE`, a
+               migration, forbidden by this design-only pass's strict
+               boundaries. OVERSIZED_OR_EXPANSION_LIMIT is the correct
+               choice available WITHOUT one; if a future pass judges
+               the grouping too coarse, splitting it is its own,
+               separate, small schema decision - not invented here.
+retryable:     False. Unlike a transient condition (disk temporarily
+               full, Ollama briefly unreachable), max_depth exceeded is
+               a DETERMINISTIC property of this specific archive's own
+               structure against a fixed configuration value - retrying
+               with the SAME max_depth against the SAME archive fails
+               identically, every time. (Note, scoped narrowly and not
+               decided here: the CURRENT code hardcodes retryable=True
+               for every archive failure category uniformly - this
+               correction addresses ONLY the max_depth outcome
+               specifically, per the review's own scoped request; it
+               does not re-litigate retryable semantics for
+               MALFORMED_ARCHIVE/EXTRACTION_ERROR_OTHER/etc., which
+               remain exactly as they already are.)
+distinctness:  never UNSUPPORTED (a ContentPipelineState value for
+               MEMBER content eligibility, not an IngestionAttempt
+               outcome for a container-level structural refusal) and
+               never EXCLUDED (a policy decision made before any
+               attempt, never the result of one) - a FAILED
+               IngestionAttempt with this failure_code is the sole,
+               unambiguous representation.
+```
+
+Required acceptance/test item (added to sections 18/20 below): a
+synthetic archive nested exactly `max_depth` levels deep must produce
+`IngestionAttempt.outcome=FAILED`, `failure_code=OVERSIZED_OR_
+EXPANSION_LIMIT`, `retryable=False`, and `SourceInstance.risk_tier_
+actual IS NULL` on the root instance - asserted directly, not merely
+that "an exception was raised somewhere."
+
+**EXCLUDED / UNSUPPORTED / FAILED, kept distinct exactly as already
+established** (mandatory invariant): `.rar`/`.gz` and any other
+non-extractable archive format never reach `ArchiveProcessingService`
+at all - they are excluded at the SELECTION layer
+(`BatchClassPolicy.require_extractable_archive`, Milestone 2,
+unchanged), never claimed, never attempted, never recorded as FAILED.
+A member's own eligibility (EXCLUDED for `.c9r`, UNSUPPORTED for a
+known-unsupported member extension) is decided by the SAME
+`classify_eligibility` function loose files already use, unchanged -
+archive membership does not create a second eligibility vocabulary.
+
+### 14. T7 unavailable / drift
+
+Reusing the frozen "### 10. Live corpus drift" four-way outcome
+taxonomy verbatim, applied to archive containers specifically:
+
+```
+OBSERVED_AT_SELECTION          - D0's declared (path, size) at batch
+                                  admission - evidence only, never
+                                  re-validated as if it were current.
+SOURCE_PRESENT_AT_EXECUTION    - archive still exists, is still a
+                                  valid zip/7z, metadata roughly matches.
+SOURCE_CHANGED_AFTER_SELECTION - archive still opens, but its actual
+                                  declared member sizes/count differ
+                                  from D0's single declared-size
+                                  estimate - NOT an error; extraction
+                                  proceeds normally, and the ONLY
+                                  consequence is that section 4's
+                                  pre-flight estimate (D0's declared
+                                  size) may diverge further than usual
+                                  from section 6's measured actual -
+                                  reconciliation (never the pre-flight
+                                  estimate) is what stays authoritative.
+SOURCE_MISSING_AT_EXECUTION    - the existing FileNotFoundError ->
+                                  T7_UNAVAILABLE path, unchanged.
+```
+
+Frozen invariant, restated for archives specifically: **the bytes
+actually extracted are authoritative for every member's content
+identity; D0's declared size is selection-time evidence for admission
+and pre-flight estimation ONLY, never re-asserted as fact once real
+extraction has occurred.**
+
+### 15. Duplicate archive members
+
+Three cases, all shown to generalize cleanly from the already-proven
+loose-file mechanism - **no new mechanism required**:
+
+```
+1. Two DIFFERENT member paths within ONE archive, byte-identical
+   content: two SourceInstance rows (different member_path), two
+   independent ProvenanceLink chains, ONE ContentIdentityGroup (hash
+   convergence) - identical in shape to two loose files with the same
+   content ("same content, new occurrence").
+
+2. The SAME member re-observed by re-processing the SAME archive:
+   - within ONE classification_run_id: _find_existing_member prevents
+     a duplicate row (idempotent resume, section 7).
+   - across DIFFERENT classification_run_ids (a later DiscoveryRun/
+     batch re-selecting the same T7 archive path): a NEW SourceInstance
+     is correctly created (matches BatchCreationService's own
+     discovery-run-scoped eligibility precedent, Milestone 2) and its
+     member, once re-extracted and re-hashed, converges to the SAME
+     ContentIdentityGroup as before.
+
+3. Identical content in TWO ENTIRELY DIFFERENT archives: each gets its
+   own root_t7_path + member_path + independent ProvenanceLink chain
+   (rooted at its OWN archive's T7_FILE), converging to ONE
+   ContentIdentityGroup by hash - exactly what content-identity
+   convergence exists for.
+```
+
+A crafted archive with two central-directory entries claiming the SAME
+internal path (`zipfile`'s own last-write-wins behavior on
+`extractall()`) is absorbed by the same convergence mechanism: both
+central-directory entries produce their own `DiscoveredFile` record,
+both read the SAME final (overwritten) on-disk bytes, both converge to
+ONE `ContentIdentityGroup` - safe, not a gap, requiring no new logic.
+**Content identity convergence never merges or deletes a
+`SourceInstance`/`ProvenanceLink` row** in any of these cases - only
+`content_identity_group_id` is set (write-once, existing mechanism) on
+each independently-existing row.
+
+### 16. Pause / abort behavior around an atomic operation
+
+Restating the mandatory invariant precisely, since "extraction is
+atomic" and "stop means STOP" can otherwise be read as contradictory:
+
+```
+Batch pauses/aborts BEFORE a new archive claim is attempted:
+    -> the claim's own RUNNING-admission check (section 2, Milestone 4,
+       unchanged) refuses the claim outright. No extraction begins.
+
+Batch pauses/hard-stops WHILE an extractall() call is already
+synchronously in flight (the claim was already granted; extraction is
+running in this worker's own process, uninterruptible mid-call, per
+the frozen atomicity finding):
+    -> the in-flight extraction is ALLOWED TO FINISH. Neither this
+       design nor anything in this codebase spawns/kills worker
+       processes - there is no mechanism to interrupt a running
+       extractall() call, and pretending otherwise would contradict
+       the frozen atomicity finding this design was explicitly told to
+       respect. "Stop means STOP" governs the NEXT admission decision
+       (the next claim, the next pre-flight envelope check), never an
+       already-granted, already-atomic operation.
+    -> IF extraction then SUCCEEDS: reconciliation (section 6) and
+       member persistence proceed normally and are PERSISTED - already-
+       completed, correct work is never discarded merely because the
+       batch's own state changed concurrently (exactly matching
+       BatchControlService.abort()'s own documented position: "does
+       NOT clean up any active extraction/embedding work in progress").
+    -> IF extraction then FAILS (for an unrelated reason, or because a
+       genuine hard-stop condition - e.g. workspace disk actually
+       ran out - manifested as an OSError): the existing failure path
+       (section 13) runs exactly as it would have regardless of batch
+       state; the pre-flight reservation is released (section 4/13).
+
+Operator aborts AFTER extraction has already completed (persisted):
+    -> no consequence to already-persisted SourceInstance/
+       ProvenanceLink/ContentIdentityGroup rows - those are durable,
+       immutable historical facts (existing invariant, unchanged) -
+       only NEW claims are refused going forward.
+```
+
+### 17. Claim fencing — RESOLVED (Design Correction Pass; see section 2)
+
+**Original position, superseded.** This section originally recorded an
+open, unclosed gap: `SourceInstance.release_source_instance_claim`
+cleared `claimed_by`/`claimed_at` unconditionally by `instance_id`
+alone, with no generation to fence on. The problem this identified,
+preserved here for the historical record of WHY the fix in section 2
+exists:
+
+**The concrete consequence, as originally worked through**: worker A
+claims a large archive; its extraction genuinely takes longer than
+`lease_duration` (archives can legitimately take far longer than a
+typical embedding call); stale-claim recovery grants the SAME archive
+to worker B, who begins extracting into the SAME deterministic
+`staging_root` (section 3); A, still genuinely running (not crashed -
+a true zombie, not a corpse), eventually finishes and calls its own
+`release_source_instance_claim(instance.id)` in its `finally` block -
+unconditionally clearing B's live claim, since the call had no
+generation to check against. A third worker C could then claim the
+SAME archive while B was still working, producing a genuine three-way
+concurrent write into one staging directory - not merely a
+lease-window-bounded race, but one A's own "harmless" cleanup call
+actively, deterministically reopened.
+
+**Review correctly rejected the proposed resolution** ("add the column,
+or accept bounded residual risk with a conservative lease") as
+insufficient - a shorter lease narrows the race window but does not
+remove the underlying correctness dependency on unconditional release,
+and the same invariant Milestone 4 judged worth a real fix for
+`ContentIdentityGroup` should apply consistently to `SourceInstance`.
+
+**Resolution, now frozen in section 2 above**: `SourceInstance` gains
+`claim_generation` (identical shape to `ContentIdentityGroup`'s),
+`release_source_instance_claim` gains a required, fenced
+`claim_generation` parameter, and both `SourceInstance`-level claim
+methods increment it on every grant (fresh or reclaim) in the same
+existing atomic `UPDATE`. Worker A's release above now matches zero
+rows once B has reclaimed the row to a new generation - a safe no-op,
+never a wrongful clear, never an opening for a third concurrent
+claimant. This is no longer an open gap; it is a frozen design
+requiring one new column and two small, mechanical call-site updates
+at implementation time (see the gap register's final disposition,
+section 19, and the acceptance criteria, section 20).
+
+### 18. Concurrency / adversarial test matrix — UPDATED (Design Correction Pass)
+
+```
+TRAVERSAL / UNSAFE MEMBERS
+  - member path containing ../.. escaping the staging root -> rejected
+    (existing ArchiveExtractor check, needs a LOCKING test, not just
+    reliance on the check existing)
+  - absolute member path (e.g. "/etc/passwd") -> rejected (existing
+    behavior is INCIDENTAL - Path's own "/" operator discards the left
+    side when the right is absolute, so is_relative_to() still catches
+    it - this design recommends a DEDICATED test proving this, not
+    relying on the side effect remaining true across a future Python
+    version)
+  - 7z symlink member -> rejected (existing, needs a locking test)
+  - 7z junction member -> rejected (NEW pre-extraction check this
+    design adds, section 4a - Windows-junction recreation is
+    win32-gated in py7zr, but this project runs on Linux; reject
+    unconditionally rather than trust the fallback path)
+  - 7z socket member -> rejected BEFORE extraction (NEW pre-extraction
+    check, section 4a - closes the real _discover_extracted_7z_files
+    FileNotFoundError crash bug found by this correction pass: py7zr
+    itself never writes a file for a socket entry, so the existing
+    discovery loop's unconditional path.stat() would otherwise raise
+    uncaught)
+  - ZIP "symlink-mode" member (external_attr S_IFLNK bits set) ->
+    CONFIRMED EMPIRICALLY (section 4a, reproducible): extractall()
+    writes a REGULAR file containing the symlink TARGET STRING as
+    content, never a real symlink - the exact reproduction from
+    section 4a becomes this test verbatim
+  - hardlink-shaped entry (7z) -> py7zr's public FileInfo API has no
+    is_hardlink flag (confirmed by reading py7zr/py7zr.py directly,
+    section 4a); construct the closest obtainable adversarial case and
+    confirm the post-extraction file-type audit (below) still fails
+    closed even if the pre-extraction member check cannot name the
+    entry precisely
+  - post-extraction file-type audit (NEW, section 4a's fail-closed
+    backstop) -> after any extractall() call, every entry under the
+    destination must be a regular file or directory (lstat, never
+    stat) - anything else raises, classified MALFORMED_ARCHIVE,
+    staging discarded, claim released; this is the general safety net
+    that does not depend on enumerating every unsafe member type by
+    name
+  - duplicate member names within one archive -> converges via content
+    identity, never corrupts (section 15)
+
+RESOURCE / ENVELOPE
+  - declared-size-exceeds-envelope -> deferred, no IngestionAttempt,
+    staging never created, claim released (section 4)
+  - actual extraction undershoots/overshoots declared estimate ->
+    reconciliation corrects the counter without re-litigating admission
+    (section 6)
+  - workspace disk exhausted mid-extraction -> ArchiveExtractor's own
+    existing OSError path (unchanged), INSUFFICIENT_DISK_SPACE
+  - expansion-ratio bomb -> existing HARD_EXPANSION_RATIO rejection
+  - max_depth exceeded, EXACTLY at the configured boundary -> FAILED,
+    OVERSIZED_OR_EXPANSION_LIMIT, retryable=False, risk_tier_actual
+    remains NULL on the root SourceInstance (section 13's frozen
+    outcome, asserted precisely, not just "an exception was raised")
+
+CORRUPTION / FORMAT
+  - corrupt/truncated zip or 7z -> MALFORMED_ARCHIVE
+  - unsupported archive format (.rar/.gz) -> never claimed (selection-
+    layer exclusion, unchanged)
+  - archive with zero members -> succeeds trivially, zero members
+    created, SUCCEEDED IngestionAttempt
+
+CRASH / RESTART / ZOMBIE (real PostgreSQL, real filesystem)
+  - crash before extraction -> stale-claim recovery, clean start
+  - crash mid-extractall() (simulated: kill the staging dir mid-write)
+    -> next attempt's idempotent cleanup discards it, re-extracts clean
+  - crash after extraction, before any member persisted -> reservation
+    remains estimated, next attempt starts member-creation from empty
+  - crash mid-member-persistence (some members done, some not) ->
+    existing idempotent resume (already covered by existing tests -
+    this design does not weaken that coverage, only re-verifies it
+    still holds with batch/envelope integration layered on)
+  - genuine zombie (not crashed) returns after stale-recovery granted
+    the SAME archive to a second worker -> the section 17 scenario,
+    now REQUIRED to prove the FIX, not measure the gap: worker A claims
+    (generation N), stale-recovery reclaims to generation N+1 for
+    worker B, A's own delayed `release_source_instance_claim(instance_
+    id, claim_generation=N)` call must be a no-op (zero rows matched);
+    assert B's `claimed_by`/`claimed_at`/`claim_generation` are
+    completely untouched by A's call - real PostgreSQL, mirroring
+    Milestone 4's own zombie-worker test shape exactly, generalized to
+    `SourceInstance`
+  - concurrent stale-claim recovery race for the SAME archive (two
+    workers both attempt to reclaim before either commits) -> exactly
+    one wins, generation advances by exactly 1, never 2 (mirrors
+    Milestone 4's `test_one_stale_recovery_wins_concurrently`,
+    generalized to `SourceInstance`)
+
+NESTED ARCHIVE
+  - archive-of-archives resumed mid-recursion -> proven by induction
+    (section 8), tested at depth 2+ explicitly, not just depth 0
+  - duplicate nested member across two different nested archives ->
+    converges via content identity (section 15)
+
+PROVENANCE
+  - duplicate ProvenanceLink rows never created on any resume path
+    (assert exact row count before/after a simulated crash-resume)
+
+CONCURRENCY (real PostgreSQL + real filesystem, separate
+sessions/processes)
+  - two workers race to claim two DIFFERENT archives in the SAME
+    RUNNING batch -> both succeed, zero cross-contamination (mirrors
+    Milestone 4's cross-batch claim race, applied within one batch)
+  - two workers race to claim the SAME archive (both attempt
+    concurrently, before either's claim commits) -> exactly one wins
+    (existing SKIP LOCKED mechanism, re-verified under this milestone's
+    added classification_run_id/RUNNING-admission conditions)
+  - batch pause/abort races a claim attempt -> RUNNING-admission wins
+    or loses cleanly (mirrors Milestone 4's pause-vs-claim race,
+    reused directly for the archive-claim query)
+  - concurrent reservation-vs-envelope race across MULTIPLE archives
+    claimed simultaneously against a small max_extracted_bytes ->
+    envelope never exceeded (mirrors Milestone 4's concurrent-
+    reservation-vs-max_embeddings test, applied to
+    extracted_bytes_consumed)
+
+T7 UNAVAILABLE / DRIFT
+  - archive deleted between selection and claim -> T7_UNAVAILABLE
+  - archive content changed (different bytes, same declared size in D0)
+    -> extraction proceeds, measured bytes/hash reflect the TRUE
+    current content, never the stale D0 estimate (section 14)
+
+STAGING CLEANUP
+  - staging deleted after SUCCEEDED, FAILED, and simulated-crash-then-
+    recovered paths - assert zero residual staging directories after
+    each
+```
+
+### 19. Unresolved gaps / open questions — FINAL DISPOSITION (Design Correction Pass)
+
+All eight gaps from the original pass, each given an explicit final
+disposition per review's classification. None remain silently deferred
+without an explicit status.
+
+1. **`SourceInstance` claim release has no generation-fencing** —
+   **RESOLVED (design-level).** Section 2 above freezes the full
+   `claim_generation` design for `SourceInstance`, generalizing
+   `ContentIdentityGroup`'s Milestone 4 pattern exactly: durable
+   column, fenced acquisition, fenced release, unchanged stale-recovery
+   mechanism, the zombie scenario now closed. **Remaining work is
+   implementation-only**: add the column (migration), thread the
+   parameter through both claim methods and `release_source_instance_
+   claim`, update the two existing call sites. A shorter lease is
+   explicitly rejected as a substitute correctness mechanism, per
+   review's instruction - the lease question (item 8 below) is
+   resolved independently, on its own merits, not as a stand-in fix
+   for this one.
+2. **py7zr hardlink/special-file behavior** — **RESOLVED (verified +
+   fail-closed backstop), per section 4a.** Direct inspection of
+   `py7zr/py7zr.py` (installed 1.1.3) confirms the public `FileInfo`
+   API's exact shape-flag surface (`is_directory`/`is_file`/
+   `is_symlink`/`is_junction`/`is_socket`, no `is_hardlink`), and
+   confirms two concrete, previously-unknown facts: `is_junction` is
+   not checked by the existing `_validate_7z_members` (a real gap, now
+   closed by extending that check) and `is_socket` entries, which
+   py7zr's own extraction silently skips, would crash `_discover_
+   extracted_7z_files`'s unconditional `path.stat()` with an uncaught
+   `FileNotFoundError` (a real, previously-undiscovered bug, now closed
+   the same way). The remaining irreducible uncertainty (no distinct
+   hardlink flag exists to check) is closed by the fail-closed
+   post-extraction file-type audit, which verifies the ACTUAL result
+   regardless of library internals.
+3. **ZIP symlink-safety** — **RESOLVED (confirmed empirically), per
+   section 4a.** A disposable, non-committed synthetic reproduction
+   (crafted `ZipInfo` with `external_attr` symlink mode bits, extracted
+   via this project's actual Python 3.12 `zipfile`) proved `extractall
+   ()` writes a regular file containing the target string, never a real
+   symlink. No longer a belief - a directly-observed fact, with the
+   exact reproduction steps specified so it becomes a real, committed
+   test at implementation time.
+4. **`max_depth`-exceeded misclassification** — **RESOLVED (frozen
+   outcome), per section 13.** Exact terminal state specified:
+   `FAILED`, `failure_code=OVERSIZED_OR_EXPANSION_LIMIT`,
+   `retryable=False`, `risk_tier_actual` remains NULL - never
+   `MALFORMED_ARCHIVE`, never confusable with `UNSUPPORTED`/`EXCLUDED`.
+   A dedicated new failure-code enum value was considered and
+   explicitly rejected (it would require a migration, forbidden by
+   this pass's boundaries) in favor of the correct existing value.
+5. **`SourceInstance.risk_tier_actual` absence** — **RESOLVED
+   (design-level), per section 7.** Exact column type (reuses
+   `RiskTierEstimated`, no new enum), nullability, write-once timing
+   (end of a successful whole-claim-attempt), and input formula (total
+   member count, max depth reached, measured expansion ratio from
+   section 6's reconciled total) are now fully specified. The frozen
+   numeric pass's own deferral of NUMERIC THRESHOLDS (LOW/MEDIUM/HIGH/
+   EXTREME boundaries) is correctly preserved as still-deferred - this
+   design does not invent those, matching `risk_tier_estimated`'s own
+   already-accepted gap. **Remaining work is implementation-only**: the
+   column migration itself.
+6. **Member-level classification unwired** — **RESOLVED (exact
+   wiring specified), per section 7.** Exact function calls, exact
+   parameters, and the `declared_size_bytes`-naming clarification (a
+   real, measured value for members, despite the parameter's
+   loose-file-era name) are now specified precisely, not left as "call
+   the existing classifiers." `classify_backup_sync_context` is
+   explicitly confirmed NOT invoked for archive members - archive
+   membership is never treated as a backup/sync/snapshot signal.
+   **Remaining work is implementation-only**: wiring the specified
+   calls into `_extract_recursive`.
+7. **`ArchiveExtractor.SUSPICIOUS_EXPANSION_RATIO` dead code** —
+   **RESOLVED (remove, do not invent new semantics).** The constant
+   was never given defined behavior by any prior design pass (unlike
+   `HARD_EXPANSION_RATIO`, which has a clear, frozen, enforced
+   meaning) - inventing a new "soft warning" tier for it now would be
+   scope creep beyond "resolve the dead code," not requested by this
+   correction and not decided here. Recommendation: delete the unused
+   constant at implementation time. A future, SEPARATE design pass
+   remains free to propose a real soft-expansion-ratio signal (e.g.
+   feeding `IngestionBatch.review_required`) if a real need for one
+   emerges - not proposed or decided by this pass.
+8. **Archive-processing `lease_duration`** — **RESOLVED (mechanism
+   frozen, per-class values tied to an existing calibration gap), per
+   section 2.** The staleness formula and parameter-based shape are
+   unchanged and frozen; the existing `timedelta(minutes=10)` default
+   is confirmed correct for the smallest extractable archive class
+   only. Larger classes' exact lease values are not invented here -
+   they are folded into the SAME already-acknowledged `CALIBRATION_
+   REQUIRED`/`TBD at gate` numeric-envelope gap the frozen numeric pass
+   already named for those classes' other envelope fields, never left
+   as a new, separately-undecided question.
+
+**Net effect**: every gap has an explicit design-level resolution or a
+named, bounded implementation-only remainder (a migration, a call-site
+update, or a wiring task) - none are open architectural questions any
+longer. Items 1 and 5 both require a migration; item 1's fencing logic
+and item 5's column can reasonably be added in the SAME schema-only
+implementation step, mirroring how Milestone 1 introduced multiple
+related columns together.
+
+### 20. Implementation acceptance criteria — UPDATED (Design Correction Pass)
+
+A later, separately-authorized Milestone 5 implementation must be
+reviewable against exactly these criteria (mirroring the discipline
+already applied to Milestones 1-4):
+
+```
+1. claim_source_instance_for_archive_processing is called with
+   classification_run_id set to the claiming batch's ClassificationRun.id
+2. RUNNING-only admission is proven under real PostgreSQL concurrency
+   (pause-vs-claim race), reusing Milestone 4's established pattern
+3. staging_root/nested_staging_dir naming matches section 3 exactly;
+   no archive-member-name is ever used directly as a path component
+4. pre-flight admission (section 4) and post-extraction reconciliation
+   (section 6) are both implemented as the exact conditional/plain
+   UPDATE statements specified, never read-then-update
+5. envelope-exhausted deferral records NO IngestionAttempt (matches
+   the frozen numeric pass exactly)
+6. staging cleanup is unconditional at both the start and end of every
+   claim attempt, proven by a test asserting zero residual staging
+   directories after success, failure, and simulated-crash-then-
+   recovery
+7. member-level source_category/workload_category/risk_tier_estimated
+   are populated at member-creation time, using the exact calls
+   specified in section 7 - classify_backup_sync_context is NOT called
+   for archive members
+8. risk_tier_actual is populated on the ROOT SourceInstance from real
+   post-extraction evidence (section 7's exact formula), remaining
+   NULL on any failure that precedes that evidence existing
+9. SourceInstance.claim_generation exists, is incremented on every
+   claim/reclaim (both claim_source_instance_for_identity_resolution
+   AND claim_source_instance_for_archive_processing - the column lives
+   on the model, not one use case), and release_source_instance_claim
+   requires and fences on it - both existing call sites updated
+10. the zombie-worker test (section 18) proves the FIX: a delayed
+    worker's stale-generation release is a no-op and never clears a
+    legitimately-reclaimed newer owner's claim - measured directly,
+    not assumed
+11. the pre-extraction member checks reject is_symlink AND is_junction
+    AND is_socket (7z); the post-extraction file-type audit (section
+    4a) exists as a general backstop and is proven to fire on at least
+    one adversarial case
+12. max_depth-exceeded produces exactly the frozen outcome (section 13):
+    FAILED, OVERSIZED_OR_EXPANSION_LIMIT, retryable=False,
+    risk_tier_actual NULL
+13. ArchiveExtractor.SUSPICIOUS_EXPANSION_RATIO is removed (or, if a
+    future need is found, given real defined semantics and its own
+    test - never left as unwired dead code)
+14. lease_duration for archive-processing claims is passed explicitly
+    per batch class; Class 2's default (timedelta(minutes=10)) is used
+    only for Class 2, with a documented rationale for any larger
+    class's chosen value (no larger class's value is fabricated
+    without at least a stated basis)
+15. every test in section 18's matrix exists and passes
+16. the full existing regression suite (861 passed, 0 skipped as of
+    this design pass) still passes unchanged, plus all new focused/
+    concurrency tests
+17. zero real-T7 access, verified by grep across every changed file,
+    exactly as every prior milestone's final verification has done
+```
+
+### 21. Mandatory invariants — re-reviewed after corrections (Design Correction Pass)
+
+Each of the 20 authorization's mandatory invariants, re-checked against
+the corrected design above:
+
+```
+1.  Real T7 is read-only.
+    UNCHANGED - still holds; nothing in the corrections touches T7 access.
+2.  Archive extraction writes only to an authorized isolated workspace.
+    UNCHANGED - still holds; staging model unchanged in principle
+    (section 3), only its member-safety detail was hardened (4a).
+3.  No archive member can escape its staging root.
+    STRENGTHENED - traversal checks unchanged, now reinforced by the
+    is_junction addition and the post-extraction file-type audit (4a),
+    which verifies the ACTUAL result rather than trusting member-type
+    enumeration alone.
+4.  Archive containers cannot be claimed by loose-file identity
+    resolution.
+    UNCHANGED - still holds (Milestone 1's not_archive_suffixed
+    exclusion, untouched).
+5.  Every materialized member has a complete provenance chain.
+    UNCHANGED - still holds (section 9, untouched).
+6.  Resume never creates duplicate SourceInstance or ProvenanceLink
+    records.
+    UNCHANGED at the ROW level (idempotent find-or-create was already
+    sufficient for this specific guarantee) - but see #8: the
+    CONCURRENT-WRITE risk that could have accompanied a wrongful claim
+    reopening (never a duplicate-row risk per se) is now also closed.
+7.  Existing evidence snapshots are preserved.
+    UNCHANGED - still holds (section 7, untouched by the classification
+    wiring, which uses dedicated columns, never evidence_snapshot).
+8.  Zombie workers cannot mutate state after losing their claim
+    generation.
+    NOW SATISFIED FOR SourceInstance TOO - this is the invariant the
+    correction pass actually closes. Originally true only for
+    ContentIdentityGroup; section 2's SourceInstance.claim_generation
+    design extends it uniformly to archive-processing (and identity-
+    resolution) claims.
+9.  Resource limits fail closed.
+    UNCHANGED - still holds (pre-flight admission, section 4) -
+    REINFORCED by the new post-extraction file-type audit, itself a
+    fail-closed mechanism (4a).
+10. Stop means STOP, never skip-and-continue.
+    UNCHANGED - still holds, precisely scoped in section 16 (governs
+    future admission, never an already-atomic in-flight extractall()).
+11. Failed extraction cannot be represented as successful extraction.
+    STRENGTHENED - now also explicitly true for max_depth-exceeded
+    (section 13's frozen FAILED outcome, never SUCCEEDED) and for the
+    post-extraction file-type audit's own failures (4a).
+12. EXCLUDED, UNSUPPORTED, and FAILED remain semantically distinct.
+    STRENGTHENED - reinforced by the max_depth fix (correctly FAILED,
+    never misclassified toward MALFORMED_ARCHIVE, never confusable
+    with UNSUPPORTED/EXCLUDED, section 13).
+13. Duplicate content convergence never destroys physical provenance.
+    UNCHANGED - still holds (section 15, untouched).
+14. Cleanup is workspace-only.
+    UNCHANGED - still holds (section 12, untouched).
+15. No OS permission is relied upon as the safety boundary.
+    STRENGTHENED - the post-extraction file-type audit (4a) verifies
+    the actual on-disk result directly, rather than relying solely on
+    zipfile's/py7zr's internal behavior (or the OS's own permission
+    model) to have prevented an unsafe entry type.
+```
+
+**Net result**: zero invariants weakened; one (#8) newly satisfied for
+a model it did not previously cover; four (#3, #9, #11, #12, #15)
+strengthened by a second, independent verification layer rather than
+resting on a single mechanism. None of the five items the review asked
+to be explicitly preserved (the staging-vs-promotion distinction,
+section 3; the three-way declared/actual/peak accounting distinction,
+section 4; source_category vs. workload_category, section 7) were
+touched by any correction - each remains exactly as originally frozen.
+
+**This design pass authorizes no code, no migration, no test-code
+changes, and no real-T7 access.** The next gate, not yet opened, is
+either a further design-review round (if any of the above needs
+correction) or a separate, explicit implementation authorization for
+Milestone 5.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.
