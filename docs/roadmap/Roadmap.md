@@ -2207,6 +2207,91 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       either a further design-review round or a separate, explicit
       implementation authorization for Milestone 5.
 
+- [ ] Scaled Real-T7 Ingestion — Milestone 6 Design: Identity Resolution
+      & Embedding-Reservation Batch Integration — **design-only pass,
+      reviewed and FROZEN after a correction pass; implementation not
+      yet authorized**. Opened after Milestone 5
+      (`6acdc53`) closed; establishes the boundary by inspecting the
+      repository directly against the frozen Implementation Design
+      Pass's (`2fab4b3`) 12-step order rather than assuming a roadmap
+      item: steps 1-8 and 10 are done (Milestones 1-5); step 9
+      ("worker/claim integration — the loop that ties 3-8 together per
+      batch") is done only for archive processing (Milestone 5) and
+      still open for identity resolution and embedding; step 11
+      (`BatchReportService`) does not exist yet; step 12 (final
+      adversarial-test milestone) remains correctly gated on both.
+
+      Identifies two concrete, already-evidenced gaps by reading the
+      code directly: `IdentityResolutionService.resolve_next` never
+      passes the `classification_run_id` parameter its own claim method
+      has already accepted since Milestone 4; and
+      `PipelineEmbeddingService.embed_next` never calls any of the
+      three embedding-reservation methods (`reserve_embeddings`/
+      `consume_embedding_reservation`/`release_embedding_reservation`)
+      Milestone 4 already built and froze — meaning `max_embeddings` is
+      completely unenforced by any code path that actually calls the
+      embedding backend today. Confirms `NormalizationService`/
+      `ChunkingService` need no equivalent change: `claim_content_
+      identity_group`'s global (non-batch-scoped) claim is
+      already-frozen, deliberate design, not a gap.
+
+      Freezes the exact owning-batch resolution query and its
+      deterministic (lowest-`id`-wins) tie-break rule for cross-batch
+      identity convergence, and the explicit "no currently-`RUNNING`
+      owning batch → proceed unreserved, never strand the item at
+      `CHUNKED`" invariant — both previously unspecified. Adds no new
+      schema, migration, `ExpensiveOperationKind`, or pipeline state.
+
+      **Design Correction Pass applied — reservation-ownership semantics
+      now resolved explicitly.** Review correctly declined to freeze the
+      original pass because it specified *how* an owning batch is picked
+      (lowest-`id` tie-break) without resolving *what that ownership
+      means*: whether `RUNNING`-only eligibility is enforced once or
+      continuously, whether lowest-id implies any business/semantic
+      priority, what happens when the resolved batch stops being
+      `RUNNING` (before or after reservation), whether a non-owner
+      batch's spare capacity can substitute, how `reserved_embeddings_
+      batch_id` is cleared/recovered, and how `claim_generation` fences
+      stale workers from touching a reservation they no longer own. The
+      correction (new section 4a) resolves all of this: lowest-id is
+      confirmed pure, reproducible arbitration with **no** semantic
+      priority; `RUNNING`-only eligibility is enforced twice
+      (independently, at resolution and again atomically at reservation);
+      a reservation's fate, once granted, is fully decoupled from the
+      owning batch's later status transitions — unconditionally, per
+      already-existing Milestone 4 guarantees, never newly invented
+      here; all three clear/recovery paths (consume, release, abandoned-
+      reservation recovery) read `reserved_embeddings_batch_id` fresh
+      from the row, never from a remembered value; `claim_generation`
+      fences every reservation operation identically to the existing
+      claim mechanism. One bounded scope decision was surfaced and named
+      explicitly rather than left ambiguous: no multi-candidate
+      reservation fallback within a single attempt if the resolved batch
+      denies — the item defers and a later attempt re-resolves. The
+      standing principle is restated explicitly: content identity is
+      globally convergent; embedding-reservation ownership is a fourth,
+      orthogonal concept — pure resource-cost attribution, never content
+      or claim ownership.
+
+      See `AI_Brain_Architecture.md`'s "Scaled Real-T7 Ingestion —
+      Milestone 6 Design: Identity Resolution & Embedding-Reservation
+      Batch Integration" section for the full specification, including
+      the boundary derivation (section 0), the exact pseudocode for
+      both call sites (section 3), the owning-batch resolution algorithm
+      and its corrected ownership semantics (sections 4 and 4a), the
+      synthetic test matrix (section 15), and the gap register (section 18).
+
+      Also notes, without correcting (out of this pass's scope): the
+      Milestone 5 roadmap entry above still reads "design-only pass
+      produced, not yet reviewed or frozen" despite Milestone 5 having
+      been implemented, reviewed, and committed at `6acdc53` — a stale
+      status left for a future, separately-authorized documentation
+      correction.
+
+      **This pass authorizes no code, no migration, no test-code
+      changes, and no real-T7 access.** **Next gate, not yet opened**:
+      a separate, explicit implementation authorization for Milestone 6.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

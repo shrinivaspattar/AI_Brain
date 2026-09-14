@@ -10027,6 +10027,852 @@ either a further design-review round (if any of the above needs
 correction) or a separate, explicit implementation authorization for
 Milestone 5.
 
+## Scaled Real-T7 Ingestion — Milestone 6 Design: Identity Resolution & Embedding-Reservation Batch Integration (DESIGN ONLY — no code, no migration, no real-T7 access authorized by this section)
+
+Design pass for Implementation Milestone 6, opened after Milestone 5
+(`6acdc53`) was committed and closed. This section establishes the M6
+boundary by direct inspection of the current repository — not from an
+assumed roadmap item — and freezes the design for that boundary before
+any implementation is authorized.
+
+**Design Correction Pass applied**: the initial pass specified *how* an
+owning batch is resolved (lowest-`id` tie-break, section 4) but left
+*what that ownership means* — its persistence across the owning batch's
+own later status transitions, its interaction with `claim_generation`
+fencing and stale-reservation recovery, and whether it carries any
+priority beyond arbitration — unresolved. Review correctly declined to
+freeze the design on that basis. Section 4a, added by this correction,
+resolves all ten review points explicitly. Nothing in section 4a
+changes section 3's pseudocode, section 5's "no schema change," or any
+other section — it is a semantics clarification of already-specified
+(and, for the reservation primitives themselves, already Milestone-4-built)
+mechanism, never a new mechanism.
+
+### 0. Establishing the boundary — what the repository actually shows
+
+The frozen "Scaled Real-T7 Ingestion — Implementation Design Pass"
+(`2fab4b3`), section 18, names an exact 12-step implementation order.
+Mapping what is actually committed today against that order:
+
+```
+1. Schema/model design review                         -> done (Milestone 1, cc8dbec)
+2. Migration                                            -> done (Milestone 1, cc8dbec)
+3. Batch creation service                               -> done (Milestone 2, 4709ffd)
+4. Policy evaluator                                     -> done (Milestone 2, 4709ffd)
+5. WorkerClaimService extension (classification_run_id) -> done (Milestone 4, 6513948)
+6. BatchResourceGuard                                   -> done (Milestone 3, ca3ab4e)
+7. Extracted-bytes + embedding reservation (primitives) -> done (Milestone 4, 6513948:
+                                                            embedding reservation lifecycle;
+                                                            Milestone 5, 6acdc53: extracted-
+                                                            bytes reservation + staging)
+8. Runtime accounting                                   -> done (Milestone 3, ca3ab4e)
+9. Worker/claim integration (the loop that ties 3-8
+   together per batch)                                  -> PARTIAL — done for archive
+                                                            processing only (Milestone 5);
+                                                            NOT done for identity resolution
+                                                            or embedding
+10. Archive-processing integration                      -> done (Milestone 5, 6acdc53)
+11. BatchReportService                                  -> NOT STARTED — no such service
+                                                            exists anywhere in app/classification/
+12. Adversarial/concurrency tests (final milestone)     -> NOT STARTED (correctly: this is
+                                                            the LAST step, gated on 9 and 11)
+```
+
+Milestone 5 completed step 10 (archive-processing integration) ahead of
+step 9 in the frozen numbering — an explicit, already-authorized and
+already-closed divergence from the written order, not something this
+pass reopens or corrects. What step 10 actually did for archive
+processing (`classification_run_id`-scoped claim, `BatchResourceGuard`
+admission, atomic pre-flight reservation, post-work reconciliation) is
+**exactly the shape of integration step 9 still owes to the two
+pipeline stages Milestone 5 did not touch**: identity resolution and
+embedding. This is confirmed by reading the current code directly, not
+assumed:
+
+- `WorkerClaimService.claim_source_instance_for_identity_resolution`
+  already accepts an optional `classification_run_id: int | None = None`
+  (added by Milestone 4, per its own docstring) and already applies the
+  exact frozen predicate from section 10 of the Implementation Design
+  Pass when given one. But `IdentityResolutionService.resolve_next` —
+  the only caller — never accepts or passes this parameter. The
+  primitive is batch-aware; the service that uses it is not.
+- `WorkerClaimService.reserve_embeddings` / `consume_embedding_
+  reservation` / `release_embedding_reservation` are a complete,
+  already-frozen (section 8 of the Implementation Design Pass),
+  already-built (Milestone 4) fenced reservation lifecycle for
+  `IngestionBatch.max_embeddings`/`embeddings_reserved`. **Verified
+  directly: zero call sites in `app/` invoke any of these three
+  methods.** `PipelineEmbeddingService.embed_next` calls
+  `EmbeddingClient.embed()` unconditionally, with no reservation, no
+  envelope check, and no `BatchResourceGuard` consultation of any kind.
+  This means `max_embeddings` — one of the five envelope fields a real
+  ingestion batch is bounded by — is **completely unenforced** by any
+  code path that actually calls the embedding backend today.
+- `NormalizationService.normalize_next` and `ChunkingService.
+  chunk_next` both call `WorkerClaimService.claim_content_identity_
+  group`, which the frozen design (Implementation Design Pass, section
+  19, "DECIDED/FROZEN") explicitly and deliberately keeps **global** —
+  "`claim_content_identity_group` remains a *global* claim (no batch
+  filter)... a known, accepted imprecision in cross-batch budget
+  attribution... not a correctness bug." No `classification_run_id`
+  parameter exists on this method, and none is missing — the design
+  already decided this. Normalization and chunking therefore need **no**
+  batch-integration change; adding one would contradict frozen design,
+  not complete it.
+- `BatchReportService` (step 11) does not exist. Building it is a
+  larger, independent unit of work (reporting/reconciliation across the
+  whole batch, not a per-item pipeline change) and depends on nothing
+  this pass touches; pursuing it here would be scope expansion beyond
+  "the smallest necessary next milestone."
+
+**Conclusion**: the smallest, most necessary, most concretely evidenced
+next boundary is completing step 9 for exactly the two stages Milestone
+5 did not cover — identity resolution and embedding — using the same
+integration pattern already reviewed and closed for archive processing.
+This is Milestone 6's scope. It is not real-T7 execution, not
+`BatchReportService`, and not a change to normalization/chunking's
+already-frozen global-claim behavior.
+
+**A related, real documentation gap noted but explicitly NOT corrected
+by this pass** (per this authorization's scope: documentation changes
+are limited to the Milestone 6 design specification and its roadmap
+status): the Milestone 5 commit (`6acdc53`) added a "Milestones 1–4 —
+committed" roadmap entry but never added a corresponding "Milestone 5 —
+committed" entry, or an implementation-report architecture section
+analogous to this one — the Roadmap's Milestone 5 bullet still reads
+"design-only pass produced, not yet reviewed or frozen," which is now
+stale. This is flagged for a future, separately-authorized documentation
+correction; fixing it here would be scope expansion beyond Milestone 6.
+
+### 1. Objective and scope
+
+Make identity resolution and embedding — the two remaining
+non-archive, per-item pipeline stages with a Milestone-4-built,
+batch-aware primitive sitting unused beneath them — actually batch-aware
+and (for embedding) envelope-honest, mirroring exactly what Milestone 5
+did for archive processing. Concretely:
+
+- **A. Identity resolution**: `IdentityResolutionService.resolve_next`
+  gains an optional `classification_run_id: int | None = None` parameter,
+  threaded straight into the existing `claim_source_instance_for_
+  identity_resolution` call. `None` preserves exact pre-Milestone-6
+  behavior for any caller that omits it (the same backward-compatibility
+  contract every prior milestone's optional parameters used).
+- **B. Embedding**: `PipelineEmbeddingService.embed_next` gains an
+  optional `guard: BatchResourceGuard | None = None` parameter and is
+  wired to the already-frozen, already-built reservation lifecycle:
+  resolve the owning batch (new logic, specified in section 4 below),
+  reserve before calling `EmbeddingClient.embed()`, consume on success,
+  release on failure — never calling `embed()` without a successful
+  reservation when an owning `RUNNING` batch exists.
+- **Explicitly NOT in scope**: `NormalizationService`, `ChunkingService`
+  (frozen global-claim design, unchanged); `BatchReportService`; a
+  scheduler-wide worker-orchestration loop; any new `ExpensiveOperationKind`
+  value (identity resolution reading T7 bytes was never named as an
+  "expensive operation" checkpoint anywhere in the frozen design —
+  inventing one now would be a new resource-guard policy, not a wiring
+  completion); any change to `claim_content_identity_group`'s
+  global-claim scoping; any new `IngestionBatch` or `SourceInstance`
+  column; any migration; any real-T7 access.
+
+### 2. Existing capability being reused
+
+Entirely reused, unchanged:
+- `WorkerClaimService.claim_source_instance_for_identity_resolution`'s
+  existing `classification_run_id` parameter and predicate (Milestone
+  4) — this pass adds a caller, not a capability.
+- `WorkerClaimService.reserve_embeddings` / `consume_embedding_
+  reservation` / `release_embedding_reservation` and the full fenced
+  reservation lifecycle they implement (Milestone 4, Implementation
+  Design Pass section 8) — this pass adds the first real caller, not a
+  capability.
+- `BatchResourceGuard.check_before_expensive_operation(batch,
+  ExpensiveOperationKind.EMBEDDING)` (Milestone 3) — already accepted
+  as an optional parameter by `reserve_embeddings` itself; this pass
+  threads it from `PipelineEmbeddingService.embed_next` down to that
+  existing call, exactly as `ArchiveProcessingService` already does for
+  `ExpensiveOperationKind.ARCHIVE_EXTRACTION` (Milestone 5).
+- `DocumentChunk.embedding IS NULL` as the idempotent unit-of-work
+  signal (existing, unchanged) — the count of such rows at claim time is
+  the reservation's `n`.
+
+### 3. Exact new capability
+
+**A. `IdentityResolutionService.resolve_next`**:
+```
+def resolve_next(
+    self, *, worker_id: str, workspace_root: Path,
+    lease_duration: timedelta = timedelta(minutes=10),
+    classification_run_id: int | None = None,
+) -> SourceInstance | None:
+    instance = self.claims.claim_source_instance_for_identity_resolution(
+        worker_id=worker_id, lease_duration=lease_duration,
+        classification_run_id=classification_run_id,
+    )
+    ...  # unchanged below this line
+```
+No other change to this service. `release_source_instance_claim`
+already fences on `claim_generation` (Milestone 5) regardless of how
+the claim was scoped, so nothing downstream of the claim needs to
+change.
+
+**B. `PipelineEmbeddingService.embed_next` / `_embed_claimed_group`**:
+```
+def embed_next(
+    self, *, worker_id: str,
+    lease_duration: timedelta = timedelta(minutes=10),
+    guard: BatchResourceGuard | None = None,
+) -> ContentIdentityGroup | None:
+    group = self.claims.claim_content_identity_group(...)   # unchanged
+    if group is None:
+        return None
+    try:
+        self._embed_claimed_group(group, worker_id=worker_id, guard=guard)
+    except Exception:
+        self.claims.release_content_identity_group_claim(...)  # unchanged
+        raise
+    ...
+```
+
+`_embed_claimed_group`, new sequencing (pseudocode; transactional steps
+matter here):
+```
+document = <existing lookup; unchanged, including the "no Document" failure path>
+
+unembedded_chunks = <existing query: DocumentChunk WHERE document_id=... AND embedding IS NULL>
+n = len(unembedded_chunks)
+
+if n == 0:
+    # Nothing left to embed - e.g. a crash-resume where a prior attempt
+    # already embedded everything but did not advance pipeline_state.
+    # No reservation is needed for zero work. Existing behavior, unchanged.
+    goto <existing "record success, release with final_state" tail>
+
+owning_batch_id = _resolve_owning_running_batch(group.id)   # NEW, section 4
+
+if owning_batch_id is not None:
+    outcome = self.claims.reserve_embeddings(
+        group_id=group.id, my_generation=group.claim_generation,
+        batch_id=owning_batch_id, n=n, guard=guard,
+    )
+    if not outcome.reserved:
+        # reserve_embeddings has ALREADY released the claim on every
+        # denial path (its own existing contract, unchanged). No
+        # IngestionAttempt is recorded - this is a clean deferral, not
+        # a failure of the item itself, exactly matching the frozen
+        # "item deferred" outcome (Implementation Design Pass section 8).
+        return   # embed_next returns None-equivalent to its caller
+    reserved = True
+else:
+    # No RUNNING batch currently owns this group (e.g. every batch whose
+    # SourceInstance(s) fed it has since paused/completed/aborted, or -
+    # structurally impossible today since PipelineEmbeddingService has
+    # no non-batch caller, but kept as an explicit, named case rather
+    # than an unstated assumption). Proceed unguarded/unreserved -
+    # embedding work must never silently strand a Document at CHUNKED
+    # forever merely because no batch is currently claiming ownership of
+    # its cost accounting (see section 4's explicit invariant).
+    reserved = False
+
+try:
+    vectors = self.embedding_client.embed([c.content for c in unembedded_chunks])
+except Exception as exc:
+    if reserved:
+        self.claims.release_embedding_reservation(group_id=group.id, my_generation=group.claim_generation)
+        # release_embedding_reservation ALSO releases the claim (existing
+        # contract) - do not call release_content_identity_group_claim again.
+        self._record_failure(...)   # existing _fail() body, but do not
+                                      # double-release the claim
+        return
+    else:
+        <existing _fail() path, unchanged>
+    return
+
+for chunk, vector in zip(unembedded_chunks, vectors):
+    chunk.embedding = vector
+self.db.commit()
+
+<existing: record SUCCEEDED attempt>
+<existing: compute remaining_unembedded, final_state>
+
+if reserved:
+    self.claims.consume_embedding_reservation(
+        group_id=group.id, my_generation=group.claim_generation,
+        new_pipeline_state=final_state,
+    )
+    # consume_embedding_reservation ALSO releases the claim with the new
+    # state (existing contract) - do not call release_content_identity_
+    # group_claim again for this path.
+else:
+    <existing: self.claims.release_content_identity_group_claim(..., new_pipeline_state=final_state)>
+```
+
+The two release paths (`release_embedding_reservation` /
+`consume_embedding_reservation` vs. the plain
+`release_content_identity_group_claim`) are mutually exclusive per
+attempt, selected by whether a reservation was actually taken — an
+implementation-time discipline this design calls out explicitly to
+prevent a double-release-claim bug (the fenced `WHERE claim_generation
+= :my_generation` on the second call would simply no-op harmlessly if
+this were gotten wrong, per every release method's existing "safe
+no-op, never an exception" contract, but the intent must still be
+implemented correctly, not left to that safety net).
+
+### 4. Lifecycle / state transitions
+
+No new `ContentPipelineState` values. The existing
+`CHUNKED -(claim)-> [reserve] -(embed)-> EMBEDDED|INGESTED -(consume, releases claim)`
+skeleton (Implementation Design Pass, section 8) is now actually
+exercised end to end for the first time, exactly as originally frozen;
+this pass adds no new state.
+
+**New logic (not previously specified anywhere): resolving which batch
+owns a `ContentIdentityGroup`'s embedding cost.**
+
+```
+def _resolve_owning_running_batch(group_id: int) -> int | None:
+    SELECT ib.id
+    FROM ingestion_batches ib
+    JOIN source_instances si ON si.classification_run_id = ib.classification_run_id
+    WHERE si.content_identity_group_id = :group_id
+      AND ib.status = 'RUNNING'
+    ORDER BY ib.id ASC
+    LIMIT 1
+```
+
+**Determinism rule, frozen here**: when more than one `RUNNING` batch's
+`SourceInstance` rows resolve to the same shared `ContentIdentityGroup`
+(the already-proven, already-accepted cross-batch convergence case —
+Implementation Design Pass section 10), the batch with the lowest `id`
+(equivalently, the earliest-created batch, mirroring this codebase's
+existing `ORDER BY created_at`/`id ASC` convention for "earliest wins"
+selection) is charged. This is a new, previously-unspecified tie-break
+rule this design pass freezes explicitly, rather than leaving the
+"whichever batch's worker claims it first" language of section 10
+under-specified at the SQL level. It governs only *which ledger records
+the cost* — never which worker performs the (single, deduplicated) work,
+which remains governed entirely by `claim_content_identity_group`'s own
+existing `SELECT ... FOR UPDATE SKIP LOCKED` exclusivity.
+
+**Explicit invariant, frozen here (also previously unspecified)**: if no
+`RUNNING` batch currently owns the group (every owning batch has since
+`PAUSED`/`COMPLETED`/`ABORTED`), embedding work proceeds **without** a
+reservation — the item is never blocked or deferred merely for lack of
+an active batch to charge. Rationale: `claim_content_identity_group` is
+frozen as a global claim specifically so shared content converges and
+completes regardless of any one batch's lifecycle; making embedding
+completion conditional on a currently-`RUNNING` owning batch would
+strand such a group at `CHUNKED` indefinitely whenever its only owning
+batch(es) finish first — a real regression this design explicitly
+avoids, not an oversight.
+
+### 4a. Reservation-ownership semantics — CORRECTED / RESOLVED (Design Correction Pass)
+
+**Correction context**: review correctly identified that section 4, as
+originally written, specified *how* an owning batch is picked but never
+resolved *what kind of ownership* that pick establishes, nor what
+happens to it across the owning batch's own subsequent lifecycle
+transitions. Both bear directly on `reserved_embeddings_batch_id`'s
+durability and on stale-reservation recovery, so this cannot be left
+implicit. The ten points below are resolved explicitly; nothing here
+changes section 3's pseudocode or section 5's "no schema change" — this
+is a semantics clarification of already-specified mechanism, not a new
+mechanism.
+
+**1. Only `RUNNING` batches are eligible owners — yes, explicitly, and
+enforced twice.** `_resolve_owning_running_batch` (section 4) filters
+`ib.status = 'RUNNING'` as its *candidate-selection* check. Independently,
+`reserve_embeddings`'s own existing atomic `UPDATE ... WHERE id = :batch_id
+AND status = 'RUNNING' AND embeddings_reserved + n <= max_embeddings`
+(Milestone 4, unchanged by this pass) re-checks the identical condition
+at the *instant of reservation*. A batch that is `PLANNED`, `PAUSED`,
+`COMPLETED`, or `ABORTED` can never become a NEW reservation's owner
+under any circumstance — both checks agree, and the second is the one
+that actually matters for correctness (point 5 covers the gap between
+them).
+
+**2. The calling worker's own batch gets NO preference — there is no
+such concept at this claim layer.** Unlike
+`claim_source_instance_for_archive_processing` (which takes an explicit
+`classification_run_id` naming the calling worker's batch),
+`claim_content_identity_group` is frozen (Implementation Design Pass,
+section 19) as a global claim with no batch-identifying parameter at
+all. A worker calling `embed_next()` has no associated batch to prefer —
+the method has no input through which one could even be named. If a
+future, separately-scoped milestone builds a batch-scoped orchestration
+loop that wants to bias `embed_next()` toward a specific batch's
+content, that is new scope for that milestone (a new optional parameter
+on `embed_next()`), not something M6 introduces or assumes.
+
+**3 & 4. Why lowest `id`, and it is arbitration only — never business
+priority.** Lowest `id` is chosen *solely* because it is cheap,
+deterministic, and reproducible across repeated test runs and real
+concurrent contention (an `ORDER BY ib.id ASC LIMIT 1` always returns
+the same row for the same candidate set, independent of thread
+scheduling) — matching this codebase's existing convention of using
+creation order as an arbitrary-but-reproducible tie-break elsewhere
+(e.g. `claim_content_identity_group`'s own `ORDER BY created_at` for
+which stale/eligible row is claimed first). **It carries no semantic or
+business meaning whatsoever**: it does NOT mean the lowest-id batch is
+"more important," "should finish first," or has any claim-priority over
+the group's actual processing — that is governed entirely and
+separately by `claim_content_identity_group`'s own
+`SELECT ... FOR UPDATE SKIP LOCKED` exclusivity, unaffected by which
+batch's ledger happens to be charged. This is exactly the same
+"known, accepted imprecision in cross-batch budget attribution... not a
+correctness bug" the frozen Implementation Design Pass (section 10)
+already named for `claim_content_identity_group`'s own global-claim
+decision — this tie-break rule is that same accepted imprecision, made
+concrete and reproducible rather than left as unspecified prose.
+
+**5. If the resolved (lowest-id) batch is no longer `RUNNING` by the
+time `reserve_embeddings` actually executes**: `_resolve_owning_running_batch`
+(a plain `SELECT`) and `reserve_embeddings`'s atomic `UPDATE` are two
+separate statements, so a race window exists between them. This is
+already fully handled, not a new gap: `reserve_embeddings`'s own
+`WHERE status = 'RUNNING'` re-check (point 1) will simply fail to match
+if the batch left `RUNNING` in that window, and the method returns
+`reserved=False` with `denial_reason=BATCH_NOT_RUNNING` (existing
+`ReservationDenialReason` value, Milestone 4) — the claim is released
+(existing contract) and the item is deferred (section 3/12's "clean
+deferral" semantics, no `IngestionAttempt` recorded). **No in-attempt
+fallback to a second candidate is attempted** — see point 6. The next
+independent claim attempt (by any worker, at any later time) re-runs
+`_resolve_owning_running_batch` fresh and will naturally resolve to
+whatever batch is now the lowest-id `RUNNING` owner, or `None` if none
+remains.
+
+**6. A non-owner batch's spare capacity is never substituted, even
+within the same attempt.** Resolution picks exactly one candidate. If
+that specific batch denies (not `RUNNING`, envelope exhausted, or
+guard-denied), the whole attempt defers — `embed_next()` does not loop
+over other `RUNNING` batches that also reference the group and retry
+their capacity instead. This is a **deliberate, named scope boundary**,
+not an oversight: multi-candidate fallback would require either
+retrying `reserve_embeddings` against successive candidates within one
+call (added control-flow complexity for a rare edge case — simultaneous
+cross-batch convergence *and* the specific resolved batch being
+exhausted/stopped at the exact moment of reservation) or a
+priority-ordered capacity-borrowing scheme neither the frozen design nor
+this pass ever specifies. Deferring and letting a later attempt
+re-resolve (point 5) already guarantees eventual progress once *any*
+`RUNNING` batch remains eligible, or the "no owner" path (section 4's
+existing invariant) takes over once none do — correctness is preserved,
+only latency in the rare contended case is traded for simplicity, an
+explicit exclusion added to section 17.
+
+**7. What happens when the reservation owner transitions to `PAUSED`,
+`ABORTED`, or `COMPLETED` *after* a reservation was already granted**:
+the reservation's fate becomes **entirely decoupled from the owning
+batch's live status** the instant `reserve_embeddings` commits — this is
+already-frozen, already-built behavior (Implementation Design Pass
+section 8; Milestone 4 code, unchanged by this pass), not new to M6.
+Explicitly, quoting the existing frozen guarantee: *"reservations are
+not released merely because the batch pauses — they represent real,
+potentially still-in-flight work; only the stale-claim-triggered
+recovery path ever clears one, always fenced to the generation it
+actually belongs to."* Concretely: `consume_embedding_reservation`
+(success) and `release_embedding_reservation` (failure) both check
+**only** `claim_generation` — neither reads nor cares about the owning
+batch's current `status` — so a worker that successfully reserved
+against a batch that has since paused, aborted, or completed still
+finishes normally (consume) or fails normally (release) exactly as if
+nothing had changed. The same applies to abandoned-reservation recovery
+(point 8): its own existing docstring states crediting back is
+*"unconditional on the owning batch's status (even an already-`ABORTED`
+batch's counter is still correctly reconciled — this is bookkeeping
+correction, never a new-work admission decision)."* A batch leaving
+`RUNNING` therefore only ever affects **future** reservation attempts
+against it (point 1); it never retroactively invalidates, cancels, or
+reassigns a reservation already granted.
+
+**8. How `reserved_embeddings_batch_id` is cleared/recovered — three
+existing paths, none introduced or altered by M6**:
+```
+(a) consume_embedding_reservation (success):
+    fenced UPDATE ... WHERE id=:group_id AND claim_generation=:my_generation
+    SET reserved_embeddings=NULL, reserved_embeddings_batch_id=NULL
+    -- IngestionBatch.embeddings_reserved is NOT decremented (monotonic -
+    -- real, completed work; unchanged from the frozen design)
+
+(b) release_embedding_reservation (embed() failure, or any explicit release):
+    SELECT reserved_embeddings, reserved_embeddings_batch_id FOR UPDATE
+      WHERE id=:group_id AND claim_generation=:my_generation
+    -- read FRESH, never a caller-supplied/remembered batch_id
+    UPDATE ... SET reserved_embeddings=NULL, reserved_embeddings_batch_id=NULL
+    UPDATE ingestion_batches SET embeddings_reserved = embeddings_reserved - :n
+      WHERE id = <the batch_id just read fresh>
+
+(c) abandoned-reservation recovery (built into claim_content_identity_group's
+    own reclaim UPDATE, Milestone 4 - triggered when a NEW claim attempt
+    reclaims a row whose claimed_at < stale_before while a reservation is
+    still present):
+    the SAME transaction that grants the new claim_generation reads the
+    STALE row's reserved_embeddings/reserved_embeddings_batch_id fresh
+    under the row lock, credits that exact amount back to that exact
+    batch, and clears both columns - BEFORE the new generation's owner
+    does anything
+```
+All three read `reserved_embeddings_batch_id` **fresh from the row**,
+never from a value any caller remembers or passes in — this is precisely
+what makes all three safe regardless of how much time, or how many
+owning-batch status transitions, have elapsed since the reservation was
+granted (point 7).
+
+**9. How `claim_generation` fences stale workers from consuming or
+releasing a reservation they no longer own**: every mutating reservation
+operation — `reserve`, `consume`, `release`, and recovery's own internal
+clear — includes `AND claim_generation = :my_generation` in its `WHERE`
+clause against `ContentIdentityGroup`. A worker captures `:my_generation`
+once, from the value its own `claim_content_identity_group` call
+returned, and holds it for that attempt's lifetime. If the row is
+reclaimed in the meantime (stale-claim recovery bumps `claim_generation`
+to N+1, per point 8c), the original worker's later `consume`/`release`
+call — still carrying generation N — matches **zero rows**: a safe,
+silent no-op, never an exception, and structurally incapable of
+touching generation N+1's live claim or reservation. This is the exact,
+already-built (Milestone 4) fencing mechanism `SourceInstance.
+claim_generation` (Milestone 5) later generalized for archive/identity
+claims — M6 does not add or modify this mechanism, it is simply the
+first pass whose new call site (`PipelineEmbeddingService`) actually
+exercises it against real reservation traffic end to end.
+
+**10. Preserved, stated explicitly as a standing principle governing
+every point above**: content identity is globally convergent — a
+property of bytes, never batch-scoped (Implementation Design Pass,
+section 10). Embedding-reservation ownership
+(`reserved_embeddings_batch_id`) is a **fourth, orthogonal concept**,
+never to be conflated with the three already-frozen ones (batch
+membership / content-identity convergence / worker claim ownership):
+it is pure **resource-control cost attribution** — *which batch's
+ledger pays for one specific, already-exclusively-claimed reservation*
+— and confers **no ownership of, or priority over, the content itself**.
+Whichever batch is charged, the underlying `ContentIdentityGroup` is
+processed exactly once, by exactly one worker, exactly as the
+already-proven global-claim exclusivity guarantees; the reservation
+ledger is bookkeeping, never an admission or priority mechanism over
+the work itself.
+
+### 5. Database changes
+
+None. No migration. No new columns, tables, indexes, or enum values.
+Both new call sites (`_resolve_owning_running_batch`'s `SELECT`,
+`reserve_embeddings`'s existing `UPDATE`s) use only already-existing
+columns (`source_instances.classification_run_id`,
+`source_instances.content_identity_group_id`, `ingestion_batches.id`,
+`ingestion_batches.status`).
+
+### 6. Worker/claim interactions
+
+Unchanged claim mechanics for both stages — this milestone changes only
+which parameters are *passed into* already-existing, already-fenced
+claim/reservation methods, never the methods' own locking or fencing
+logic. `claim_source_instance_for_identity_resolution`'s
+`classification_run_id`-scoped `SELECT ... FOR UPDATE SKIP LOCKED`
+behavior is exactly as Milestone 4 built and Milestone 5's tests already
+exercise for the sibling `claim_source_instance_for_archive_processing`
+method — no new proof of that mechanism itself is required, only proof
+that `IdentityResolutionService` correctly passes the parameter through
+(a wiring test, not a concurrency-primitive test).
+
+### 7. Batch/resource-control interactions
+
+- Identity resolution: no numeric envelope, no `BatchResourceGuard`
+  checkpoint (none was ever named for this stage in the frozen design —
+  see section 1's explicit "not in scope" note). Batch interaction is
+  admission-only: a `classification_run_id`-scoped claim will not match
+  a `SourceInstance` whose batch is not `RUNNING` (the existing predicate,
+  re-checked in the `UPDATE`'s own `WHERE`, per Milestone 4's docstring).
+- Embedding: full `max_embeddings`/`embeddings_reserved` envelope
+  enforcement via `reserve_embeddings`, including its own existing
+  `guard.check_before_expensive_operation(batch, EMBEDDING)` consultation
+  (Ollama-reachability tiering, already built) — now actually reachable
+  from a real embedding call for the first time.
+
+### 8. Idempotency and retry semantics
+
+Unchanged and already sufficient, verified by reading the existing code
+paths this design reuses:
+- Identity resolution: `resolve_next`'s existing `finally`-fenced
+  release and write-once `content_identity_group_id` assignment are
+  untouched; adding a claim-scoping parameter changes only which rows
+  are eligible to be claimed, never the resolution logic's own
+  idempotency.
+- Embedding: `WHERE embedding IS NULL` chunk selection (existing,
+  unchanged) remains the sole resumability mechanism — a crash after
+  reserving but before `embed()` completes leaves the reservation to be
+  recovered by the *existing*, already-Milestone-4-proven abandoned-
+  reservation recovery path inside `claim_content_identity_group`
+  (credits `embeddings_reserved` back, clears the reservation, advances
+  the generation) the next time this group is claimed — no new recovery
+  logic is introduced by this pass.
+
+### 9. Crash/recovery behavior
+
+No new crash scenario is introduced. The two crash points this pass's
+new code path adds exposure to were both already designed for by
+Milestone 4:
+- Crash after `reserve_embeddings` returns `reserved=True` but before
+  `embed()` returns: reservation is recovered via the existing
+  abandoned-reservation path on the next claim of this row (unchanged
+  mechanism, new exerciser).
+- Crash after `embed()` succeeds but before `consume_embedding_
+  reservation` commits: chunks already have embeddings written (the
+  `for chunk, vector in zip(...): chunk.embedding = vector; self.db.commit()`
+  step happens first); the reservation is still outstanding and will be
+  recovered the same way; a later resumed attempt's `unembedded_chunks`
+  query will find zero remaining rows (`n == 0` path, section 3) and
+  proceed straight to state advancement — no duplicate embedding call,
+  no lost work.
+
+### 10. Concurrency behavior
+
+Two properties require proof beyond what Milestone 4 already proved for
+the reservation primitives themselves:
+1. **Wiring correctness**: `PipelineEmbeddingService` actually calls
+   `reserve_embeddings` before `embed()` and never calls `embed()` after
+   a denied reservation — a direct-call/mock-boundary test, not a
+   concurrency test.
+2. **Deterministic batch attribution under real concurrency**: two real
+   `IngestionBatch` rows, both `RUNNING`, each with its own
+   `SourceInstance` resolving (via identity convergence) to the SAME
+   `ContentIdentityGroup`; two real workers race `embed_next()` via
+   `threading.Barrier` against real Postgres. Assert: exactly one
+   worker's `embed()` call happens (existing global-claim exclusivity,
+   already proven for `claim_content_identity_group` generally — this
+   test is the first to also assert the *specific* batch charged), and
+   the batch charged is always the lower-`id` batch, reproducibly across
+   repeated runs (proving section 4's tie-break rule is genuinely
+   deterministic under contention, not merely in the single-threaded
+   case).
+
+### 11. Provenance preservation
+
+Untouched. Neither change reads, writes, or reinterprets
+`ProvenanceLink`, `root_t7_path`, or `member_path`. Identity resolution's
+existing "read `root_t7_path` exactly once" contract is unaffected by
+adding a claim-scoping parameter.
+
+### 12. Failure taxonomy
+
+No new `IngestionFailureCode` value. A denied reservation is explicitly
+**not** a failure — no `IngestionAttempt` row is recorded for it (per
+the frozen "item deferred" semantics, section 3 above), exactly
+matching how `ArchiveProcessingService`'s own pre-flight denial (Milestone
+5) is already handled: a clean, silent deferral, retried on a future
+claim, never a durable `FAILED` outcome. An `embed()` exception after a
+successful reservation still records the existing
+`EMBEDDING_UNAVAILABLE` failure code, unchanged, with the added step of
+releasing the reservation first.
+
+### 13. Observability/audit requirements
+
+No new audit surface. `IngestionAttempt` rows continue to record exactly
+what they do today for both stages. The one new piece of derived state
+(which batch was charged for a given embedding reservation) is already
+fully durable and queryable via the existing
+`content_identity_groups.reserved_embeddings_batch_id` column during
+the reservation's lifetime — no new column is needed to audit this
+pass's new behavior.
+
+### 14. Security/safety boundaries
+
+Unchanged. Neither change touches T7 access, file-type validation, or
+any OS-permission-adjacent logic — pure database/service wiring,
+entirely synthetic-testable, matching every other milestone's boundary
+in this chain.
+
+### 15. Synthetic test strategy
+
+All new/updated tests are pure `ArchiveExtractor`-free, T7-free,
+synthetic-fixture tests against `aibrain_test`, matching this project's
+established pattern:
+```
+1.  resolve_next(classification_run_id=None) behaves exactly as before
+    (regression, existing fixture reused).
+2.  resolve_next(classification_run_id=X) only claims SourceInstances
+    under run X - a sibling SourceInstance under run Y is never claimed.
+3.  resolve_next(classification_run_id=X) does not claim a SourceInstance
+    under run X whose IngestionBatch is not RUNNING.
+4.  embed_next() with n==0 unembedded chunks: no reservation attempted,
+    existing success path taken unchanged.
+5.  embed_next() with an owning RUNNING batch and available envelope:
+    reserve -> embed -> consume, embeddings_reserved increases by n,
+    reserved_embeddings/reserved_embeddings_batch_id return to NULL after
+    consume.
+6.  embed_next() with an owning RUNNING batch whose envelope is already
+    exhausted: reservation denied, claim already released (verify via a
+    fresh claim by a second worker succeeding immediately after), no
+    IngestionAttempt row created, no embed() call made (assert via a
+    call-counting stub EmbeddingClient).
+7.  embed_next() with guard denying (HARD_STOP and SOFT_STOP both):
+    same deferral shape as (6), verified via a stub guard.
+8.  embed_next() where embed() raises after a successful reservation:
+    release_embedding_reservation is invoked, embeddings_reserved
+    returns to its pre-reservation value, FAILED IngestionAttempt
+    recorded, claim released.
+9.  embed_next() where NO RUNNING batch owns the group (all owning
+    batches PAUSED/COMPLETED/ABORTED): embedding proceeds unreserved,
+    completes normally, no batch counter touched (regression proof for
+    section 4's explicit invariant).
+10. Two SourceInstances under two different RUNNING batches converge on
+    one ContentIdentityGroup: _resolve_owning_running_batch returns the
+    lower batch id, deterministically, across repeated calls.
+11. Real-Postgres concurrency (threading.Barrier, per this project's
+    standard, repeated 8-10x): two workers race embed_next() for the
+    cross-batch-converged group above; exactly one embed() call happens;
+    the charged batch is always the lower-id batch.
+12. Stale/abandoned embedding reservation recovery (existing Milestone 4
+    mechanism) is exercised via this new call site at least once, end to
+    end, rather than only via the lower-level WorkerClaimService tests -
+    confirms the wiring does not accidentally bypass it.
+```
+
+### 16. Acceptance criteria
+
+- `IdentityResolutionService.resolve_next` accepts and correctly
+  threads `classification_run_id`; all pre-existing identity-resolution
+  tests pass unchanged (regression).
+- `PipelineEmbeddingService.embed_next` never calls
+  `EmbeddingClient.embed()` without either (a) a successful reservation
+  against a resolved `RUNNING` owning batch, or (b) confirmation that no
+  `RUNNING` batch currently owns the group.
+- `IngestionBatch.embeddings_reserved` is verifiably incremented and
+  never exceeds `max_embeddings` under the new call path (DB
+  `CHECK`/atomic-`UPDATE` guarantee, now actually exercised).
+- All 12 scenarios in section 15 pass, including the two real-Postgres
+  concurrency scenarios (10-11) repeated without flakiness across
+  multiple runs, per this project's non-negotiable concurrency-test
+  standard.
+- Zero changes to `NormalizationService`, `ChunkingService`,
+  `ArchiveProcessingService`, `ArchiveExtractor`, any model, or any
+  migration.
+- Full existing regression suite (886 tests collected as of `6acdc53`)
+  continues to pass, plus the new tests from section 15.
+- No real-T7 access; no production `aibrain` migration.
+
+### 17. Explicit exclusions
+
+- `BatchReportService` (frozen step 11) — a separate, later milestone.
+- Any scheduler-wide, cross-batch, or cross-worker orchestration loop —
+  this milestone governs two individual claim/reservation call sites,
+  exactly as Milestone 5 governed one recursive archive-claim operation;
+  outer loop scheduling remains a future milestone's responsibility.
+- Any change to `claim_content_identity_group`'s frozen global-claim
+  scoping, or to `NormalizationService`/`ChunkingService`.
+- Any new `ExpensiveOperationKind`, `IngestionFailureCode`,
+  `ContentPipelineState`, or `BatchStopReason` value.
+- Correcting the stale Milestone 5 roadmap/architecture status gap noted
+  in section 0 — flagged, not fixed, here.
+- Real-T7 ingestion of any kind.
+- Adversarial/concurrency tests beyond what section 15 lists (the full
+  frozen step-12 "final milestone" test suite remains gated on
+  `BatchReportService` and any further per-stage integration existing
+  independently of this pass).
+- **Multi-candidate reservation fallback** (Design Correction Pass,
+  section 4a, point 6): if the single resolved (lowest-id) owning batch
+  denies a reservation, `embed_next()` does not retry against a second,
+  also-eligible `RUNNING` batch within the same attempt — it defers and
+  relies on a later independent claim to re-resolve. A priority-ordered,
+  multi-candidate fallback scheme is out of scope for this milestone.
+
+### 18. Unresolved questions / gap register
+
+**DECIDED / FROZEN by this pass** (new design content, not previously
+specified anywhere):
+```
+The owning-batch resolution query and its ASC-by-id determinism rule
+(section 4) - previously only described in prose ("whichever batch
+claims first") without an exact, reproducible algorithm.
+
+The explicit "no RUNNING owning batch -> proceed unreserved, never
+strand the item" invariant (section 4) - previously unstated; without
+it, embedding completion for a group whose only owning batch(es) have
+since stopped would have been an unspecified/ambiguous case.
+
+The mutually-exclusive release-path discipline (section 3) between
+release_embedding_reservation/consume_embedding_reservation (when a
+reservation was taken) and the plain release_content_identity_group_
+claim (when it was not) - implementation-time discipline, not a new
+mechanism.
+
+**Design Correction Pass additions (section 4a)** - the full reservation-
+ownership semantics review required before freezing:
+lowest-id resolution is arbitration only, never business/semantic
+priority (points 3-4); RUNNING-only eligibility is enforced twice,
+independently, at resolution and at reservation (point 1); no
+"calling worker's batch" preference exists at this claim layer (point 2);
+a resolved-but-since-non-RUNNING batch cleanly denies via the existing
+BATCH_NOT_RUNNING path with no in-attempt fallback to a second candidate
+(points 5-6, the latter a named, bounded scope exclusion - see section 17);
+a granted reservation's fate is fully decoupled from the owning batch's
+later status transitions, unconditionally, per already-existing Milestone
+4 guarantees (point 7); all three clear/recover paths read reserved_
+embeddings_batch_id fresh from the row, never from a remembered value
+(point 8); claim_generation fences every reserve/consume/release/recover
+operation identically to the existing SourceInstance/ContentIdentityGroup
+claim mechanism, exercised end to end for the first time by this
+milestone's new call site (point 9); embedding-reservation ownership is
+a fourth, orthogonal concept (pure resource-cost attribution) never to
+be conflated with batch membership, content-identity convergence, or
+worker claim ownership (point 10).
+```
+
+**REQUIRES IMPLEMENTATION-TIME VERIFICATION**:
+```
+Exact SQL join shape/index usage for _resolve_owning_running_batch under
+real query-planning (logically specified above, not yet run against
+aibrain_test's actual indexes - source_instances.classification_run_id
+and content_identity_group_id are both already indexed per existing
+schema, but this pass does not re-verify the query plan).
+
+Whether the cross-batch-convergence concurrency scenario (test 11) is
+reproducible without flakiness at the same 8-10x repetition standard
+already achieved for every prior milestone's concurrency tests - expected
+based on the identical underlying SELECT ... FOR UPDATE SKIP LOCKED
+mechanism, but not yet run.
+```
+
+**DELIBERATELY DEFERRED** (unchanged from earlier gates):
+```
+BatchReportService (frozen step 11); a scheduler-wide worker-orchestration
+loop; the stale Milestone 5 roadmap/architecture "committed" status entry
+(section 0); risk_tier_actual numeric boundaries; any real-T7 access -
+all remain gated behind their own, separate future authorizations.
+```
+
+### 19. Safety verification
+
+- No real-T7 access: this design pass reads and reasons about only
+  already-committed repository code, the frozen architecture document,
+  and synthetic/conceptual examples. No T7 path is scanned, listed,
+  hashed, extracted, or referenced as a fixture anywhere in this section.
+- No production DB modification: no migration is specified as anything
+  other than "none" (section 5); no command was run against `aibrain`
+  during this design pass — only read-only inspection commands
+  (`alembic heads`/`current`, `git log`/`diff`/`show`, `pytest
+  --collect-only`) were executed, all against `aibrain_test`'s
+  migration head or the git history, never against `aibrain` itself.
+- No application/test/migration changes: this pass produced
+  documentation only (this section and the accompanying roadmap entry).
+- Working tree changes are limited to `docs/architecture/AI_Brain_Architecture.md`
+  and `docs/roadmap/Roadmap.md`.
+
+**Design Correction Pass outcome**: all ten reservation-ownership
+review points (section 4a) are now resolved explicitly — lowest-id
+resolution is confirmed arbitration-only with no business/semantic
+priority; RUNNING-only eligibility, ownership persistence across the
+owning batch's later status transitions, `reserved_embeddings_batch_id`
+clear/recovery, and `claim_generation` fencing are all stated precisely
+and grounded in already-existing, already-built (Milestone 4) mechanism
+rather than left implicit. The one bounded scope decision surfaced by
+this correction (no multi-candidate reservation fallback) is recorded
+as an explicit exclusion (section 17), not an open question.
+
+**This design pass authorizes no code, no migration, no test-code
+changes, and no real-T7 access.** The next gate, not yet opened, is a
+separate, explicit implementation authorization for Milestone 6.
+
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
   given import job. Derived, disposable, safe to delete and re-ingest.

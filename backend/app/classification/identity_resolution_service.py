@@ -54,13 +54,28 @@ class IdentityResolutionService:
         worker_id: str,
         workspace_root: Path,
         lease_duration: timedelta = timedelta(minutes=10),
+        classification_run_id: int | None = None,
     ) -> SourceInstance | None:
         """Claims and resolves ONE unresolved root-level SourceInstance.
         Returns the (now identity-resolved, or durably failed) instance,
         or None if no eligible work exists.
+
+        `classification_run_id` (Milestone 6 addition, default `None` =
+        pre-Milestone-6 behavior, unchanged): threaded straight into
+        `claim_source_instance_for_identity_resolution`, whose own
+        `classification_run_id`-scoped predicate has existed since
+        Milestone 4 but had no caller supplying it until now. When
+        given, restricts claimable candidates to that classification
+        run AND requires its owning `IngestionBatch` to be `RUNNING` -
+        both re-checked in the claim's own `UPDATE ... WHERE` (not just
+        its candidate `SELECT`), exactly as that method's docstring
+        specifies. `None` preserves the exact prior, batch-unaware
+        claim predicate for any caller that omits it.
         """
         instance = self.claims.claim_source_instance_for_identity_resolution(
-            worker_id=worker_id, lease_duration=lease_duration
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            classification_run_id=classification_run_id,
         )
         if instance is None:
             return None
