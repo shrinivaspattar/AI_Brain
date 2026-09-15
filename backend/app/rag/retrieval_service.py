@@ -44,7 +44,7 @@ class RetrievalService:
             select(DocumentChunk, Document, distance.label("distance"))
             .join(Document, DocumentChunk.document_id == Document.id)
             .where(DocumentChunk.embedding.is_not(None))
-            .order_by(distance)
+            .order_by(distance, DocumentChunk.id)
             .limit(top_k)
         )
 
