@@ -2414,6 +2414,50 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       `AI_Brain_Architecture.md`'s "Chain 1 ↔ Chain 2 relationship"
       subsection, marked **ARCHITECTURAL DECISION REQUIRED**.
 
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 14: live HTTP
+      composition proof — **committed** (`a1721b1`), test-only. Proves,
+      through the real HTTP layer rather than direct service
+      composition (Milestone 10) or the CLI's own report (Milestone 12),
+      that content driven through the real, unmodified Milestone 12 CLI
+      is genuinely retrievable and citable via `POST /rag/search` and
+      `POST /chat`. `EmbeddingClient.embed`/`ChatClient.chat` are
+      monkeypatched only at the class boundary; `RetrievalService` and
+      `ChatService` themselves are not mocked. Exact `DocumentChunk.id`/
+      `Document.id` asserted against the HTTP response, not "a result
+      came back." No citation/provenance enrichment introduced - the
+      existing four-field citation shape is re-observed, not extended.
+      2 new tests; full regression 979 passed, 1 skipped, stable across
+      3 runs; zero residue. No schema change, no T7 access.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 15:
+      deterministic retrieval ranking — **committed** (`29c6dee`).
+      `RetrievalService.search()`'s `order_by` gained a deterministic
+      secondary key: `distance ASC, DocumentChunk.id ASC` - primary
+      ordering by cosine distance is unchanged; the secondary key only
+      resolves an exact-distance tie (a real, already-present condition
+      in `test_retrieval.py`'s own fixture, previously tolerated via a
+      set-comparison rather than an ordered one). No reranking or
+      relevance-model change. `top_k` semantics and the `SearchResponse`/
+      `SearchResult` API shape are unchanged. The existing
+      `test_retrieval.py` test was extended, not replaced, to assert
+      exact tie order and call-to-call repeatability. Full regression
+      979 passed, 1 skipped. No schema/migration change, no T7 access.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 16: embedding
+      failure handling — **committed** (`cc53e02`). `EmbeddingUnavailableError`
+      (`app/embeddings/client.py`) mirrors the pre-existing
+      `ChatUnavailableError` convention exactly - the original exception
+      is chained via `from exc`. `POST /rag/search` and `POST /chat` each
+      convert only this exception into a clean `HTTP 503`; any other
+      exception continues to propagate unconverted, proven by a
+      dedicated test. Chain 1's (`ImportJobService._embed_documents`)
+      and Chain 2's (`PipelineEmbeddingService`, both call sites)
+      existing `except Exception` boundaries required no change - both
+      already caught any exception, confirmed by their own regression
+      suites (37/37, 46/46) passing unmodified. No retry/backoff
+      framework introduced. 4 new tests; full regression 983 passed,
+      1 skipped. No schema/migration change, no T7 access.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

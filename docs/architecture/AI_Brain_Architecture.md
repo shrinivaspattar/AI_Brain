@@ -10873,7 +10873,7 @@ as an explicit exclusion (section 17), not an open question.
 changes, and no real-T7 access.** The next gate, not yet opened, is a
 separate, explicit implementation authorization for Milestone 6.
 
-## Scaled Real-T7 Ingestion — Milestones 7–12: Report, Reconciliation, Orchestration & Operator CLI (implemented and committed)
+## Scaled Real-T7 Ingestion — Milestones 7–16: Report, Reconciliation, Orchestration, Operator CLI, HTTP Composition, Retrieval Determinism & Embedding Failure Handling (implemented and committed)
 
 Milestones 7–12 were each separately authorized, implemented, and
 committed following Milestone 6, but — unlike Milestones 1–6 above —
@@ -11026,6 +11026,43 @@ rather than assumed:
 embedding claim query ever re-admits, so this suite has zero Ollama
 dependency by design). Full regression 977 passed, 1 skipped, stable
 across 3 runs. No schema change.
+
+**Milestone 14 — live HTTP composition proof** (`a1721b1`, test-only).
+Proves, through the real HTTP layer rather than direct service
+composition (Milestone 10) or the CLI's own report (Milestone 12), that
+content driven through the real, unmodified Milestone 12 CLI is
+genuinely retrievable and citable via `POST /rag/search` and
+`POST /chat` - the same code path an actual user hits.
+`EmbeddingClient.embed`/`ChatClient.chat` are monkeypatched only at the
+class boundary; neither `RetrievalService` nor `ChatService` is mocked
+or bypassed. Exact `DocumentChunk.id`/`Document.id` are asserted
+against the HTTP response. No citation/provenance enrichment was
+introduced - the existing four-field citation shape
+(`document_chunk_id`/`document_id`/`document_title`/`document_source`)
+is re-observed at this boundary, not extended.
+
+**Milestone 15 — deterministic retrieval ranking** (`29c6dee`).
+`RetrievalService.search()`'s `order_by` gained a deterministic
+secondary key: `distance ASC, DocumentChunk.id ASC`. Primary ordering
+by cosine distance is unchanged; the secondary key resolves only an
+exact-distance tie - a real, already-present condition in
+`test_retrieval.py`'s own fixture, previously tolerated via a
+set-comparison rather than an ordered one. No reranking or
+relevance-model change; `top_k` semantics and the `SearchResponse`/
+`SearchResult` API shape are unchanged. No schema/migration change.
+
+**Milestone 16 — embedding failure handling** (`cc53e02`).
+`EmbeddingUnavailableError` (`app/embeddings/client.py`) mirrors the
+pre-existing `ChatUnavailableError` convention exactly, including
+chaining the original exception via `from exc`. `POST /rag/search` and
+`POST /chat` each convert only this exception into a clean `HTTP 503`;
+any other exception continues to propagate unconverted. Chain 1's
+(`ImportJobService._embed_documents`) and Chain 2's
+(`PipelineEmbeddingService`, both call sites) existing
+`except Exception` boundaries required no change, since both already
+caught any exception - confirmed by their own regression suites passing
+unmodified. No retry/backoff framework was introduced. No
+schema/migration change.
 
 ### Chain 1 ↔ Chain 2 relationship
 
