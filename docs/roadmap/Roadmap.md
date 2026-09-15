@@ -2458,6 +2458,29 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       framework introduced. 4 new tests; full regression 983 passed,
       1 skipped. No schema/migration change, no T7 access.
 
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 18: mixed
+      Chain 1 + Chain 2 retrieval proof — **committed** (`5d008eb`),
+      test-only. Directly proved (not merely argued from code) that
+      genuine Chain 1 content (`ImportJobService` → `Document`/
+      `DocumentChunk`) and genuine Chain 2 content (the real, unmodified
+      Milestone 12 CLI driving the real Chain 2 pipeline) can coexist in
+      the same `aibrain_test` database and both participate correctly in
+      the existing `RetrievalService`, `POST /rag/search`, and
+      `POST /chat` paths, with no chain-specific retrieval filtering
+      anywhere. Both ingestion paths were exercised through their own
+      genuine, already-established entry points, never by manually
+      constructing final rows; the real `RetrievalService`/`ChatService`
+      were used unmodified, with only the established model-client seams
+      (`EmbeddingClient.embed`/`ChatClient.chat`) faked. Observed the
+      current database-level provenance distinction as tested, not as a
+      newly-declared rule: Chain 1 rows carry `import_job_id` populated
+      and `content_identity_group_id` NULL; Chain 2 rows carry the
+      reverse. Citation shape unchanged. No production, schema, or API
+      change of any kind; the long-term Chain 1 ↔ Chain 2 relationship
+      remains intentionally unresolved. 1 new test, stable across 3
+      runs; full regression 984 passed, 1 skipped; zero residue. No
+      schema/migration change, no T7 access.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

@@ -10873,7 +10873,7 @@ as an explicit exclusion (section 17), not an open question.
 changes, and no real-T7 access.** The next gate, not yet opened, is a
 separate, explicit implementation authorization for Milestone 6.
 
-## Scaled Real-T7 Ingestion — Milestones 7–16: Report, Reconciliation, Orchestration, Operator CLI, HTTP Composition, Retrieval Determinism & Embedding Failure Handling (implemented and committed)
+## Scaled Real-T7 Ingestion — Milestones 7–18: Report, Reconciliation, Orchestration, Operator CLI, HTTP Composition, Retrieval Determinism, Embedding Failure Handling & Mixed-Chain Retrieval Proof (implemented and committed)
 
 Milestones 7–12 were each separately authorized, implemented, and
 committed following Milestone 6, but — unlike Milestones 1–6 above —
@@ -11063,6 +11063,29 @@ any other exception continues to propagate unconverted. Chain 1's
 caught any exception - confirmed by their own regression suites passing
 unmodified. No retry/backoff framework was introduced. No
 schema/migration change.
+
+**Milestone 18 — mixed Chain 1 + Chain 2 retrieval proof** (`5d008eb`,
+test-only). Directly proved, rather than argued from code, that genuine
+Chain 1 content (`ImportJobService` → `Document`/`DocumentChunk`) and
+genuine Chain 2 content (the real, unmodified Milestone 12 CLI driving
+the real Chain 2 pipeline) can coexist in the same `aibrain_test`
+database and both correctly participate in the existing
+`RetrievalService`, `POST /rag/search`, and `POST /chat` paths, with no
+chain-specific retrieval filtering anywhere. Both ingestion paths were
+exercised through their own genuine, already-established entry points -
+never by manually constructing final `Document`/`DocumentChunk` rows -
+and `RetrievalService`/`ChatService` themselves were used unmodified,
+with only the established model-client seams (`EmbeddingClient.embed`/
+`ChatClient.chat`) faked. The current database-level provenance
+distinction was observed as tested, not declared as a new rule: Chain 1
+rows carry `import_job_id` populated and `content_identity_group_id`
+`NULL`; Chain 2 rows carry the reverse. The existing four-field
+citation shape is unchanged. No production, schema, or API change of
+any kind was required. **The long-term Chain 1 ↔ Chain 2 relationship
+remains intentionally unresolved** - this milestone proves the two
+paths coexist safely today, not that their relationship has been
+decided; see the subsection immediately below, unchanged since
+Milestone 13.
 
 ### Chain 1 ↔ Chain 2 relationship
 
