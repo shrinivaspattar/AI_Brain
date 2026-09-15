@@ -54,6 +54,7 @@ def test_send_message_returns_reply_with_citations() -> None:
                             "document_id": "doc-1",
                             "document_title": "notes.txt",
                             "document_source": "/documents/notes.txt",
+                            "source_occurrences": None,
                         }
                     ],
                     "created_at": "2026-08-12T10:00:00Z",

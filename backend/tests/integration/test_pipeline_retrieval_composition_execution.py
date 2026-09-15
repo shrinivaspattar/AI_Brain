@@ -155,7 +155,9 @@ class FakeChatClient:
         return SimpleNamespace(content=self.reply_content, tool_calls=None)
 
 
-def _run_pipeline_to_embedded_chunk(db: Session, tmp_path, content_text: str) -> tuple[Document, DocumentChunk, FakeEmbeddingClient]:
+def _run_pipeline_to_embedded_chunk(
+    db: Session, tmp_path, content_text: str
+) -> tuple[Document, DocumentChunk, FakeEmbeddingClient, SourceInstance]:
     """The frozen M10 call sequence: a real .txt file on disk, through
     IdentityResolutionService -> NormalizationService -> ChunkingService
     -> PipelineEmbeddingService, using only the real production
@@ -202,7 +204,7 @@ def _run_pipeline_to_embedded_chunk(db: Session, tmp_path, content_text: str) ->
     assert chunk.embedding is not None
     assert chunk.content == content_text  # short text -> chunk_text() returns it verbatim (chunker.py)
 
-    return document, chunk, fake_embedding_client
+    return document, chunk, fake_embedding_client, instance
 
 
 # ============================================================
@@ -212,7 +214,7 @@ def _run_pipeline_to_embedded_chunk(db: Session, tmp_path, content_text: str) ->
 
 def test_pipeline_output_is_retrievable_via_real_retrieval_service(db: Session, tmp_path) -> None:
     content_text = "AI_Brain scaled ingestion composition proof content for Milestone 10"
-    document, chunk, fake_embedding_client = _run_pipeline_to_embedded_chunk(db, tmp_path, content_text)
+    document, chunk, fake_embedding_client, instance = _run_pipeline_to_embedded_chunk(db, tmp_path, content_text)
 
     retrieval = RetrievalService(db, embedding_client=fake_embedding_client)
     results = retrieval.search(content_text, top_k=5)
@@ -232,6 +234,14 @@ def test_pipeline_output_is_retrievable_via_real_retrieval_service(db: Session, 
     # transaction, so this also implicitly proves it is the top match).
     assert top.distance == pytest.approx(0.0, abs=1e-9)
 
+    # Milestone 22/23: real Chain 2 provenance now flows through -
+    # exactly the one real SourceInstance this test created, never a
+    # fabricated or selected "representative."
+    assert top.source_occurrences is not None
+    assert len(top.source_occurrences) == 1
+    assert top.source_occurrences[0].root_t7_path == instance.root_t7_path
+    assert top.source_occurrences[0].member_path is None
+
 
 # ============================================================
 # Test 2: Pipeline -> Retrieval -> Chat
@@ -240,7 +250,7 @@ def test_pipeline_output_is_retrievable_via_real_retrieval_service(db: Session, 
 
 def test_pipeline_output_is_consumed_by_chat_service_with_correct_citation(db: Session, tmp_path) -> None:
     content_text = "AI_Brain scaled ingestion composition proof content for chat consumption"
-    document, chunk, fake_embedding_client = _run_pipeline_to_embedded_chunk(db, tmp_path, content_text)
+    document, chunk, fake_embedding_client, instance = _run_pipeline_to_embedded_chunk(db, tmp_path, content_text)
 
     retrieval = RetrievalService(db, embedding_client=fake_embedding_client)
     fake_chat_client = FakeChatClient(reply_content="Based on your documents, here is the deterministic answer.")
@@ -260,11 +270,10 @@ def test_pipeline_output_is_consumed_by_chat_service_with_correct_citation(db: S
     sent_messages = fake_chat_client.calls[0]
     assert any(content_text in message.get("content", "") for message in sent_messages)
 
-    # Citation contract as it CURRENTLY exists (Document.source/title
-    # only) - documented, not extended. The known provenance-richness
-    # limitation (no SourceInstance/ProvenanceLink surfaced) remains
-    # deferred to the separate Answer-Provenance Decision; this test
-    # does not attempt to close that gap.
+    # Citation contract as of Milestone 22/23: the original four fields
+    # (Document.source/title etc.) plus real Chain 2 provenance - no
+    # longer the "known limitation" this test previously only
+    # documented; the gap is now closed for Chain 2 content.
     assert assistant_message.citations is not None
     assert len(assistant_message.citations) >= 1
     citation = assistant_message.citations[0]
@@ -272,3 +281,7 @@ def test_pipeline_output_is_consumed_by_chat_service_with_correct_citation(db: S
     assert citation["document_id"] == document.id
     assert citation["document_title"] == document.title
     assert citation["document_source"] == document.source
+    assert citation["source_occurrences"] is not None
+    assert len(citation["source_occurrences"]) == 1
+    assert citation["source_occurrences"][0]["root_t7_path"] == instance.root_t7_path
+    assert citation["source_occurrences"][0]["member_path"] is None

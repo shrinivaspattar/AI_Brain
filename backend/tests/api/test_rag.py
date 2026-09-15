@@ -23,6 +23,7 @@ def test_search_returns_ranked_results() -> None:
             result.document.title = "notes.txt"
             result.document.source = "/documents/notes.txt"
             result.distance = 0.2
+            result.source_occurrences = None
 
             service_class.return_value.search.return_value = [result]
 
@@ -44,6 +45,7 @@ def test_search_returns_ranked_results() -> None:
                         "chunk_index": 0,
                         "content": "hello AI_Brain",
                         "score": 0.8,
+                        "source_occurrences": None,
                     }
                 ]
             }

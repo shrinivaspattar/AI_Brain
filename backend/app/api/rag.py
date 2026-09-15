@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.embeddings.client import EmbeddingUnavailableError
 from app.rag.retrieval_service import RetrievalService
-from app.schemas.rag import SearchRequest, SearchResponse, SearchResult
+from app.schemas.rag import AncestryStep, SearchRequest, SearchResponse, SearchResult, SourceOccurrence
 
 router = APIRouter(
     prefix="/rag",
@@ -41,7 +41,25 @@ def search(
                 chunk_index=result.chunk.chunk_index,
                 content=result.chunk.content,
                 score=1 - result.distance,
+                source_occurrences=_to_schema_occurrences(result.source_occurrences),
             )
             for result in results
         ]
     )
+
+
+def _to_schema_occurrences(occurrences) -> list[SourceOccurrence] | None:
+    if occurrences is None:
+        return None
+    return [
+        SourceOccurrence(
+            root_t7_path=occurrence.root_t7_path,
+            member_path=occurrence.member_path,
+            archive_ancestry=(
+                [AncestryStep(kind=step.kind, path=step.path) for step in occurrence.archive_ancestry]
+                if occurrence.archive_ancestry is not None
+                else None
+            ),
+        )
+        for occurrence in occurrences
+    ]

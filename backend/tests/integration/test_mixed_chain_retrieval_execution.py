@@ -381,6 +381,7 @@ def test_mixed_chain_1_and_chain_2_content_both_retrievable_and_citable(
             chain2_chunk_id = chain2_chunks[0].id
             chain2_title = chain2_document.title
             chain2_source = chain2_document.source
+            chain2_root_t7_path = chain2_instance.root_t7_path
 
         # -- SHARED DATABASE PROOF: both coexist simultaneously --------
         with Session(engine) as db:
@@ -399,12 +400,21 @@ def test_mixed_chain_1_and_chain_2_content_both_retrievable_and_citable(
             assert chain1_results[0].chunk.id == chain1_chunk_id
             assert chain1_results[0].document.id == chain1_document_id
             assert chain1_results[0].distance == pytest.approx(0.0, abs=1e-6)
+            # Milestone 22/23: Chain 1 has no SourceInstance graph -
+            # provenance is structurally absent, never fabricated.
+            assert chain1_results[0].source_occurrences is None
 
             chain2_results = retrieval.search(chain2_content, top_k=1)
             assert len(chain2_results) == 1
             assert chain2_results[0].chunk.id == chain2_chunk_id
             assert chain2_results[0].document.id == chain2_document_id
             assert chain2_results[0].distance == pytest.approx(0.0, abs=1e-6)
+            # Chain 2 provenance: exactly the one real SourceInstance
+            # this test created, never a selected "representative."
+            assert chain2_results[0].source_occurrences is not None
+            assert len(chain2_results[0].source_occurrences) == 1
+            assert chain2_results[0].source_occurrences[0].root_t7_path == chain2_root_t7_path
+            assert chain2_results[0].source_occurrences[0].member_path is None
 
         # -- HTTP POST /rag/search PROOF --------------------------------
         app.dependency_overrides[get_db] = _override_get_db(engine)
@@ -418,6 +428,7 @@ def test_mixed_chain_1_and_chain_2_content_both_retrievable_and_citable(
             assert body1["results"][0]["chunk_id"] == chain1_chunk_id
             assert body1["results"][0]["document_id"] == chain1_document_id
             assert body1["results"][0]["content"] == chain1_content
+            assert body1["results"][0]["source_occurrences"] is None
 
             response2 = client.post("/rag/search", json={"query": chain2_content, "top_k": 1})
             assert response2.status_code == 200
@@ -426,6 +437,9 @@ def test_mixed_chain_1_and_chain_2_content_both_retrievable_and_citable(
             assert body2["results"][0]["chunk_id"] == chain2_chunk_id
             assert body2["results"][0]["document_id"] == chain2_document_id
             assert body2["results"][0]["content"] == chain2_content
+            assert body2["results"][0]["source_occurrences"] == [
+                {"root_t7_path": chain2_root_t7_path, "member_path": None, "archive_ancestry": None}
+            ]
         finally:
             app.dependency_overrides.clear()
 
@@ -445,11 +459,15 @@ def test_mixed_chain_1_and_chain_2_content_both_retrievable_and_citable(
                 "document_id",
                 "document_title",
                 "document_source",
+                "source_occurrences",
             }
             assert citations1[0]["document_chunk_id"] == chain1_chunk_id
             assert citations1[0]["document_id"] == chain1_document_id
             assert citations1[0]["document_title"] == chain1_title
             assert citations1[0]["document_source"] == chain1_source
+            # Milestone 22/23: Chain 1 citations never receive
+            # fabricated provenance - null, not an empty list.
+            assert citations1[0]["source_occurrences"] is None
 
             chat2 = client.post("/chat", json={"message": chain2_content, "top_k": 1})
             assert chat2.status_code == 200
@@ -462,11 +480,18 @@ def test_mixed_chain_1_and_chain_2_content_both_retrievable_and_citable(
                 "document_id",
                 "document_title",
                 "document_source",
+                "source_occurrences",
             }
             assert citations2[0]["document_chunk_id"] == chain2_chunk_id
             assert citations2[0]["document_id"] == chain2_document_id
             assert citations2[0]["document_title"] == chain2_title
             assert citations2[0]["document_source"] == chain2_source
+            # Chain 2 citation carries real provenance - one occurrence,
+            # not selected as "the" source, per the frozen Milestone 22
+            # semantic.
+            assert citations2[0]["source_occurrences"] == [
+                {"root_t7_path": chain2_root_t7_path, "member_path": None, "archive_ancestry": None}
+            ]
         finally:
             app.dependency_overrides.clear()
 

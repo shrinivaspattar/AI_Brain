@@ -180,6 +180,7 @@ def test_send_message_includes_citations_and_context_in_prompt() -> None:
             "document_id": "doc-1",
             "document_title": "notes.txt",
             "document_source": "/documents/notes.txt",
+            "source_occurrences": None,
         }
     ]
 

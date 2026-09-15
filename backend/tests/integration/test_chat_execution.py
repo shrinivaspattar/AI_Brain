@@ -161,6 +161,7 @@ def test_send_message_cites_retrieved_chunks() -> None:
                     "document_id": document.id,
                     "document_title": "brain-notes.txt",
                     "document_source": "/chat-test/brain-notes.txt",
+                    "source_occurrences": None,
                 }
             ]
 

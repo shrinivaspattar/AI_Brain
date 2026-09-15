@@ -327,6 +327,7 @@ def test_cli_ingested_content_is_cited_via_real_chat_endpoint(
             expected_document_id = document.id
             expected_title = document.title
             expected_source = document.source
+            expected_root_t7_path = instance.root_t7_path
 
         app.dependency_overrides[get_db] = _override_get_db(engine)
         try:
@@ -344,21 +345,25 @@ def test_cli_ingested_content_is_cited_via_real_chat_endpoint(
         assert len(citations) == 1
         citation = citations[0]
 
-        # Milestone 10's own, still-current finding, re-observed here at
-        # the HTTP boundary rather than fixed: the citation contract
-        # carries exactly these four fields, nothing richer. Recorded
-        # as an observation for a separate, not-yet-authorized
-        # provenance milestone - never touched by this one.
+        # Milestone 22/23: the citation contract now also carries real
+        # Chain 2 provenance (source_occurrences) alongside the four
+        # original fields - the M10-era "nothing richer" finding this
+        # comment used to record is now closed for Chain 2 content.
         assert set(citation.keys()) == {
             "document_chunk_id",
             "document_id",
             "document_title",
             "document_source",
+            "source_occurrences",
         }
         assert citation["document_chunk_id"] == expected_chunk_id
         assert citation["document_id"] == expected_document_id
         assert citation["document_title"] == expected_title
         assert citation["document_source"] == expected_source
+        assert citation["source_occurrences"] is not None
+        assert len(citation["source_occurrences"]) == 1
+        assert citation["source_occurrences"][0]["root_t7_path"] == expected_root_t7_path
+        assert citation["source_occurrences"][0]["member_path"] is None
 
     finally:
         if classification_run_id is not None:

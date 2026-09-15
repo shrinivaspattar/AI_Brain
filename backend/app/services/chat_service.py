@@ -372,6 +372,29 @@ class ChatService:
                 "document_id": result.document.id,
                 "document_title": result.document.title,
                 "document_source": result.document.source,
+                "source_occurrences": ChatService._occurrences_to_dicts(result.source_occurrences),
             }
             for result in retrieved
+        ]
+
+    @staticmethod
+    def _occurrences_to_dicts(occurrences) -> list[dict] | None:
+        """Maps the already-computed RetrievedChunk.source_occurrences
+        (Milestone 22) into the same plain-dict shape this method
+        already uses for the other citation fields - never a second,
+        independent provenance query. `occurrences` is None for a
+        Chain 1 result (no SourceInstance graph exists)."""
+        if occurrences is None:
+            return None
+        return [
+            {
+                "root_t7_path": occurrence.root_t7_path,
+                "member_path": occurrence.member_path,
+                "archive_ancestry": (
+                    [{"kind": step.kind, "path": step.path} for step in occurrence.archive_ancestry]
+                    if occurrence.archive_ancestry is not None
+                    else None
+                ),
+            }
+            for occurrence in occurrences
         ]
