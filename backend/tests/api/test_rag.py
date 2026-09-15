@@ -1,8 +1,10 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.db.session import get_db
+from app.embeddings.client import EmbeddingUnavailableError
 from app.main import app
 
 
@@ -87,3 +89,45 @@ def test_search_rejects_top_k_out_of_range() -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_search_returns_service_unavailable_when_embedding_fails() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.rag.RetrievalService") as service_class:
+            service_class.return_value.search.side_effect = EmbeddingUnavailableError(
+                "connection refused"
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/rag/search", json={"query": "hello"})
+
+            assert response.status_code == 503
+            assert response.json() == {
+                "detail": "Embedding model unavailable: connection refused"
+            }
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_search_does_not_convert_unrelated_exceptions_to_503() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.rag.RetrievalService") as service_class:
+            service_class.return_value.search.side_effect = RuntimeError("boom")
+
+            client = TestClient(app)
+
+            with pytest.raises(RuntimeError, match="boom"):
+                client.post("/rag/search", json={"query": "hello"})
+
+    finally:
+        app.dependency_overrides.clear()

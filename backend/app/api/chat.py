@@ -3,6 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.embeddings.client import EmbeddingUnavailableError
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.schemas.chat import ChatRequest, ChatResponse, MessageResponse
@@ -20,7 +21,7 @@ router = APIRouter(
     response_model=ChatResponse,
     responses={
         404: {"description": "Conversation not found"},
-        503: {"description": "Chat model unavailable"},
+        503: {"description": "Chat model or embedding model unavailable"},
     },
 )
 def send_message(
@@ -44,6 +45,11 @@ def send_message(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Chat model unavailable: {exc}",
+        )
+    except EmbeddingUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Embedding model unavailable: {exc}",
         )
 
     return ChatResponse(

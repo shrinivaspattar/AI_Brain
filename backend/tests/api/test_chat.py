@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from app.db.session import get_db
+from app.embeddings.client import EmbeddingUnavailableError
 from app.main import app
 from app.services.chat_client import ChatUnavailableError
 
@@ -113,6 +114,30 @@ def test_send_message_returns_service_unavailable_when_ollama_fails() -> None:
 
             assert response.status_code == 503
             assert "connection refused" in response.json()["detail"]
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_send_message_returns_service_unavailable_when_embedding_fails() -> None:
+    db = MagicMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            service_class.return_value.send_message.side_effect = (
+                EmbeddingUnavailableError("connection refused")
+            )
+
+            client = TestClient(app)
+
+            response = client.post("/chat", json={"message": "hi"})
+
+            assert response.status_code == 503
+            assert response.json() == {
+                "detail": "Embedding model unavailable: connection refused"
+            }
 
     finally:
         app.dependency_overrides.clear()

@@ -1,6 +1,8 @@
 from unittest.mock import MagicMock, patch
 
-from app.embeddings.client import EmbeddingClient
+import pytest
+
+from app.embeddings.client import EmbeddingClient, EmbeddingUnavailableError
 
 
 def test_embed_returns_empty_list_for_no_texts() -> None:
@@ -35,3 +37,17 @@ def test_embed_client_defaults_from_settings() -> None:
         EmbeddingClient()
 
         client_class.assert_called_once_with(host=settings.OLLAMA_HOST)
+
+
+def test_embed_raises_embedding_unavailable_error_on_underlying_failure() -> None:
+    with patch("app.embeddings.client.ollama.Client") as client_class:
+        underlying = ConnectionError("connection refused")
+        client_class.return_value.embed.side_effect = underlying
+
+        client = EmbeddingClient()
+
+        with pytest.raises(EmbeddingUnavailableError) as excinfo:
+            client.embed(["hello"])
+
+        assert str(excinfo.value) == "connection refused"
+        assert excinfo.value.__cause__ is underlying

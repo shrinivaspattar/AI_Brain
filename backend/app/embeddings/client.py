@@ -5,6 +5,10 @@ import ollama
 from app.core.config import settings
 
 
+class EmbeddingUnavailableError(RuntimeError):
+    """Raised when the Ollama embed API can't be reached or fails."""
+
+
 class EmbeddingClient:
     """Thin wrapper around the Ollama embed API."""
 
@@ -21,5 +25,9 @@ class EmbeddingClient:
         if not texts:
             return []
 
-        response = self._client.embed(model=self.model, input=texts)
+        try:
+            response = self._client.embed(model=self.model, input=texts)
+        except Exception as exc:
+            raise EmbeddingUnavailableError(str(exc)) from exc
+
         return [list(embedding) for embedding in response.embeddings]
