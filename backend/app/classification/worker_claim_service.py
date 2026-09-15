@@ -302,6 +302,7 @@ class WorkerClaimService:
         worker_id: str,
         lease_duration: timedelta,
         classification_run_id: int | None = None,
+        exclude_ids: frozenset[int] | None = None,
     ) -> SourceInstance | None:
         """Claims one root-level, non-archive SourceInstance needing
         identity resolution: content_identity_group_id IS NULL.
@@ -345,6 +346,27 @@ class WorkerClaimService:
         If the `UPDATE` fails to match for this reason, the transaction
         is rolled back and `None` is returned - a clean "no work
         available right now," never a claim on a non-RUNNING batch.
+
+        `exclude_ids` (Milestone 11 addition, default `None` = pre-
+        Milestone-11 behavior, unchanged): when given, the candidate
+        `SELECT` also excludes these specific ids from consideration.
+        This is a pure, per-call, caller-supplied narrowing of the
+        candidate pool - it changes nothing about `claim_generation`,
+        lease fencing, or any other row's eligibility, and introduces
+        no new persisted state (the caller, `BatchOrchestratorService`,
+        owns an in-memory set for the lifetime of one invocation only).
+        It exists to close a real starvation gap found during that
+        milestone's own implementation: because a failed claim's
+        release resets `claimed_by`/`claimed_at` to NULL immediately
+        (no lease wait), and the candidate `SELECT` orders by `created_
+        at` alone, an old, deterministically-failing row can win that
+        ordering every single time and starve every newer, genuinely
+        distinct, eligible row for an entire bounded orchestrator
+        invocation. `exclude_ids` lets such a caller say "not this one
+        again, this invocation" without inventing any retry-exhaustion
+        policy, counter, or schema - a row excluded here remains fully,
+        immediately eligible for any OTHER caller, or for the very next
+        invocation of the same caller.
         """
         stale_before = datetime.now(UTC) - lease_duration
 
@@ -367,6 +389,8 @@ class WorkerClaimService:
             select_conditions.append(SourceInstance.classification_run_id == classification_run_id)
             select_conditions.append(_running_batch_exists_for_classification_run(classification_run_id))
             update_conditions.append(_running_batch_exists_for_classification_run(classification_run_id))
+        if exclude_ids:
+            select_conditions.append(~SourceInstance.id.in_(exclude_ids))
 
         candidate_id = self.db.execute(
             select(SourceInstance.id)
@@ -432,6 +456,7 @@ class WorkerClaimService:
         worker_id: str,
         lease_duration: timedelta,
         classification_run_id: int | None = None,
+        exclude_ids: frozenset[int] | None = None,
     ) -> SourceInstance | None:
         """Claims one TOP-LEVEL (T7-visible, `member_path IS NULL`)
         archive SourceInstance that has not yet been successfully
@@ -458,6 +483,12 @@ class WorkerClaimService:
         pre-Milestone-4 behavior, unchanged) - see `claim_source_
         instance_for_identity_resolution`'s docstring for the exact
         batch-scoping/admission semantics; identical here.
+
+        `exclude_ids` (Milestone 11 addition, default `None` = pre-
+        Milestone-11 behavior, unchanged) - see `claim_source_instance_
+        for_identity_resolution`'s docstring for the exact rationale
+        (a starvation gap found during that milestone's own
+        implementation) and safety argument; identical here.
         """
         stale_before = datetime.now(UTC) - lease_duration
 
@@ -486,6 +517,8 @@ class WorkerClaimService:
             select_conditions.append(SourceInstance.classification_run_id == classification_run_id)
             select_conditions.append(_running_batch_exists_for_classification_run(classification_run_id))
             update_conditions.append(_running_batch_exists_for_classification_run(classification_run_id))
+        if exclude_ids:
+            select_conditions.append(~SourceInstance.id.in_(exclude_ids))
 
         candidate_id = self.db.execute(
             select(SourceInstance.id)

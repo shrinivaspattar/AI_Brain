@@ -55,6 +55,7 @@ class IdentityResolutionService:
         workspace_root: Path,
         lease_duration: timedelta = timedelta(minutes=10),
         classification_run_id: int | None = None,
+        exclude_ids: frozenset[int] | None = None,
     ) -> SourceInstance | None:
         """Claims and resolves ONE unresolved root-level SourceInstance.
         Returns the (now identity-resolved, or durably failed) instance,
@@ -71,11 +72,22 @@ class IdentityResolutionService:
         its candidate `SELECT`), exactly as that method's docstring
         specifies. `None` preserves the exact prior, batch-unaware
         claim predicate for any caller that omits it.
+
+        `exclude_ids` (Milestone 11 addition, default `None` = pre-
+        Milestone-11 behavior, unchanged): threaded straight into
+        `claim_source_instance_for_identity_resolution`'s own
+        `exclude_ids` parameter - lets a caller (`BatchOrchestratorService`)
+        that already claimed-and-processed certain ids earlier in the
+        same bounded invocation ensure THIS call reaches a genuinely
+        different, not-yet-attempted row instead of starving on one
+        that keeps winning the claim's own `ORDER BY created_at`
+        ordering. See that method's docstring for the full rationale.
         """
         instance = self.claims.claim_source_instance_for_identity_resolution(
             worker_id=worker_id,
             lease_duration=lease_duration,
             classification_run_id=classification_run_id,
+            exclude_ids=exclude_ids,
         )
         if instance is None:
             return None

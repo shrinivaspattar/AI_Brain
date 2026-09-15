@@ -175,11 +175,23 @@ class ArchiveProcessingService:
         max_depth: int = 10,
         classification_run_id: int | None = None,
         guard: BatchResourceGuard | None = None,
+        exclude_ids: frozenset[int] | None = None,
     ) -> SourceInstance | None:
+        """`exclude_ids` (Milestone 11 addition, default `None` = pre-
+        Milestone-11 behavior, unchanged): threaded straight into
+        `claim_source_instance_for_archive_processing`'s own
+        `exclude_ids` parameter - lets a caller (`BatchOrchestratorService`)
+        that already claimed-and-processed certain ids earlier in the
+        same bounded invocation ensure this call reaches a genuinely
+        different, not-yet-attempted row instead of starving on one
+        that keeps winning the claim's own `ORDER BY created_at`
+        ordering. See that method's docstring for the full rationale.
+        """
         instance = self.claims.claim_source_instance_for_archive_processing(
             worker_id=worker_id,
             lease_duration=lease_duration,
             classification_run_id=classification_run_id,
+            exclude_ids=exclude_ids,
         )
         if instance is None:
             return None
