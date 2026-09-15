@@ -2117,9 +2117,10 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       `AI_Brain_Architecture.md`'s corresponding sections for each
       milestone's exact scope.
 
-- [ ] Scaled Real-T7 Ingestion — Milestone 5 Design: Archive Processing
-      / Extraction — **design-only pass produced, not yet reviewed or
-      frozen**. Sits on top of the already-frozen implementation design
+- [x] Scaled Real-T7 Ingestion — Milestone 5 Design: Archive Processing
+      / Extraction — **design pass reviewed and frozen (after a
+      correction pass), then implemented and committed at `6acdc53`**.
+      Sits on top of the already-frozen implementation design
       (`2fab4b3`) and the four committed milestones above; makes the
       **already-existing, already-tested** archive pipeline from the
       earlier "Controlled T7 -> AI_Brain Ingestion Design" chain
@@ -2207,10 +2208,10 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       either a further design-review round or a separate, explicit
       implementation authorization for Milestone 5.
 
-- [ ] Scaled Real-T7 Ingestion — Milestone 6 Design: Identity Resolution
-      & Embedding-Reservation Batch Integration — **design-only pass,
-      reviewed and FROZEN after a correction pass; implementation not
-      yet authorized**. Opened after Milestone 5
+- [x] Scaled Real-T7 Ingestion — Milestone 6 Design: Identity Resolution
+      & Embedding-Reservation Batch Integration — **design pass,
+      reviewed and FROZEN after a correction pass; implemented and
+      committed at `e06de5a`**. Opened after Milestone 5
       (`6acdc53`) closed; establishes the boundary by inspecting the
       repository directly against the frozen Implementation Design
       Pass's (`2fab4b3`) 12-step order rather than assuming a roadmap
@@ -2288,9 +2289,130 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       status left for a future, separately-authorized documentation
       correction.
 
+      **Corrected by Milestone 13's documentation reconciliation pass**:
+      both the Milestone 5 and Milestone 6 entries above now reflect
+      their actual implemented/committed status; this paragraph is kept
+      as a historical record of when and why the staleness was first
+      noticed, not deleted.
+
       **This pass authorizes no code, no migration, no test-code
       changes, and no real-T7 access.** **Next gate, not yet opened**:
       a separate, explicit implementation authorization for Milestone 6.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 7:
+      `BatchReportService` — **committed** (`3136ffb`). A pure read/
+      aggregation service (`generate_report(batch_id) -> BatchReport`):
+      no claim, no lock, no write, no T7 access. Counts are scoped
+      correctly to root-level `SourceInstance` rows only (archive
+      members excluded from every denominator), with an explicit,
+      visible `NULL` bucket for `risk_tier_actual` (still honestly
+      unpopulated since Milestone 5) and `actual_source_bytes_read`/
+      drift-outcome counts represented via a new `Instrumented[T]`
+      type rather than a bare `0`/`None` — both remain explicitly
+      deferred, not computed. Denominator contradictions raise
+      `BatchReportInvariantViolation` rather than being silently
+      clamped. 21 new tests; full regression 930 collected, 929
+      passed, 1 skipped (pre-existing, environmental). No schema
+      change; `aibrain` unmigrated throughout.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 8:
+      `BatchCompletionReconciliationService` — **committed** (`65b4b9c`).
+      Closes the last piece of frozen step 9: `check_and_complete
+      (batch_id)` reads Milestone 7's own report, declares
+      `SOURCE_WORK_EXHAUSTED` iff `unattempted_selected_count == 0`
+      and `terminal_source_count == attempted_source_count`, then
+      delegates exclusively to the existing `BatchControlService.
+      complete()` — never mutates `IngestionBatch` directly.
+      Envelope-exhaustion and runtime-budget-exhaustion detection are
+      explicitly **not** implemented, deferred to a future, separate
+      design decision; `NEEDS_REVIEW` is treated as terminal for this
+      decision, distinct from `successful_ingestion_count`. 15 new
+      tests, including a real two-worker completion race (80 total
+      races, zero flakiness); full regression 945 collected, 944
+      passed, 1 skipped. No schema change.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 9: final
+      cross-stage adversarial validation — **committed** (`6ad5ffb`),
+      test-only, zero production code change. Frozen step 12 of the
+      Implementation Design Pass's 12-step order: eight real-Postgres
+      concurrency scenarios proving interactions between Milestones
+      1–8's already-individually-proven components (mixed-stage claim
+      fencing, three-way cross-batch embedding arbitration, reservation
+      vs. reconciliation ordering, dual-archive crash/idempotent-retry,
+      cross-batch identity convergence, pause→abort→reconciliation, and
+      live report reads under concurrent multi-stage load). Two genuine
+      test-only fixture bugs were found and fixed, never in production.
+      Full regression 953 collected, 952 passed, 1 skipped.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 10: pipeline-
+      to-retrieval composition proof — **committed** (`d4d26d7`),
+      test-only. Proves, with real execution rather than static
+      reading, that a `Document`/`DocumentChunk` produced by driving
+      synthetic content through the real Milestones 1–9 pipeline is
+      genuinely consumable by the pre-existing, previously-unrelated
+      `RetrievalService`/`ChatService`. **Also documents, without
+      extending, a real and still-current limitation**: the citation
+      contract surfaces only `document_chunk_id`/`document_id`/
+      `document_title`/`document_source` — no `SourceInstance`/
+      `ProvenanceLink` data — left open as a separate, not-yet-
+      authorized "Answer-Provenance Decision." Full regression 955
+      collected, 954 passed, 1 skipped. No production code changed.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 11:
+      `BatchOrchestratorService` — **committed** (`62592cd`). Model A
+      (bounded, attended, single-process execution): `run_once()` runs
+      one fixed-order pass through all five pipeline stages (archive
+      processing → identity resolution → normalization → chunking →
+      embedding), each exhausted once, then exactly one completion-
+      reconciliation call — the first real, callable entry point the
+      scaled pipeline has had outside test code. Two distinct defects
+      were found and fixed during this milestone's own design/
+      implementation: a termination gap (a deterministically-failing
+      claim is immediately reclaimable, so a naive loop never
+      terminates) and, found only after fixing that, a starvation gap
+      (the same stuck row keeps winning the claim query's ordering and
+      could block newer, distinct work for a whole invocation). Both
+      are closed by one additive, in-memory-only `exclude_ids`
+      parameter threaded directly into the claim queries
+      (`worker_claim_service.py`) — no retry-exhaustion policy,
+      counter, or schema change. **Explicitly named but not fixed**: a
+      pre-existing (Milestone-5-origin) gap where `claim_source_
+      instance_for_archive_processing`'s `already_processed` check
+      never excludes a durable `retryable=False` failure — harmless
+      today only because the orchestrator's own `exclude_ids` prevents
+      it from looping, and remains open as a real, separately-
+      authorizable follow-up. 12 new tests; full regression 967
+      collected, 966 passed, 1 skipped. No schema change.
+
+- [x] Scaled Real-T7 Ingestion — Implementation Milestone 12: operator
+      CLI entrypoint — **committed** (`bee4f69`). `scripts/
+      run_ingestion_batch.py` — the pipeline's first human-usable entry
+      point, giving Milestone 11's `run_once()`/`BatchReportService` a
+      real caller. `--database` defaults to `aibrain_test` and cannot
+      reach production by omission (built via `make_url(settings.
+      DATABASE_URL).set(database=...)`, never `SessionLocal`); batch
+      existence is checked explicitly before calling `run_once()`, with
+      no broad `except ValueError` around it, since `ValueError` is
+      raised throughout `app.classification` for several unrelated
+      reasons (proven by direct inspection, not assumed); the CLI opens
+      one session for the whole invocation and issues no commit/
+      rollback of its own, fully composing the existing per-service
+      commit model. Prints a plain-text operator report
+      (`BatchReportService`'s fields) after each run; stdlib logging
+      only. 11 new integration tests (real database, zero Ollama
+      dependency by design); full regression 977 passed, 1 skipped,
+      stable across 3 runs. No schema change.
+
+      **Post-Milestone-12 review found two real, previously-unsurfaced
+      documentation/architecture gaps** (see `AI_Brain_Architecture.md`'s
+      "Scaled Real-T7 Ingestion — Milestones 7–12" section for the full
+      writeup): this roadmap and `AI_Brain_Architecture.md` had not been
+      updated since Milestone 6 (corrected by this same Milestone 13
+      pass), and a second, independent, already-live ingestion path
+      (`ImportJob`/`ImportJobService`, "Chain 1") coexists with this one
+      ("Chain 2") with their relationship undecided — see
+      `AI_Brain_Architecture.md`'s "Chain 1 ↔ Chain 2 relationship"
+      subsection, marked **ARCHITECTURAL DECISION REQUIRED**.
 
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade

@@ -75,8 +75,8 @@ master backup / source files (read-only)
 | Module | Status | Responsibility |
 |---|---|---|
 | `ingestion/` | Implemented | `SourceScanner` walks a source dir; `ArchiveExtractor` safely expands `.zip` and `.7z` archives (bomb/path-traversal/disk-space guarded — see below); `DocumentIngestor` orchestrates scan → extract → persist, and computes `Document.content_hash` (SHA-256, streamed) for exact-duplicate detection; `text_extractor.extract_text` pulls plain text out of `.pdf`/`.docx`/anything-UTF-8-decodable, used before embedding. |
-| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`, `DedupExecutionPlan`, `DedupExecutionPlanAction`, `DiscoveryRun`, `ClassificationRun`, `ContentIdentityGroup`, `SourceInstance`, `ProvenanceLink`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it; `Document.content_identity_group_id` links it to its `ContentIdentityGroup` (see `classification/`, below — schema/model implementation only, no ingestion pipeline calls this yet). |
-| `classification/` | Implemented (schema/model layer only — no ingestion pipeline calls it yet) | `DiscoveryRunService`, `ClassificationRunService`, `ContentIdentityService` (`get_or_create_group` — the database-concurrency-safe claim for a `ContentIdentityGroup`; `assign_content_identity` — write-once `SourceInstance.content_identity_group_id`), `SourceInstanceService` (creates a `SourceInstance` + its full `ProvenanceLink` ancestry chain atomically), `CanonicalDecisionService` (records a canonical-status decision with required evidence). Implements the `29d6864`/`14b8063` frozen design — see "Schema/Model Implementation," below. No T7 access anywhere in this module. |
+| `models/`, `schemas/` | Implemented | SQLAlchemy models (`Document`, `DocumentChunk`, `ImportJob`, `Conversation`, `Message`, `Memory`, `ToolCallRecord`, `DuplicateReview`, `DuplicateReviewMember`, `DedupExecutionPlan`, `DedupExecutionPlanAction`, `DiscoveryRun`, `ClassificationRun`, `ContentIdentityGroup`, `SourceInstance`, `ProvenanceLink`) and Pydantic schemas. `Document.import_job_id` carries provenance back to the import job that created it (Chain 1 only); `Document.content_identity_group_id` links it to its `ContentIdentityGroup` (Chain 2 only — see `classification/`, below). Both columns are independently nullable; a given `Document` row is populated by exactly one of the two chains, never both, but nothing in the schema enforces this — see "Scaled Real-T7 Ingestion — Milestones 7–12" for the currently-undecided relationship between them. |
+| `classification/` | Implemented — full scaled batch ingestion pipeline (Implementation Milestones 1–12), reachable today only via `scripts/run_ingestion_batch.py` (no API endpoint, no scheduler) | `DiscoveryRunService`, `ClassificationRunService`, `ContentIdentityService` (`get_or_create_group` — the database-concurrency-safe claim for a `ContentIdentityGroup`; `assign_content_identity` — write-once `SourceInstance.content_identity_group_id`), `SourceInstanceService`, `CanonicalDecisionService`, `BatchCreationService`/`deterministic_selector`/`policy_evaluator`, `BatchResourceGuard`/`BatchControlService`, `WorkerClaimService`, `ArchiveProcessingService`, `IdentityResolutionService`, `NormalizationService`, `ChunkingService`, `PipelineEmbeddingService`, `BatchReportService`, `BatchCompletionReconciliationService`, and `BatchOrchestratorService` (`run_once()` — the pipeline's own coordinator). `NormalizationService`/`ChunkingService`/`PipelineEmbeddingService` create and populate `Document`/`DocumentChunk` rows directly — this is a second, independent ingestion path into those same tables, alongside `ImportJobService` (Chain 1). See "Scaled Real-T7 Ingestion — Milestones 7–12," below, for the full picture, including the currently-undecided relationship between the two paths. No T7 access anywhere in this module beyond what a separately-authorized real-T7 batch explicitly grants. |
 | `services/` | Implemented | `DocumentService` (persistence, `list_documents`), `ImportJobService` (job lifecycle, enforced state transitions, embeds documents synchronously during `execute_job`), `EmbeddingService` (chunk + embed + persist a document's text), `ChatService`/`ChatClient` (RAG-augmented chat over Ollama, conversation persistence, memory injection, tool-calling loop). |
 | `api/` | Implemented | FastAPI routers: health, version, database, documents, import_jobs, rag, chat, memory, tools, dedup. |
 | `db/` | Implemented | Session/engine setup, health checks. |
@@ -10872,6 +10872,207 @@ as an explicit exclusion (section 17), not an open question.
 **This design pass authorizes no code, no migration, no test-code
 changes, and no real-T7 access.** The next gate, not yet opened, is a
 separate, explicit implementation authorization for Milestone 6.
+
+## Scaled Real-T7 Ingestion — Milestones 7–12: Report, Reconciliation, Orchestration & Operator CLI (implemented and committed)
+
+Milestones 7–12 were each separately authorized, implemented, and
+committed following Milestone 6, but — unlike Milestones 1–6 above —
+were not preceded by their own standalone frozen design-pass section in
+this document; each was gated, reviewed, and corrected directly against
+the running repository. This section is Milestone 13's factual
+reconciliation of what those six milestones actually built, grounded in
+their own commit messages and the code as it exists today — it does not
+reconstruct a design narrative that was never separately written down.
+
+**Milestone 7 — `BatchReportService`** (`3136ffb`). A pure read/
+aggregation service: `generate_report(batch_id) -> BatchReport` holds no
+claim, takes no lock, writes nothing, and needs no T7 access. Counts are
+scoped correctly to root-level `SourceInstance` rows only (`member_path
+IS NULL` — archive members share their parent's `classification_run_id`
+but were never part of `source_instances_selected`, and must not
+contaminate these denominators). `risk_tier_actual`'s distribution
+carries an explicit, visible `NULL` bucket rather than hiding Milestone
+5's honest non-population of that field. `actual_source_bytes_read` and
+the four drift-outcome counts remain explicitly deferred, represented
+via a new `Instrumented[T]` type (`available`/`value`) rather than a
+bare `0`/`None` that could be misread as a checked value. Internal
+denominator contradictions raise `BatchReportInvariantViolation` rather
+than being silently clamped or repaired. 21 new tests; full regression
+930 collected, 929 passed, 1 skipped (pre-existing, environmental). No
+schema change.
+
+**Milestone 8 — `BatchCompletionReconciliationService`** (`65b4b9c`).
+Closes the one remaining piece of frozen step 9 ("worker/claim
+integration — the loop that ties 3-8 together per batch"):
+`check_and_complete(batch_id)` reads Milestone 7's own report and
+declares `SOURCE_WORK_EXHAUSTED` iff `unattempted_selected_count == 0`
+and `terminal_source_count == attempted_source_count`, then delegates
+exclusively to the pre-existing `BatchControlService.complete()` — this
+service never mutates `IngestionBatch` directly, and may observe a
+stale positive reading under concurrency (its own report read and the
+`complete()` call are two separate operations), which is safe only
+because of three already-existing properties: immutable batch
+membership, no claim query ever re-admitting a terminal
+`ContentPipelineState`, and the existing Milestone-4 admission gate
+against new claims once a batch leaves `RUNNING`. Envelope-exhaustion
+and runtime-budget-exhaustion detection are explicitly **not**
+implemented — deferred to a future, separate design decision.
+`NEEDS_REVIEW` counts as terminal for this decision, distinct from
+`successful_ingestion_count`. 15 new tests, including a real two-worker
+completion race (80 total races, zero flakiness); full regression 945
+collected, 944 passed, 1 skipped.
+
+**Milestone 9 — final cross-stage adversarial validation** (`6ad5ffb`,
+test-only, zero production code change). Frozen step 12 of the
+Implementation Design Pass's 12-step order: eight real-Postgres
+concurrency scenarios proving interactions *between* Milestones 1–8's
+already-individually-proven components, rather than re-proving any one
+primitive in isolation — mixed-stage claim fencing, three-way
+cross-batch embedding arbitration, reservation-vs-reconciliation
+ordering, dual-archive crash/idempotent-retry, cross-batch identity
+convergence, pause→hard-stop-abort→reconciliation, and live report
+reads under concurrent multi-stage load. Two genuine test-fixture bugs
+were found and fixed here, never in production. Full regression 953
+collected, 952 passed, 1 skipped.
+
+**Milestone 10 — pipeline-to-retrieval composition proof** (`d4d26d7`,
+test-only). Proves, with real execution rather than static reading,
+that a `Document`/`DocumentChunk` produced by driving synthetic content
+through the real Milestones 1–9 pipeline is genuinely consumable by the
+pre-existing, previously-unrelated `RetrievalService`/`ChatService` — a
+real `RetrievalService` is used throughout (only its embedding client
+faked), deliberately not a mocked `RetrievalService`. **Also documents,
+without extending, a real and still-current limitation**: the citation
+contract surfaces only `document_chunk_id`/`document_id`/
+`document_title`/`document_source` — no `SourceInstance`/`ProvenanceLink`
+data — left open as a separate, not-yet-authorized "Answer-Provenance
+Decision." Full regression 955 collected, 954 passed, 1 skipped.
+
+**Milestone 11 — `BatchOrchestratorService`** (`62592cd`). Model A
+(bounded, attended, single-process execution), selected over
+persistent/multi-worker/distributed alternatives per this document's
+own "no task queue, no worker pool, and no distributed-execution
+architecture anywhere else in this codebase, and none is planned"
+(§ above). `run_once()` composes the six existing pipeline services
+through their own public methods only — it never constructs, queries,
+or mutates `SourceInstance`/`ContentIdentityGroup`/`Document`/
+`DocumentChunk` directly — running one fixed-order pass through all
+five stages (archive processing → identity resolution → normalization →
+chunking → embedding), each exhausted once, followed by exactly one
+`BatchCompletionReconciliationService.check_and_complete()` call. This
+is the first point in the whole chain where the scaled pipeline has a
+real, callable entry point outside test code.
+
+Two distinct defects were found and fixed during this milestone's own
+design/implementation: (1) **termination** — `claim_source_instance_
+for_archive_processing`/`claim_source_instance_for_identity_resolution`
+release a failed claim by resetting `claimed_by`/`claimed_at` to `NULL`
+unconditionally, so a deterministically-failing row becomes immediately
+reclaimable with no lease wait, and a naive "loop until `None`" never
+terminates for it; (2) **progress over distinct candidates** — found
+only after fixing (1) — the claim query orders candidates by
+`created_at` alone, so the same stuck row would keep winning that
+ordering and could starve every newer, distinct, processable row for a
+whole invocation. Both are closed by one mechanism: each stage's own
+in-memory, per-invocation set of already-claimed ids is passed as a new,
+additive, optional `exclude_ids` parameter directly into the claim
+query itself (`worker_claim_service.py`) — never merely checked after
+the fact — with no new retry-exhaustion policy, persisted counter, or
+schema change. **Named but explicitly not fixed**: a pre-existing
+(Milestone-5-origin) gap where `claim_source_instance_for_archive_
+processing`'s `already_processed` exclusion checks only
+`EXISTS(SUCCEEDED)`, never `retryable` — a durable `retryable=False`
+archive remains claim-eligible forever at the predicate level, harmless
+today only because this orchestrator's own `exclude_ids` prevents it
+from looping or starving other work. Remains open as a real,
+separately-authorizable follow-up. 12 new tests; full regression 967
+collected, 966 passed, 1 skipped.
+
+**Milestone 12 — operator CLI entrypoint** (`bee4f69`).
+`scripts/run_ingestion_batch.py` is the pipeline's first human-usable
+entry point, giving Milestone 11's `run_once()`/`BatchReportService` a
+real caller (matching this repository's only existing entrypoint
+convention — there is no `pyproject.toml`/console-script mechanism
+anywhere in the repo). Contract, verified against the actual code
+rather than assumed:
+- `--database` defaults to `"aibrain_test"` and cannot reach production
+  by omission — the engine is built via `make_url(settings.DATABASE_URL)
+  .set(database=args.database)`, never `SessionLocal` (which binds to
+  `settings.DATABASE_URL` as-is, i.e. production `aibrain`); the
+  resolved database name is printed before anything else runs.
+- Batch existence is checked with one direct `db.get(IngestionBatch,
+  args.batch_id)` before calling `run_once()`/`generate_report()`, and
+  there is no `except ValueError` anywhere in the script — `ValueError`
+  is raised throughout `app.classification` for several unrelated
+  reasons (e.g. `ContentIdentityService.assign_content_identity`'s
+  write-once violation, reachable from `run_once()`'s own normal
+  identity-resolution call chain), so a blanket catch could mislabel a
+  real defect as a harmless "batch not found." Anything past the
+  pre-check propagates uncaught.
+- One `Session` spans the whole invocation (orchestration + report);
+  the CLI issues no `commit()`/`rollback()` of its own, since every
+  mutating service it composes already commits its own work — `close()`
+  runs in a `finally` block regardless of outcome.
+- No source-path argument of any kind exists — real T7 paths only ever
+  enter earlier, via the separately-gated `BatchCreationService`/
+  `SourceInstanceService` — so a T7-path guard here was evaluated and
+  deliberately not added; there is no attack surface for one to defend.
+- Prints a plain-text operator report using only existing
+  `OrchestratorRunResult`/`BatchReportService` fields; stdlib `logging`
+  only, no new dependency.
+
+11 new integration tests (real database; every scenario stays within
+`ContentPipelineState.UNSUPPORTED`, which no normalization/chunking/
+embedding claim query ever re-admits, so this suite has zero Ollama
+dependency by design). Full regression 977 passed, 1 skipped, stable
+across 3 runs. No schema change.
+
+### Chain 1 ↔ Chain 2 relationship
+
+**Two independent ingestion paths currently exist and are both live**,
+writing into the same `documents`/`document_chunks` tables:
+
+- **Chain 1**: `ImportJob` → `ImportJobService` → `app/api/import_jobs.py`
+  (`/import-jobs`), wired into the running app and the frontend's
+  Import Job Monitoring view. Sets `Document.import_job_id`, leaves
+  `content_identity_group_id` `NULL`. Performs no deduplication at all
+  — `Document.content_hash` is computed but never looked up before
+  insert (the model's own comment: "Deliberately not unique -
+  duplicates are exactly what this is for").
+- **Chain 2**: `IngestionBatch` → `BatchOrchestratorService` →
+  Milestone 12's CLI (`scripts/run_ingestion_batch.py`), the only
+  trigger for it today. Sets `Document.content_identity_group_id`,
+  leaves `import_job_id` `NULL`. Deduplicates by construction — one
+  `ContentIdentityGroup` per distinct content hash, write-once.
+
+Both chains reuse the identical chunker (`app.embeddings.chunker.
+chunk_text`) and the identical `EmbeddingClient`, so the `DocumentChunk`
+rows they each produce are structurally identical. `RetrievalService`/
+`ChatService`/`app/rag/*.py` make zero reference to `import_job_id`,
+`content_identity_group_id`, or `content_hash` anywhere (grep-verified)
+— retrieval and chat do not distinguish which chain produced a given
+`Document`.
+
+**Coexistence hazard, concretely, not hypothetically**: both chains
+hash raw bytes with the identical algorithm (SHA-256). Byte-identical
+content ingested once through each chain produces the same hash value
+but two separate `Document` rows and two separate sets of
+`DocumentChunk`/embeddings, since neither chain's dedup logic consults
+the other's tables. Nothing in the schema prevents a future `Document`
+row from having both `import_job_id` and `content_identity_group_id`
+set, or neither.
+
+**ARCHITECTURAL DECISION REQUIRED: the long-term relationship between
+Chain 1 and Chain 2 remains undecided.** Nothing in this repository —
+no design doc, commit message, roadmap entry, or code comment — states
+whether Chain 1 is legacy-and-to-be-replaced, transitional, intended to
+permanently coexist with Chain 2 (e.g. for arbitrary on-demand imports,
+as distinct from Chain 2's T7-scale classification/selection machinery),
+or simply an independent path nobody has reconciled yet. This document
+deliberately does not resolve that question — it did not exist to be
+resolved from the repository as it stands at Milestone 12, and is
+recorded here as open rather than inferred. Both chains remain live for
+now.
 
 ## On-disk layout
 - `documents/imports/<job_id>/` — working copies produced by ingestion for a
