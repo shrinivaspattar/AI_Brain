@@ -2481,6 +2481,34 @@ Tracked in [`docs/backlog.md`](../backlog.md); architecture TBD in
       runs; full regression 984 passed, 1 skipped; zero residue. No
       schema/migration change, no T7 access.
 
+- [x] Scaled Real-T7 Ingestion — Provenance-Rich Citations
+      (Milestones 20–24): investigation → semantic decision →
+      design/freeze → implementation → acceptance — **implemented and
+      committed** (`facd7cf`). Milestone 20 traced the full provenance
+      graph and surfaced the central open question - which source
+      occurrence should user-visible provenance represent when
+      multiple `SourceInstance`s converge on one `ContentIdentityGroup`?
+      Milestone 21's narrow follow-up resolved every remaining
+      precondition directly from repository evidence:
+      `ClassificationRun` ↔ `IngestionBatch` is DB-enforced 1:1;
+      multiple `SourceInstance`s legitimately converge on one group;
+      `CanonicalDecisionService` has zero production callers and
+      permits multiple `CANONICAL` instances per group, so it is not a
+      safe selection mechanism; `NEEDS_REVIEW` is fully independent;
+      no earliest/latest/id/path selector has any repository-supported
+      semantic justification - establishing "all source occurrences"
+      (Model A) as the only evidence-supported semantic. Milestone 22
+      froze that design without writing code. Milestone 23 implemented
+      it exactly (13 files: 5 production, 8 test) - batched,
+      deterministic-order, Chain-1-null, canonical/`NEEDS_REVIEW`-free.
+      Milestone 24's post-implementation review independently
+      re-inspected the actual committed code (not merely the
+      implementation report) and confirmed every claim; **M23
+      accepted**. Canonical selection, `NEEDS_REVIEW` integration,
+      real-T7 path policy, occurrence-set capping, and multi-process
+      execution remain distinct, separately-authorizable, deliberately
+      deferred items - none implemented here.
+
 Should/nice-to-have: temporal diffing, repository health score, best copy
 arbitration, forgotten knowledge surfacing, topic drift timeline, decade
 capsules. Future research: cross-source entity resolution, repository time

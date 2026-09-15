@@ -10873,7 +10873,7 @@ as an explicit exclusion (section 17), not an open question.
 changes, and no real-T7 access.** The next gate, not yet opened, is a
 separate, explicit implementation authorization for Milestone 6.
 
-## Scaled Real-T7 Ingestion — Milestones 7–18: Report, Reconciliation, Orchestration, Operator CLI, HTTP Composition, Retrieval Determinism, Embedding Failure Handling & Mixed-Chain Retrieval Proof (implemented and committed)
+## Scaled Real-T7 Ingestion — Milestones 7–24: Report, Reconciliation, Orchestration, Operator CLI, HTTP Composition, Retrieval Determinism, Embedding Failure Handling, Mixed-Chain Retrieval Proof & Provenance-Rich Citations (implemented and committed)
 
 Milestones 7–12 were each separately authorized, implemented, and
 committed following Milestone 6, but — unlike Milestones 1–6 above —
@@ -11086,6 +11086,58 @@ remains intentionally unresolved** - this milestone proves the two
 paths coexist safely today, not that their relationship has been
 decided; see the subsection immediately below, unchanged since
 Milestone 13.
+
+**Milestones 20–24 — provenance-rich citations** (investigation:
+Milestones 20/21; design/freeze: Milestone 22; implementation:
+`facd7cf`, Milestone 23; post-implementation review: Milestone 24, M23
+accepted). Milestones 20 and 21 were read-only investigations that
+changed no production behavior; Milestone 22 froze a design without
+writing code; Milestone 24 re-verified the already-committed Milestone
+23 code and introduced no changes of its own.
+
+*Source provenance model*: `SourceInstance` represents one physical
+observed occurrence; multiple `SourceInstance`s can converge on one
+`ContentIdentityGroup` (`SourceInstance.content_identity_group_id` is
+many-to-one, unlike `Document.content_identity_group_id`, which is
+`UNIQUE`), so a `ContentIdentityGroup` corresponds to at most one
+`Document`. `ProvenanceLink` stores one `SourceInstance`'s own ordered
+physical ancestry. User-visible provenance exposes ALL source
+occurrences for a group - no occurrence is authoritative merely
+because of ordering. `CanonicalDecisionService` is not currently used
+to select or filter citation provenance (zero production callers;
+nothing prevents multiple `SourceInstance`s in one group from
+independently being marked `CANONICAL`); `NEEDS_REVIEW` is entirely
+unrelated to this mechanism.
+
+*Retrieval/citation flow*: `DocumentChunk` → `RetrievedChunk` (now
+carrying `source_occurrences`) → `SearchResult`/`Citation`. Provenance
+is computed exactly once, inside `RetrievalService.search()`, consumed
+identically by `POST /rag/search` and `POST /chat` - never two
+independent implementations.
+
+*Performance*: exactly two additional batched queries per `search()`
+call (`SourceInstance WHERE content_identity_group_id IN (...)`, then
+`ProvenanceLink WHERE source_instance_id IN (...)`) - never one query
+per result/document/instance; query count is independent of `top_k`
+and of occurrence-set size.
+
+*Chain 1*: `source_occurrences: null` - no `SourceInstance` graph
+exists; none is fabricated.
+
+*Chain 2*: every `SourceInstance` associated with the `Document`'s
+`ContentIdentityGroup`, ordered by `SourceInstance.id` (presentation
+determinism only, never semantic priority).
+
+*Archive ancestry*: structured `{kind, path}` steps, populated only for
+genuinely nested (more than one archive level) occurrences - never
+flattened into an invented display-path string.
+
+**Explicitly not implemented by Milestones 20–24** (each a distinct,
+separately-authorizable, deliberately deferred item): canonical/
+representative source selection, `NEEDS_REVIEW` integration, real-T7
+path exposure/redaction policy, large-occurrence-set pagination or
+capping, OS-level multi-process execution, any distributed/scheduler
+infrastructure.
 
 ### Chain 1 ↔ Chain 2 relationship
 
