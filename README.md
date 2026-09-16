@@ -89,10 +89,13 @@ wired into any API endpoint or router** — constructible only from trusted
 Python code, exercised today only by its own tests, never reachable from
 the running application.
 
-**Frontend** — a single page (`frontend/`) with three views: chat (with
+**Frontend** — a single page (`frontend/`) with four views: chat (with
 citations, conversation persistence, light/dark theme), read-only import
-job monitoring (live polling), and a memory review queue (approve/reject
-with provenance back to the source chat message).
+job monitoring (live polling), a memory review queue (approve/reject with
+provenance back to the source chat message), and a dedup review queue
+(approve/reject a duplicate finding, choosing the canonical copy to keep —
+this view reviews the *finding*, never touches a file; nothing here or in
+the backend it calls can delete, move, or quarantine anything).
 
 ## What's not built yet
 
