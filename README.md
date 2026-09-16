@@ -73,12 +73,21 @@ except for the review-gated memory proposal.
 **Deduplication & provenance (KRM)** — exact and near-duplicate detection
 over ingested content (`GET /dedup/exact`, `GET /dedup/near`), a *dry-run*
 cleanup planner (`GET /dedup/exact/plan`) that proposes which copy to keep
-without touching any file, and a full provenance trace
+without touching any file, an explicit human-authorization gate on one
+immutable plan, and a full provenance trace
 (`GET /documents/{id}/provenance`) from source file through chunks to every
-chat message that ever cited it. There is deliberately no code path
-anywhere that deletes, moves, or modifies a file — dedup execution
-endpoints exist only as an audit/authorization ledger for a future human-
-attended executor, not an executor themselves.
+chat message that ever cited it.
+
+There is a real filesystem executor (`DedupFilesystemExecutor`) — DELETE
+always means quarantine-move via `os.rename()`, never a true delete — with
+serious TOCTOU-closure: it pins the source file's device/inode and hashes
+its content through one open file descriptor, then verifies the
+post-move destination identity matches that exact pin before calling
+anything a success. Fail-closed by construction: no default paths, no env
+var, rejects symlinked roots, refuses cross-filesystem moves. It is **not
+wired into any API endpoint or router** — constructible only from trusted
+Python code, exercised today only by its own tests, never reachable from
+the running application.
 
 **Frontend** — a single page (`frontend/`) with three views: chat (with
 citations, conversation persistence, light/dark theme), read-only import
