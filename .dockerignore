@@ -1,0 +1,26 @@
+# Secrets and personal data must never enter an image layer.
+.env
+.env.*
+!.env.example
+knowledge/
+documents/
+scripts/
+logs/
+prompts/
+
+# Local state and infrastructure directories.
+.git
+.gitignore
+.github
+.venv
+postgres/
+chroma/
+redis/
+docker/
+docs/
+
+# Build and test noise.
+**/__pycache__
+**/*.pyc
+.pytest_cache
+backend/tests

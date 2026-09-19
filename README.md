@@ -1,5 +1,7 @@
 # AI_Brain
 
+![CI](https://github.com/shrinivaspattar/AI_Brain/actions/workflows/ci.yml/badge.svg)
+
 An offline, privacy-first personal AI knowledge system. Ingest your own files,
 retrieve them with real semantic search, chat with a fully local LLM that
 cites its sources, and let it remember things about you over time — with a
@@ -31,6 +33,49 @@ kept as separate branches rather than merged into one confusing history:
 - Plain HTML/CSS/vanilla JS frontend, served directly by FastAPI — no
   Node/npm toolchain, no build step, no second process
 - 989 tests (`backend/tests`)
+
+## Architecture
+
+```mermaid
+flowchart LR
+  UI["Browser UI<br/>static HTML + JS"]
+  CLI["Operator CLI<br/>run_ingestion_batch.py"]
+  SRC["Source files<br/>read-only"]
+  OL["Ollama, local<br/>qwen3:8b + nomic-embed-text"]
+  PG[("PostgreSQL + pgvector<br/>documents, chunks, provenance,<br/>batches, memories, audits")]
+  EX["DedupFilesystemExecutor<br/>not wired to any endpoint"]
+
+  subgraph API["FastAPI backend"]
+    R["Routers<br/>chat, rag, memory, tools,<br/>import-jobs, documents, dedup"]
+    CS["ChatService<br/>retrieval + memory + tool loop"]
+    RS["RetrievalService"]
+    C1["Chain 1<br/>ImportJobService"]
+    C2["Chain 2<br/>BatchOrchestratorService<br/>archive, identity, normalize, chunk, embed"]
+    KRM["Dedup review services<br/>review, plan, authorize, audit"]
+  end
+
+  UI --> R
+  R --> CS
+  CS --> RS
+  RS --> PG
+  RS -->|query embedding| OL
+  CS -->|chat + tools| OL
+  R --> C1
+  SRC --> C1
+  C1 --> PG
+  C1 -->|chunk embeddings| OL
+  CLI --> C2
+  SRC --> C2
+  C2 --> PG
+  C2 -->|chunk embeddings| OL
+  R --> KRM
+  KRM --> PG
+  KRM -.-> EX
+```
+
+Chain 2 has no HTTP surface: it is driven only by the operator CLI, one
+bounded, attended batch at a time. Everything the chat loop can reach is
+read-only except one review-gated tool (`remember`).
 
 ## What's built
 
@@ -104,7 +149,9 @@ the backend it calls can delete, move, or quarantine anything).
 - Multiple/switchable conversations in the UI (one active conversation per
   browser today)
 - `.rar`/`.gz` archive extraction (only `.zip`/`.7z` today)
-- Any actual file executor for dedup cleanup (planning only, by design)
+- Any way to trigger the dedup executor (no endpoint or CLI calls it, by
+  design - see above)
+- Redis: `REDIS_URL` exists in the settings, but no code uses Redis yet
 - Docker Compose for Postgres/Ollama (placeholder file, not filled in)
 
 ## Setup
@@ -122,6 +169,94 @@ cd backend
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
+
+### Docker
+
+The image contains only the app (`backend/` and `frontend/`); Postgres and
+Ollama stay outside it. `.dockerignore` keeps `.env`, `knowledge/`,
+`documents/` and `scripts/` out of every layer.
+
+```bash
+docker build -t ai-brain .
+docker run --rm -p 8000:8000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL=postgresql+psycopg2://USER:PASS@host.docker.internal:5432/aibrain \
+  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  ai-brain
+```
+
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull
+request to `main`: a `pgvector/pgvector:pg16` service, both databases
+migrated with Alembic, the backend test suite, then a Docker build followed
+by a smoke test that starts the container and requires `GET /health` to
+answer. Tests that need a live Ollama skip themselves in CI.
+
+## What broke and how it was fixed
+
+Each entry below comes from this repository's history, its roadmap
+(`docs/roadmap/Roadmap.md`) or a recorded test run.
+
+1. **An orchestrator loop that never ended, then one that starved.** A
+   failed batch item released its claim immediately, so a file that always
+   failed was claimed again forever - and because claims are ordered by age,
+   that stuck row also blocked every newer one. The fix passes an in-memory
+   set of already-attempted ids into the claim query itself (not checked
+   afterwards), so nothing is retried within one run. An integration test
+   with a permanently failing archive created before a valid one had shown
+   the valid one was never attempted.
+2. **A delayed worker clearing a live worker's claim.** Releases matched on
+   row id alone, so a worker that was slow (not crashed) past its lease could
+   release after another worker had legitimately taken the row over. Every
+   grant now increments a `claim_generation` fencing token, and a release
+   only takes effect for the generation it was granted.
+3. **Embedding capacity leaked by a crash.** A worker dying mid-embedding
+   left its reserved capacity counted against the batch permanently. Each
+   reservation now records its owning batch and is credited back atomically
+   when the row is reclaimed.
+4. **Test-database pollution.** Most import integration tests never cleaned
+   up after themselves; across many runs about 160 import jobs' worth of
+   rows accumulated and pushed a real pair out of the near-duplicate query's
+   result limit, so a dedup test failed deterministically. A shared cleanup
+   helper replaced the ad-hoc cleanup, the pollution was deleted once, and
+   the suite was re-run clean five times in a row.
+5. **A JSON `null` is not a SQL `NULL`.** The provenance trace filtered
+   `citations IS NOT NULL`, but a JSONB column that stores Python `None`
+   holds a JSON `null`, which that filter does not exclude. The service now
+   re-checks in Python after the query.
+6. **A bare 500 on a bad import path.** `POST /import-jobs/{id}/execute`
+   returned 500 for a missing or non-directory source path because the
+   handler caught only `ValueError`. It now returns a 422 carrying the same
+   message stored on the job. Found while building the monitoring view.
+7. **A failure the design predicted but had never met.** The first ingestion
+   from a real external drive failed at the embedding step because Ollama was
+   not running. The affected content group moved to `FAILED`, which the
+   pipeline deliberately never retries on its own. A read-only diagnostic
+   script found the cause and a one-off, attended reset script re-queued
+   exactly that group - a manual step by design, not a new retry mechanism.
+8. **Cleanup scripts that broke on foreign keys.** Removing an accidental
+   duplicate batch failed twice: first because rows joined only by foreign
+   keys (no ORM relationship) are not ordered by autoflush, then because
+   provenance links still referenced the rows being deleted. The fix flushes
+   deletions in dependency order and refuses to touch anything already
+   processed. A later demo script left one document behind and hit the same
+   class of error; because each cleanup ran as one transaction, nothing was
+   ever half-deleted.
+9. **Documentation that contradicted the code.** Several docstrings said the
+   codebase contained no filesystem executor, long after
+   `DedupFilesystemExecutor` had been built, and an early README repeated
+   that claim (and undercounted the frontend views). The corrections came
+   from reading the code, not the comments.
+10. **An assumption measured instead of trusted.** A pilot experiment
+    (`scripts/exp001/`, one public corpus, 110 queries) found PostgreSQL's
+    built-in full-text ranking is not a substitute for BM25: alone it scored
+    0.709 nDCG@10 against 0.811 for real BM25, and combined with dense search
+    it hurt meaning-style queries. Nothing in production changed; the result
+    is recorded as promising, not proven.
+11. **Local-model latency.** Bulk query generation with Qwen3 took about five
+    minutes for two passages on CPU-only hardware because of hidden reasoning
+    tokens; disabling thinking cut it to 18 seconds with similar output.
 
 ## Design goals
 
