@@ -43,7 +43,8 @@ PROMPT = (
     '1. "lexical": a short query built around an exact identifier, command, '
     "option name, function name or error string that appears VERBATIM in the passage.\n"
     '2. "semantic": a natural-language question a reader might ask WITHOUT using '
-    "the passage's distinctive terms (paraphrase the idea).\n"
+    "the passage's distinctive terms (paraphrase the idea). It must NOT contain "
+    "any code identifier, class, function, option or parameter name from the passage.\n"
     'Return ONLY JSON: {"lexical": "...", "semantic": "..."}\n\n'
     "Passage:\n"
 )
@@ -99,6 +100,9 @@ def main() -> None:
                 model=settings.CHAT_MODEL,
                 messages=[{"role": "user", "content": PROMPT + content}],
                 format="json",
+                # Qwen3's hidden reasoning tokens dominate runtime on CPU-only
+                # hardware and add nothing for this simple extraction task.
+                think=False,
             )
             data = parse_reply(reply.message.content or "")
             if data is None:
