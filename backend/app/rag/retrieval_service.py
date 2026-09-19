@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.embeddings.cache import CachedEmbeddingClient, build_query_embedding_client
 from app.embeddings.client import EmbeddingClient
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
@@ -54,10 +55,10 @@ class RetrievalService:
     def __init__(
         self,
         db: Session,
-        embedding_client: EmbeddingClient | None = None,
+        embedding_client: EmbeddingClient | CachedEmbeddingClient | None = None,
     ):
         self.db = db
-        self.embedding_client = embedding_client or EmbeddingClient()
+        self.embedding_client = embedding_client or build_query_embedding_client()
 
     def search(
         self,

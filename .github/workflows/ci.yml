@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    name: Tests (Postgres + pgvector)
+    name: Tests (Postgres + pgvector + Redis)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -31,9 +31,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       PGPASSWORD: aibrain
       DATABASE_URL: postgresql+psycopg2://aibrain:aibrain@localhost:5432/aibrain
+      REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +72,8 @@ jobs:
         run: alembic upgrade head
 
       # Ollama is not available in CI: tests that need a live model skip
-      # themselves; everything else uses fakes or real Postgres.
+      # themselves; everything else uses fakes, real Postgres, or real Redis
+      # (the embedding-cache round-trip test).
       - name: Backend tests
         working-directory: backend
         run: python -m pytest -q

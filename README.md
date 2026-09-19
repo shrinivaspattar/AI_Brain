@@ -30,9 +30,11 @@ kept as separate branches rather than merged into one confusing history:
 
 - FastAPI + PostgreSQL (pgvector) + SQLAlchemy/Alembic
 - Ollama, local models: `qwen3:8b` (chat), `nomic-embed-text` (embeddings)
+- Redis (optional): a read-through cache for query embeddings, off by
+  default (`EMBEDDING_CACHE_ENABLED`)
 - Plain HTML/CSS/vanilla JS frontend, served directly by FastAPI — no
   Node/npm toolchain, no build step, no second process
-- 989 tests (`backend/tests`)
+- 1,000 tests (`backend/tests`)
 
 ## Architecture
 
@@ -43,6 +45,7 @@ flowchart LR
   SRC["Source files<br/>read-only"]
   OL["Ollama, local<br/>qwen3:8b + nomic-embed-text"]
   PG[("PostgreSQL + pgvector<br/>documents, chunks, provenance,<br/>batches, memories, audits")]
+  RD[("Redis<br/>optional query-embedding cache")]
   EX["DedupFilesystemExecutor<br/>not wired to any endpoint"]
 
   subgraph API["FastAPI backend"]
@@ -59,6 +62,7 @@ flowchart LR
   CS --> RS
   RS --> PG
   RS -->|query embedding| OL
+  RS -.->|cache, fails open| RD
   CS -->|chat + tools| OL
   R --> C1
   SRC --> C1
@@ -98,6 +102,13 @@ read-only except one review-gated tool (`remember`).
 **Retrieval & conversation:**
 - `POST /rag/search` — semantic search over ingested content via pgvector
   cosine distance.
+- Query embeddings can be cached in Redis (`EMBEDDING_CACHE_ENABLED=true`,
+  `REDIS_URL`, `EMBEDDING_CACHE_TTL_SECONDS`, default one day). It fails
+  open: if Redis is down or returns a bad value, search behaves exactly as
+  without a cache. On the development machine (CPU only) a repeated query
+  took 5 ms from cache versus 49 ms for a warm Ollama call and 350 ms for a
+  cold one, so the gain is small and mostly appears when Ollama has
+  unloaded the embedding model. Ingestion embeddings are never cached.
 - `POST /chat` — RAG-augmented chat against a local `qwen3:8b`, with
   numbered `[n]` citations back to real source documents, and persisted
   conversation history (`GET /chat/{id}`).
@@ -151,7 +162,6 @@ the backend it calls can delete, move, or quarantine anything).
 - `.rar`/`.gz` archive extraction (only `.zip`/`.7z` today)
 - Any way to trigger the dedup executor (no endpoint or CLI calls it, by
   design - see above)
-- Redis: `REDIS_URL` exists in the settings, but no code uses Redis yet
 - Docker Compose for Postgres/Ollama (placeholder file, not filled in)
 
 ## Setup
@@ -188,10 +198,11 @@ docker run --rm -p 8000:8000 \
 ### CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull
-request to `main`: a `pgvector/pgvector:pg16` service, both databases
-migrated with Alembic, the backend test suite, then a Docker build followed
+request to `main`: `pgvector/pgvector:pg16` and `redis:7` services, both
+databases migrated with Alembic, the backend test suite, then a Docker build followed
 by a smoke test that starts the container and requires `GET /health` to
-answer. Tests that need a live Ollama skip themselves in CI.
+answer. Tests that need a live Ollama skip themselves in CI; the Redis cache has a
+real round-trip test against the CI Redis service.
 
 ## What broke and how it was fixed
 

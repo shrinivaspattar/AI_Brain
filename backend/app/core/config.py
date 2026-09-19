@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "nomic-embed-text"
     EMBEDDING_DIMENSIONS: int = 768
 
+    # Query-embedding cache in Redis. Off by default: nothing changes until
+    # it is enabled. The TTL is a plain default, not a tuned value.
+    EMBEDDING_CACHE_ENABLED: bool = False
+    EMBEDDING_CACHE_TTL_SECONDS: int = 86400
+
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         case_sensitive=True,
