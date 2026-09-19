@@ -248,12 +248,17 @@ Each entry below comes from this repository's history, its roadmap
    `DedupFilesystemExecutor` had been built, and an early README repeated
    that claim (and undercounted the frontend views). The corrections came
    from reading the code, not the comments.
-10. **An assumption measured instead of trusted.** A pilot experiment
-    (`scripts/exp001/`, one public corpus, 110 queries) found PostgreSQL's
-    built-in full-text ranking is not a substitute for BM25: alone it scored
-    0.709 nDCG@10 against 0.811 for real BM25, and combined with dense search
-    it hurt meaning-style queries. Nothing in production changed; the result
-    is recorded as promising, not proven.
+10. **An assumption measured instead of trusted.** An experiment
+    (`scripts/exp001/`, one public corpus of 154 documents) tested whether
+    PostgreSQL's built-in full-text ranking can stand in for BM25. It cannot.
+    Alone it scored 0.709 nDCG@10 against 0.811 for real BM25 in a 110-query
+    pilot, and 0.704 against 0.848 in a separate 279-query confirmation round.
+    Combined with dense search it lowered meaning-style scores in both rounds,
+    significantly in the pilot (-0.059) but not in the confirmation (-0.026,
+    within noise). Dense search combined with real BM25 beat dense alone in
+    both rounds, but BM25 alone was about as good as that combination on
+    this corpus, and the queries were drafted from the same public docs, so
+    this says little about personal notes. Nothing in production changed.
 11. **Local-model latency.** Bulk query generation with Qwen3 took about five
     minutes for two passages on CPU-only hardware because of hidden reasoning
     tokens; disabling thinking cut it to 18 seconds with similar output.
