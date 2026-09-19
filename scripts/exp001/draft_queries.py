@@ -66,8 +66,21 @@ def parse_reply(content: str) -> dict | None:
     return data
 
 
+def excluded_chunk_ids(path: str) -> set[int]:
+    """source_chunk_id values already used in an earlier query file, so a
+    confirmation round samples passages the pilot never saw."""
+    ids: set[int] = set()
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                ids.add(json.loads(line)["source_chunk_id"])
+    return ids
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--exclude-from", help="earlier queries .jsonl whose source chunks must not be reused")
     parser.add_argument("--database", default=common.DEFAULT_SCRATCH_DB)
     parser.add_argument("--num-chunks", required=True, type=int)
     parser.add_argument("--min-chars", type=int, default=300,
@@ -86,6 +99,10 @@ def main() -> None:
             ),
             {"m": args.min_chars},
         ).all()
+
+    if args.exclude_from:
+        skip = excluded_chunk_ids(args.exclude_from)
+        rows = [r for r in rows if r[0] not in skip]
 
     if len(rows) < args.num_chunks:
         raise SystemExit(f"only {len(rows)} eligible chunks, fewer than --num-chunks {args.num_chunks}")

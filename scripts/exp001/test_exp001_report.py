@@ -88,3 +88,9 @@ def test_parse_reply_rejects_bad_shapes():
     assert draft_queries.parse_reply('{"lexical": "a"}') is None
     assert draft_queries.parse_reply('{"lexical": 1, "semantic": 2}') is None
     assert draft_queries.parse_reply('{"lexical": "a", "semantic":') is None
+
+
+def test_excluded_chunk_ids_reads_source_chunks(tmp_path):
+    path = tmp_path / "prev.jsonl"
+    path.write_text('{"source_chunk_id": 5}\n\n{"source_chunk_id": 7}\n{"source_chunk_id": 5}\n')
+    assert draft_queries.excluded_chunk_ids(str(path)) == {5, 7}
