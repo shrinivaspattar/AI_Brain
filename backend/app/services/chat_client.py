@@ -18,8 +18,10 @@ class ChatClient:
         self,
         model: str | None = None,
         host: str | None = None,
+        thinking: bool | None = None,
     ):
         self.model = model or settings.CHAT_MODEL
+        self.thinking = settings.CHAT_THINKING_ENABLED if thinking is None else thinking
         self._client = ollama.Client(host=host or settings.OLLAMA_HOST)
 
     def chat(
@@ -38,6 +40,7 @@ class ChatClient:
                 model=self.model,
                 messages=messages,
                 tools=tools,
+                think=self.thinking,
             )
         except Exception as exc:
             raise ChatUnavailableError(str(exc)) from exc

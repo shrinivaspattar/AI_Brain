@@ -23,6 +23,7 @@ def test_chat_returns_reply_message() -> None:
             model="qwen3:8b",
             messages=messages,
             tools=None,
+            think=False,
         )
 
 
@@ -40,6 +41,7 @@ def test_chat_passes_tools_through() -> None:
             model=client.model,
             messages=[{"role": "user", "content": "hi"}],
             tools=tools,
+            think=False,
         )
 
 
@@ -61,3 +63,25 @@ def test_chat_client_defaults_from_settings() -> None:
 
         assert client.model == settings.CHAT_MODEL
         client_class.assert_called_once_with(host=settings.OLLAMA_HOST)
+
+
+def test_thinking_is_off_by_default() -> None:
+    with patch("app.services.chat_client.ollama.Client"):
+        assert ChatClient().thinking is False
+
+
+def test_thinking_can_be_enabled_per_client_and_is_sent_to_ollama() -> None:
+    with patch("app.services.chat_client.ollama.Client") as client_class:
+        client_class.return_value.chat.return_value = MagicMock()
+
+        ChatClient(thinking=True).chat([{"role": "user", "content": "hi"}])
+
+        assert client_class.return_value.chat.call_args.kwargs["think"] is True
+
+
+def test_thinking_follows_the_setting_when_not_given(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "CHAT_THINKING_ENABLED", True)
+    with patch("app.services.chat_client.ollama.Client"):
+        assert ChatClient().thinking is True

@@ -34,7 +34,7 @@ kept as separate branches rather than merged into one confusing history:
   default (`EMBEDDING_CACHE_ENABLED`)
 - Plain HTML/CSS/vanilla JS frontend, served directly by FastAPI — no
   Node/npm toolchain, no build step, no second process
-- 1,000 tests (`backend/tests`)
+- 1,003 tests (`backend/tests`)
 
 ## Architecture
 
@@ -111,7 +111,13 @@ read-only except one review-gated tool (`remember`).
   unloaded the embedding model. Ingestion embeddings are never cached.
 - `POST /chat` — RAG-augmented chat against a local `qwen3:8b`, with
   numbered `[n]` citations back to real source documents, and persisted
-  conversation history (`GET /chat/{id}`).
+  conversation history (`GET /chat/{id}`). Qwen3's hidden "thinking" is off
+  by default (`CHAT_THINKING_ENABLED=true` turns it back on): on the CPU-only
+  development machine a tool-call turn took 145 s with it and 6.5 s without,
+  and a document question 279 s versus 79 s (that first run may include model
+  load time). Answers to the tested questions were equally correct and the
+  same tool was called either way; harder multi-step questions may benefit
+  from thinking, which was not measured.
 
 **Memory** — a long-term store the model can propose to, gated by human
 review: it can call a `remember` tool, but every proposal lands as

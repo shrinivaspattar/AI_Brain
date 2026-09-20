@@ -16,6 +16,11 @@ class Settings(BaseSettings):
 
     OLLAMA_HOST: str = "http://localhost:11434"
     CHAT_MODEL: str = "qwen3:8b"
+    # Qwen3 "thinking" adds hidden reasoning tokens before every reply. On
+    # this project's CPU-only dev machine that made a simple tool-call turn
+    # take 145 s instead of 6.5 s, so it is off by default. Set
+    # CHAT_THINKING_ENABLED=true to trade speed for more deliberate answers.
+    CHAT_THINKING_ENABLED: bool = False
     EMBEDDING_MODEL: str = "nomic-embed-text"
     EMBEDDING_DIMENSIONS: int = 768
 
