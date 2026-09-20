@@ -327,6 +327,7 @@ def main() -> None:
     ap.add_argument("--temp-dir", required=True, type=Path)
     ap.add_argument("--root", type=Path, help="deletion is refused for archives outside this folder")
     ap.add_argument("--only")
+    ap.add_argument("--exclude", action="append", default=[], help="skip archives whose path contains this text (repeatable)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--max-temp-gb", type=float, default=12.0)
     ap.add_argument("--extract", action="store_true")
@@ -354,6 +355,10 @@ def main() -> None:
     done = {r[0] for r in mem.execute("select archive_path from archive_done where status='done'")}
     errored = {r[0] for r in mem.execute("select distinct archive_path from member_hashes where error is not null")}
     archives = sorted(done, key=lambda p: (scan_row(p) or (0,))[0])
+    gone = [p for p in archives if not os.path.exists(p)]
+    if gone:
+        print(f"note: {len(gone)} archive(s) no longer on disk (moved or deleted) - skipped", flush=True)
+    archives = [p for p in archives if os.path.exists(p) and not any(x in p for x in a.exclude)]
     if a.only:
         archives = [p for p in archives if a.only in p]
     if a.limit:
