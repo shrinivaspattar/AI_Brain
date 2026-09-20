@@ -53,9 +53,21 @@ def nested_kind(name):
     return NESTED.get(os.path.splitext(name.lower())[1])
 
 
+MAX_NAME_UNITS = 240   # exFAT/NTFS allow 255 UTF-16 units per name; keep a margin
+
+
 def clean_part(part: str) -> str:
     if part in ("", ".", ".."):
         raise ValueError("unsafe path component")
+    if len(part.encode("utf-16-le")) // 2 > MAX_NAME_UNITS:
+        stem, ext = os.path.splitext(part)
+        ext = ext if len(ext) <= 16 else ""
+        tag = "~" + hashlib.sha1(part.encode("utf-8", "replace")).hexdigest()[:8]
+        room = MAX_NAME_UNITS - len(ext) - len(tag)
+        stem = stem[:room]
+        while len((stem + tag + ext).encode("utf-16-le")) // 2 > MAX_NAME_UNITS:
+            stem = stem[:-1]
+        part = stem + tag + ext
     return part
 
 
