@@ -116,3 +116,25 @@ jobs:
           done
           docker logs ai-brain
           exit 1
+
+      # The full stack from docker-compose.yml: Postgres+pgvector and Redis
+      # start, migrations run, and the app must report a live database
+      # connection. /health/db returns HTTP 200 even when the database is
+      # down, so the response body is what gets checked. Ollama is not part
+      # of the stack and is not needed for this check.
+      - name: Compose stack smoke test
+        run: |
+          docker rm -f ai-brain >/dev/null 2>&1 || true
+          docker compose up -d --build
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health/db | grep -q '"database":"connected"'; then
+              echo; echo "stack healthy: app is connected to Postgres"
+              docker compose down -v
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          docker compose logs --tail=80
+          docker compose down -v
+          exit 1

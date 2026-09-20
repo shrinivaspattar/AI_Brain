@@ -162,7 +162,6 @@ the backend it calls can delete, move, or quarantine anything).
 - `.rar`/`.gz` archive extraction (only `.zip`/`.7z` today)
 - Any way to trigger the dedup executor (no endpoint or CLI calls it, by
   design - see above)
-- Docker Compose for Postgres/Ollama (placeholder file, not filled in)
 
 ## Setup
 
@@ -195,13 +194,36 @@ docker run --rm -p 8000:8000 \
   ai-brain
 ```
 
+### Docker Compose
+
+One command starts the app, Postgres (pgvector) and Redis, and applies the
+migrations:
+
+```bash
+docker compose up --build
+```
+
+Only the app is published (port 8000, or set `AIBRAIN_APP_PORT`); Postgres
+and Redis stay inside the compose network, so this does not collide with a
+Postgres or Redis you already run. The database password defaults to a
+local-development value; set `AIBRAIN_DB_PASSWORD` to change it. The Redis
+embedding cache is on in this stack.
+
+Ollama is not part of the stack. The app reaches the host's Ollama at
+`host.docker.internal:11434`, but Ollama listens only on `127.0.0.1` by
+default, which a container cannot use. To make it reachable, start Ollama
+with `OLLAMA_HOST=0.0.0.0` - which also exposes it to your network, so only
+do that on a network you trust. Without it, the UI, health checks and the
+database work, and anything needing embeddings or chat fails.
+
 ### CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull
 request to `main`: `pgvector/pgvector:pg16` and `redis:7` services, both
 databases migrated with Alembic, the backend test suite, then a Docker build followed
 by a smoke test that starts the container and requires `GET /health` to
-answer. Tests that need a live Ollama skip themselves in CI; the Redis cache has a
+answer, and a second smoke test that brings up the whole compose stack and
+requires `GET /health/db` to report a live Postgres connection. Tests that need a live Ollama skip themselves in CI; the Redis cache has a
 real round-trip test against the CI Redis service.
 
 ## What broke and how it was fixed

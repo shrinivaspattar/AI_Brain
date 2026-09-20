@@ -1,0 +1,72 @@
+# One-command local stack: app + Postgres (pgvector) + Redis.
+#
+#   docker compose up --build
+#
+# Ollama is NOT part of this stack (its models are large and it often runs
+# on the host). The app reaches it at host.docker.internal:11434, which means
+# Ollama on the host must listen on an address the container can reach - by
+# default it only listens on 127.0.0.1, which a container cannot use. See the
+# README's Docker section. Everything except embeddings/chat (health checks,
+# the database, the UI) works without it.
+#
+# Postgres and Redis are deliberately not published to the host, so this
+# cannot collide with a Postgres/Redis you already run locally. Only the app
+# is exposed, on AIBRAIN_APP_PORT (default 8000).
+#
+# The variable names below are AIBRAIN_-prefixed on purpose: Compose reads
+# the repo's .env for substitution, and that file's own DATABASE_URL /
+# OLLAMA_HOST point at localhost, which is wrong inside a container.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aibrain
+      POSTGRES_PASSWORD: ${AIBRAIN_DB_PASSWORD:-aibrain}
+      POSTGRES_DB: aibrain
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibrain -d aibrain"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: applies the Alembic migrations, then exits.
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://aibrain:${AIBRAIN_DB_PASSWORD:-aibrain}@db:5432/aibrain
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build: .
+    ports:
+      - "${AIBRAIN_APP_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://aibrain:${AIBRAIN_DB_PASSWORD:-aibrain}@db:5432/aibrain
+      REDIS_URL: redis://redis:6379
+      OLLAMA_HOST: http://host.docker.internal:11434
+      EMBEDDING_CACHE_ENABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
