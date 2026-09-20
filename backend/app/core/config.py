@@ -31,6 +31,13 @@ class Settings(BaseSettings):
 
     # Query-embedding cache in Redis. Off by default: nothing changes until
     # it is enabled. The TTL is a plain default, not a tuned value.
+    # Hybrid search: fuse dense (pgvector) and BM25 rankings with RRF. Off by
+    # default - the measured gain (Experiment 001) is on public technical docs,
+    # not on personal notes. The pool is how many chunks each ranking
+    # contributes before fusion; a plain default, not tuned.
+    SEARCH_HYBRID_ENABLED: bool = False
+    SEARCH_HYBRID_POOL: int = 50
+
     EMBEDDING_CACHE_ENABLED: bool = False
     EMBEDDING_CACHE_TTL_SECONDS: int = 86400
 

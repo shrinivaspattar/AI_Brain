@@ -3,11 +3,14 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.embeddings.cache import CachedEmbeddingClient, build_query_embedding_client
 from app.embeddings.client import EmbeddingClient
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.provenance_link import ProvenanceLink
+from app.rag.bm25_index import Bm25IndexCache, default_bm25_cache
+from app.rag.fusion import rrf_fuse
 from app.models.source_instance import SourceInstance
 
 
@@ -56,9 +59,11 @@ class RetrievalService:
         self,
         db: Session,
         embedding_client: EmbeddingClient | CachedEmbeddingClient | None = None,
+        bm25_cache: Bm25IndexCache | None = None,
     ):
         self.db = db
         self.embedding_client = embedding_client or build_query_embedding_client()
+        self.bm25_cache = bm25_cache or default_bm25_cache
 
     def search(
         self,
@@ -72,6 +77,9 @@ class RetrievalService:
 
         query_embedding = self.embedding_client.embed([query])[0]
 
+        if settings.SEARCH_HYBRID_ENABLED:
+            return self._hybrid_search(query, top_k, query_embedding)
+
         distance = DocumentChunk.embedding.cosine_distance(query_embedding)
 
         statement = (
@@ -84,6 +92,40 @@ class RetrievalService:
 
         rows = self.db.execute(statement).all()
 
+        return self._build_results(rows)
+
+    def _hybrid_search(self, query: str, top_k: int, query_embedding: list[float]) -> list[RetrievedChunk]:
+        """Dense (pgvector) and BM25 rankings fused with Reciprocal Rank
+        Fusion. Each ranking contributes its top `SEARCH_HYBRID_POOL` chunks
+        (never fewer than top_k). A chunk found only by BM25 still gets a real
+        cosine distance, computed in the final fetch."""
+        pool = max(settings.SEARCH_HYBRID_POOL, top_k)
+        distance = DocumentChunk.embedding.cosine_distance(query_embedding)
+
+        dense_ids = [
+            row[0]
+            for row in self.db.execute(
+                select(DocumentChunk.id)
+                .where(DocumentChunk.embedding.is_not(None))
+                .order_by(distance, DocumentChunk.id)
+                .limit(pool)
+            )
+        ]
+        bm25_ids = self.bm25_cache.get(self.db).search(query, pool)
+
+        fused = rrf_fuse([dense_ids, bm25_ids])[:top_k]
+        if not fused:
+            return []
+
+        rows = self.db.execute(
+            select(DocumentChunk, Document, distance.label("distance"))
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .where(DocumentChunk.id.in_(fused))
+        ).all()
+        by_id = {chunk.id: (chunk, document, dist) for chunk, document, dist in rows}
+        return self._build_results([by_id[chunk_id] for chunk_id in fused if chunk_id in by_id])
+
+    def _build_results(self, rows) -> list[RetrievedChunk]:
         occurrences_by_group = self._occurrences_by_content_identity_group(
             document.content_identity_group_id
             for _chunk, document, _dist in rows

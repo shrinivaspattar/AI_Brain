@@ -34,7 +34,7 @@ kept as separate branches rather than merged into one confusing history:
   default (`EMBEDDING_CACHE_ENABLED`)
 - Plain HTML/CSS/vanilla JS frontend, served directly by FastAPI — no
   Node/npm toolchain, no build step, no second process
-- 1,019 tests (`backend/tests`)
+- 1,034 tests (`backend/tests`)
 
 ## Architecture
 
@@ -102,6 +102,16 @@ read-only except one review-gated tool (`remember`).
 **Retrieval & conversation:**
 - `POST /rag/search` — semantic search over ingested content via pgvector
   cosine distance.
+- Optional hybrid search (`SEARCH_HYBRID_ENABLED=true`): dense results and
+  in-memory BM25 keyword results fused with Reciprocal Rank Fusion. **Off by
+  default.** In two rounds of measurement (110 and 279 queries) on one public
+  corpus of technical docs it scored nDCG@10 0.868 and 0.844 against 0.842 and
+  0.794 for dense search alone, but BM25 alone was about as good as the hybrid,
+  and it has not been measured on personal notes, so enabling it is an
+  experiment on your own data. The production code reproduces the experiment
+  (0.845 vs 0.794 on the 279 queries) at about 30 ms more per search. The index
+  is built in memory from the chunk text and rebuilt when chunks change, which
+  suits thousands of chunks, not millions.
 - Query embeddings can be cached in Redis (`EMBEDDING_CACHE_ENABLED=true`,
   `REDIS_URL`, `EMBEDDING_CACHE_TTL_SECONDS`, default one day). It fails
   open: if Redis is down or returns a bad value, search behaves exactly as
