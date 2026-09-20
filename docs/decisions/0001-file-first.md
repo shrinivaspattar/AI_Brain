@@ -33,3 +33,29 @@ Practically, this means:
 - Costs: no single database transaction covers "file + index" consistency;
   ingestion code has to handle partial states (file present, index stale or
   missing) as the normal case, not an edge case.
+
+## Known gaps (found 2026-09-20, not yet resolved)
+
+Checked against the running system, two places where "files are the source
+of truth, the database can be rebuilt" does not fully hold:
+
+1. **Conversations and memories exist only in Postgres.** The decision says
+   knowledge extracted by the AI must never be the only copy of something.
+   `Conversation`, `Message` and `Memory` rows have no on-disk counterpart,
+   and there is no export code for them. A human-authored memory
+   (`POST /memory`) is therefore lost if the database is dropped. At the
+   time of writing the stakes are small (0 memories, 2 conversations,
+   4 messages), but it grows with use. Fix options, not yet chosen: export
+   approved memories and conversations to files, or state explicitly that
+   they are database-only data alongside job history and audit state.
+
+2. **Chain 2 documents can point at working copies that no longer exist.**
+   Chain 2 stores content in a workspace directory and sets
+   `Document.source` to that copy. The real-drive pilot used a workspace
+   under `/tmp`, which a reboot removed: 6 of the 13 documents in the
+   production database now have a `source` path missing on disk. Nothing is
+   lost, since the originals remain on the source drive, provenance records
+   their real paths, and search and chat use the stored chunks. But
+   `Document.source` is misleading for these documents. Fix options, not yet
+   chosen: run batches with a workspace on a persistent path, or treat
+   `Document.source` as informational for Chain 2 and rely on provenance.
