@@ -59,3 +59,20 @@ of truth, the database can be rebuilt" does not fully hold:
    `Document.source` is misleading for these documents. Fix options, not yet
    chosen: run batches with a workspace on a persistent path, or treat
    `Document.source` as informational for Chain 2 and rely on provenance.
+
+### Update (2026-09-20): tooling added for both gaps
+
+1. **Conversations and memories:** `scripts/export_data.py export` writes them
+   to a new timestamped snapshot of plain JSON files under `documents/exports/`
+   (gitignored; the files are private). `restore` loads a snapshot back into an
+   EMPTY database, preserving ids, in one transaction, and refuses otherwise
+   (`app/export/service.py`, tested against a real database including a full
+   round trip). Exports are run by hand; nothing schedules them yet. Tool-call
+   audit records are not included.
+2. **Dangling Chain 2 sources:** `scripts/repair_chain2_document_sources.py`
+   finds each affected document's original on the source drive, verifies its
+   bytes by SHA-256 against the recorded content identity, writes a fresh
+   workspace copy under a persistent root, and repoints `Document.source`. It
+   is a dry run unless `--apply` is given and refuses a workspace under `/tmp`.
+   To stop the problem recurring, run Chain 2 batches with a persistent
+   `--workspace-root` (for example `documents/workspace/`), never `/tmp`.

@@ -34,7 +34,7 @@ kept as separate branches rather than merged into one confusing history:
   default (`EMBEDDING_CACHE_ENABLED`)
 - Plain HTML/CSS/vanilla JS frontend, served directly by FastAPI — no
   Node/npm toolchain, no build step, no second process
-- 1,013 tests (`backend/tests`)
+- 1,019 tests (`backend/tests`)
 
 ## Architecture
 
@@ -232,6 +232,20 @@ by a smoke test that starts the container and requires `GET /health` to
 answer, and a second smoke test that brings up the whole compose stack and
 requires `GET /health/db` to report a live Postgres connection. Tests that need a live Ollama skip themselves in CI; the Redis cache has a
 real round-trip test against the CI Redis service.
+
+### Backing up conversations and memories
+
+Everything else in Postgres can be rebuilt from your files, but chat history and
+memories exist only in the database. Export them to plain JSON (a new snapshot
+each time, under the gitignored `documents/exports/`):
+
+```bash
+python scripts/export_data.py export
+```
+
+`python scripts/export_data.py restore SNAPSHOT_DIR --database aibrain` loads a
+snapshot into an empty database and refuses to run otherwise. Exports are manual;
+nothing schedules them.
 
 ## What broke and how it was fixed
 
