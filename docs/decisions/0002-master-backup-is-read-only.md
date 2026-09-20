@@ -32,3 +32,37 @@ a separate location outside of it.
   it never writes there.
 - Recovery story: if the index or working copies are ever corrupted, the
   master backup is the one thing we can always re-ingest from.
+
+## Known gap (found 2026-09-20, not yet resolved)
+
+The third consequence above says cleanup and deduplication must operate on a
+working copy, never on the master backup. That is not true for the original
+(Chain 1) ingestion path:
+
+- For loose, non-archive files, `DocumentIngestor` does not make a working
+  copy. `Document.source` is the original file's own path
+  (`app/ingestion/document_ingestor.py`); only archive members are extracted
+  into `INGESTION_DIR`.
+- The dedup plan then uses `Document.source` as each action's `source_path`
+  (`app/dedup/execution_plan_service.py`), so an executed plan would
+  quarantine-move the original file. The synthetic end-to-end demo
+  (`scripts/dedup_pipeline_synthetic_demo.py`) showed exactly this: the file
+  that moved was the one in the source folder, not a copy.
+- The Chain 2 ingestion path is different: its `Document.source` is a
+  workspace copy, so Chain 2 content is already on working copies.
+
+**Why it is harmless today:** `DedupFilesystemExecutor` is not wired to any
+API endpoint or CLI, and it takes `allowed_root` and `quarantine_root` from
+its caller with no defaults. Nothing in the running application can trigger
+it.
+
+**Before anyone wires it up**, decide how the executor should honour this
+decision. Options, not yet chosen:
+
+- refuse any `allowed_root` inside a configured master-backup path;
+- require plans to be built only from documents whose `source` lies under
+  `INGESTION_DIR` (working copies);
+- ingest loose files by copying them into `INGESTION_DIR` first.
+
+Independently of that choice, mounting the master backup read-only at the OS
+level (already suggested above) would make the gap unexploitable.
