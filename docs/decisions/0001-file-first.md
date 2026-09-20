@@ -76,3 +76,8 @@ of truth, the database can be rebuilt" does not fully hold:
    is a dry run unless `--apply` is given and refuses a workspace under `/tmp`.
    To stop the problem recurring, run Chain 2 batches with a persistent
    `--workspace-root` (for example `documents/workspace/`), never `/tmp`.
+
+   Applied 2026-09-20 against the production database: 6 documents repaired,
+   0 skipped, and afterwards all 13 documents' sources exist on disk and each
+   repaired file's SHA-256 equals its recorded identity hash. Chunks and
+   provenance records were untouched.
