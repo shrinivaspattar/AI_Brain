@@ -66,3 +66,20 @@ decision. Options, not yet chosen:
 
 Independently of that choice, mounting the master backup read-only at the OS
 level (already suggested above) would make the gap unexploitable.
+
+### Update (2026-09-20): guard added
+
+The first option above is now implemented. `DedupFilesystemExecutor` refuses
+to be constructed when its working area (`allowed_root`) is on, inside, or
+above a protected path, or when its quarantine folder is inside one. Protected
+paths come from the `MASTER_BACKUP_PATHS` setting (comma-separated absolute
+paths) and a caller can add more through `protected_roots` but never remove
+configured ones. Paths are resolved without needing to exist, so an unmounted
+drive is still protected.
+
+Limits, stated plainly: the guard protects only paths that are configured, so
+`MASTER_BACKUP_PATHS` must be set wherever the executor could run. The
+underlying fact that Chain 1 does not copy loose files is unchanged; the guard
+prevents the executor from acting on the original location, it does not make a
+working copy. Mounting the master backup read-only at the OS level remains the
+stronger protection.

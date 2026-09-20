@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     INGESTION_DIR: Path = BASE_DIR / "documents" / "imports"
     REDIS_URL: str = "redis://localhost:6379"
 
+    # Comma-separated absolute paths of the read-only master backup(s) (see
+    # docs/decisions/0002). The dedup filesystem executor refuses to operate
+    # on, inside, or above any of them.
+    MASTER_BACKUP_PATHS: str = ""
+
     OLLAMA_HOST: str = "http://localhost:11434"
     CHAT_MODEL: str = "qwen3:8b"
     # Qwen3 "thinking" adds hidden reasoning tokens before every reply. On
@@ -33,6 +38,9 @@ class Settings(BaseSettings):
         env_file=BASE_DIR / ".env",
         case_sensitive=True,
     )
+
+    def master_backup_paths(self) -> list[Path]:
+        return [Path(p.strip()) for p in self.MASTER_BACKUP_PATHS.split(",") if p.strip()]
 
 
 settings = Settings()

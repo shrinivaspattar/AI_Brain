@@ -14,6 +14,10 @@ either argument raises `TypeError` before any other code runs. This is
 the entire mechanism by which "the real corpus cannot be selected
 implicitly" is true: there is nothing here to implicitly select.
 
+MASTER-BACKUP GUARD (decision 0002): paths listed in the MASTER_BACKUP_PATHS
+setting, plus any passed as `protected_roots`, can never be operated on, inside,
+or above - the constructor refuses, even if the drive is not mounted.
+
 This executor is not wired into any API endpoint, any router, or
 `app/main.py` - it is only ever constructible from trusted Python code
 (today: tests). Exposing it via HTTP, or to arbitrary user-supplied
@@ -23,6 +27,7 @@ roots, is explicitly out of scope for this milestone.
 import hashlib
 import os
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +35,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.dedup.authorization_service import DedupPlanAuthorizationService
 from app.dedup.execution_plan_service import DedupExecutionPlanService, _observe_file
 from app.dedup.execution_service import AlreadyFinalizedError, DedupExecutionService
@@ -171,7 +177,14 @@ class DedupFilesystemExecutor:
     before it.
     """
 
-    def __init__(self, db: Session, allowed_root: Path, quarantine_root: Path):
+    def __init__(
+        self,
+        db: Session,
+        allowed_root: Path,
+        quarantine_root: Path,
+        *,
+        protected_roots: Sequence[Path] | None = None,
+    ):
         self.db = db
         self.execution_service = DedupExecutionService(db)
         self.authorization_service = DedupPlanAuthorizationService(db)
@@ -242,8 +255,36 @@ class DedupFilesystemExecutor:
                 "be atomic, and this executor never falls back to copy-then-delete"
             )
 
+        # Master-backup guard (decision 0002): the configured
+        # MASTER_BACKUP_PATHS always apply, and a caller may only ADD to them.
+        # Resolved without requiring existence, so an unmounted drive is
+        # still protected. Refuses a working area on, inside, or above a
+        # protected path, and a quarantine folder inside one (that would be
+        # a write into the master backup).
+        protected = [
+            Path(root).resolve(strict=False)
+            for root in [*settings.master_backup_paths(), *(protected_roots or [])]
+        ]
+        for root in protected:
+            if _is_within(allowed_root, root):
+                raise ValueError(
+                    f"allowed_root {allowed_root} is inside protected master-backup "
+                    f"path {root} - this executor never operates on the master backup"
+                )
+            if _is_within(root, allowed_root):
+                raise ValueError(
+                    f"allowed_root {allowed_root} contains protected master-backup "
+                    f"path {root} - refusing, it could reach files inside it"
+                )
+            if _is_within(quarantine_root, root):
+                raise ValueError(
+                    f"quarantine_root {quarantine_root} is inside protected "
+                    f"master-backup path {root} - the master backup is never written to"
+                )
+
         self.allowed_root = allowed_root
         self.quarantine_root = quarantine_root
+        self.protected_roots = tuple(protected)
         self._quarantine_device = quarantine_device
 
     def execute(self, execution_id: int, *, confirm: bool) -> DedupExecution:

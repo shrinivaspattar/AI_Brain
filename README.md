@@ -34,7 +34,7 @@ kept as separate branches rather than merged into one confusing history:
   default (`EMBEDDING_CACHE_ENABLED`)
 - Plain HTML/CSS/vanilla JS frontend, served directly by FastAPI — no
   Node/npm toolchain, no build step, no second process
-- 1,003 tests (`backend/tests`)
+- 1,013 tests (`backend/tests`)
 
 ## Architecture
 
@@ -145,8 +145,9 @@ always means quarantine-move via `os.rename()`, never a true delete — with
 serious TOCTOU-closure: it pins the source file's device/inode and hashes
 its content through one open file descriptor, then verifies the
 post-move destination identity matches that exact pin before calling
-anything a success. Fail-closed by construction: no default paths, no env
-var, rejects symlinked roots, refuses cross-filesystem moves. It is **not
+anything a success. Fail-closed by construction: no default paths, rejects symlinked roots,
+refuses cross-filesystem moves, and refuses to run on, inside or above any path
+listed in `MASTER_BACKUP_PATHS` (the read-only master backup). It is **not
 wired into any API endpoint or router** — constructible only from trusted
 Python code, exercised today only by its own tests, never reachable from
 the running application.
