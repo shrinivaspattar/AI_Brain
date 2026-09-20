@@ -92,7 +92,13 @@ def process(kind, path, top, prefix, depth, ctx: Ctx):
     if kind == "zip":
         process_zip(path, top, prefix, depth, ctx)
     elif kind == "7z":
-        process_7z(path, top, prefix, depth, ctx)
+        try:
+            process_7z(path, top, prefix, depth, ctx)
+        except Exception as exc:  # noqa: BLE001
+            if "nsupported" not in type(exc).__name__ + str(exc):
+                raise
+            ctx.rows = [r for r in ctx.rows if r[0] != safe(top) or not r[1].startswith(prefix)]
+            process_rar(path, top, prefix, depth, ctx)
     else:
         process_rar(path, top, prefix, depth, ctx)
 
@@ -228,7 +234,18 @@ def process_7z(path, top, prefix, depth, ctx):
             recurse_temp(rec["tmp"], rec["nk"], top, prefix + name, depth, ctx)
 
 
+def recurse_existing(path, kind, top, member_name, depth, ctx):
+    """Open an already-extracted nested archive (it is deleted with its work dir)."""
+    try:
+        process(kind, path, top, member_name + "!", depth + 1, ctx)
+    except Exception as exc:  # noqa: BLE001
+        ctx.add(top, member_name + "!", depth + 1, None, None, None, None,
+                f"nested archive could not be opened: {type(exc).__name__}: {exc}"[:300])
+
+
 def process_rar(path, top, prefix, depth, ctx):
+    """Also the fallback for 7z archives py7zr cannot decode: the `7z` command
+    extracts to a temp dir (verifying its own CRCs), which is hashed and removed."""
     workdir = tempfile.mkdtemp(dir=ctx.temp_dir)
     try:
         out = subprocess.run(["7z", "x", "-y", f"-o{workdir}", "--", path], capture_output=True, text=True, timeout=3600)
@@ -241,6 +258,9 @@ def process_rar(path, top, prefix, depth, ctx):
                 with open(full, "rb") as fh:
                     sha, crc, total = stream_hash(fh)
                 ctx.add(top, prefix + rel, depth, total, sha, crc, None)
+                nk = nested_kind(f) if depth < MAX_DEPTH else None
+                if nk:
+                    recurse_existing(full, nk, top, prefix + rel, depth, ctx)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
