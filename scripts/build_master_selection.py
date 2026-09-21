@@ -47,6 +47,10 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--large-bytes", type=int, default=50_000_000, help="provisional; files above this go to a later, separate class")
     ap.add_argument("--exclude-folder", action="append", default=[], help="top-level folder name to leave out (repeatable)")
+    ap.add_argument("--exclude-name-contains", action="append", default=[],
+                    help="leave out files whose name contains this text, case-insensitive (repeatable)")
+    ap.add_argument("--heavy-text-bytes", type=int, default=1_000_000,
+                    help="provisional (measured on the first pilot): txt/md/json/csv above this go to a separate 'chunk_heavy' class")
     ap.add_argument("--no-policy-check", action="store_true",
                     help="keep files the batch policy would not admit (default: only admitted files are selected)")
     ap.add_argument("--pilot-per-type", type=int, default=20, help="provisional; files per type in the proposed pilot")
@@ -73,6 +77,13 @@ def main() -> None:
         if path[len(root):].split("/")[0] in a.exclude_folder:
             excluded["top-level folder excluded by the user"] += 1
             continue
+        name = os.path.basename(path)
+        if name.startswith("~$"):
+            excluded["Office lock file (~$...)"] += 1
+            continue
+        if any(x.lower() in name.lower() for x in a.exclude_name_contains):
+            excluded["name excluded by the user"] += 1
+            continue
         if VENDOR.search(path):
             excluded["vendor / cache folder"] += 1
             continue
@@ -88,7 +99,8 @@ def main() -> None:
                 continue
         rel = path[len(root):]
         files.append({"path": path, "size": size, "sha256": sha_of[path], "ext": ext, "workload": workload,
-                      "top": rel.split("/")[0], "class": "large" if size > a.large_bytes else "normal"})
+                      "top": rel.split("/")[0], "class": ("large" if size > a.large_bytes else
+                                "chunk_heavy" if ext in {".txt", ".md", ".json", ".csv"} and size > a.heavy_text_bytes else "normal")})
     files.sort(key=lambda f: (f["top"], f["path"]))
 
     groups = collections.defaultdict(lambda: {"files": 0, "bytes": 0})
@@ -120,7 +132,8 @@ def main() -> None:
         "source": {"keep_csv_sha256": hashlib.sha256(a.keep_csv.read_bytes()).hexdigest(), "hashes_db": a.hashes.name},
         "rules": {"document_types": sorted(TEXT_DOCUMENT | STRUCTURED), "excluded_folders_regex": VENDOR.pattern,
                   "large_bytes": a.large_bytes, "pilot_per_type": a.pilot_per_type,
-                  "excluded_top_folders": a.exclude_folder,
+                  "excluded_top_folders": a.exclude_folder, "excluded_name_contains": a.exclude_name_contains,
+                  "heavy_text_bytes": a.heavy_text_bytes,
                   "policy_version": None if a.no_policy_check else policy.selection_policy_version},
         "excluded_counts": dict(excluded),
         "groups": [{"top": k[0], "class": k[1], **v} for k, v in sorted(groups.items())],
@@ -132,7 +145,8 @@ def main() -> None:
     n = len(files); b = sum(f["size"] for f in files)
     normal = [f for f in files if f["class"] == "normal"]
     print(f"candidate documents: {n:,} = {b/1e9:,.2f} GB   (normal {len(normal):,} = {sum(f['size'] for f in normal)/1e9:.2f} GB;"
-          f" large >{a.large_bytes/1e6:.0f} MB: {n-len(normal)} = {sum(f['size'] for f in files if f['class']=='large')/1e9:.2f} GB)")
+          f" large >{a.large_bytes/1e6:.0f} MB: {sum(1 for f in files if f['class']=='large')};"
+          f" chunk_heavy text >{a.heavy_text_bytes/1e6:.1f} MB: {sum(1 for f in files if f['class']=='chunk_heavy')})")
     print("excluded by rule:", dict(excluded))
     by_type = collections.Counter(f["ext"] for f in files)
     print("by type:", by_type.most_common(12))

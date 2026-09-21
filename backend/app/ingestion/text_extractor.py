@@ -83,7 +83,18 @@ def extract_text(path: Path) -> str:
         if suffix == extension or suffix.startswith(extension + "_"):
             return _without_nul(extractor(path))
 
-    return _without_nul(path.read_text(encoding="utf-8"))
+    return _without_nul(_read_text_file(path))
+
+
+def _read_text_file(path: Path) -> str:
+    """Plain text as UTF-8, or as UTF-16 when the file starts with a UTF-16
+    byte-order mark (common for text saved by Windows tools). Anything else
+    that is not valid UTF-8 still raises, so binary files are not read as
+    garbage text."""
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    return raw.decode("utf-8")
 
 
 def _without_nul(text: str) -> str:

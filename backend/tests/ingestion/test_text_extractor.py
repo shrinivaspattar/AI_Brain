@@ -190,3 +190,18 @@ def test_extract_text_removes_nul_characters(tmp_path: Path) -> None:
     path.write_text("before\x00after\x00", encoding="utf-8")
 
     assert extract_text(path) == "beforeafter"
+
+
+def test_extract_text_reads_utf16_with_byte_order_mark(tmp_path: Path) -> None:
+    path = tmp_path / "windows.txt"
+    path.write_bytes("héllo wörld".encode("utf-16"))
+
+    assert extract_text(path) == "héllo wörld"
+
+
+def test_extract_text_still_rejects_non_utf8_without_a_byte_order_mark(tmp_path: Path) -> None:
+    path = tmp_path / "cp1252.txt"
+    path.write_bytes(b"20\xb0C")
+
+    with pytest.raises(UnicodeDecodeError):
+        extract_text(path)
