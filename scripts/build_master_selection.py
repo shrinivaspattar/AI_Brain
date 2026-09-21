@@ -25,7 +25,14 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
+sys.path.insert(0, str(BACKEND_DIR))
+
+from app.classification.deterministic_selector import CandidateObservation, classify  # noqa: E402
+from app.classification.policy_evaluator import text_document_batch_policy  # noqa: E402
 
 TEXT_DOCUMENT = {".md", ".txt", ".html", ".htm", ".pdf", ".docx", ".doc", ".rtf", ".pptx", ".xlsx", ".mbox", ".epub"}
 STRUCTURED = {".json", ".csv", ".xml", ".ipynb"}
@@ -40,9 +47,12 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--large-bytes", type=int, default=50_000_000, help="provisional; files above this go to a later, separate class")
     ap.add_argument("--exclude-folder", action="append", default=[], help="top-level folder name to leave out (repeatable)")
+    ap.add_argument("--no-policy-check", action="store_true",
+                    help="keep files the batch policy would not admit (default: only admitted files are selected)")
     ap.add_argument("--pilot-per-type", type=int, default=20, help="provisional; files per type in the proposed pilot")
     a = ap.parse_args()
     root = a.root.rstrip("/") + "/"
+    policy = text_document_batch_policy()
 
     db = sqlite3.connect(f"file:{a.hashes}?mode=ro", uri=True)
     sha_of = {p: s for p, s in db.execute("select path, sha256 from all_hashes where sha256 is not null")}
@@ -69,6 +79,13 @@ def main() -> None:
         if path not in sha_of:
             excluded["no recorded checksum"] += 1
             continue
+        if not a.no_policy_check:
+            c = classify(CandidateObservation(path, None, size))
+            if not policy.matches(c):
+                reason = ("type not admitted by the batch policy" if c.workload_category.value not in ("text_document", "structured_data")
+                          else "risk tier too high for the batch policy (size)")
+                excluded[f"{reason} ({ext})" if reason.startswith("type") else reason] += 1
+                continue
         rel = path[len(root):]
         files.append({"path": path, "size": size, "sha256": sha_of[path], "ext": ext, "workload": workload,
                       "top": rel.split("/")[0], "class": "large" if size > a.large_bytes else "normal"})
@@ -103,7 +120,8 @@ def main() -> None:
         "source": {"keep_csv_sha256": hashlib.sha256(a.keep_csv.read_bytes()).hexdigest(), "hashes_db": a.hashes.name},
         "rules": {"document_types": sorted(TEXT_DOCUMENT | STRUCTURED), "excluded_folders_regex": VENDOR.pattern,
                   "large_bytes": a.large_bytes, "pilot_per_type": a.pilot_per_type,
-                  "excluded_top_folders": a.exclude_folder},
+                  "excluded_top_folders": a.exclude_folder,
+                  "policy_version": None if a.no_policy_check else policy.selection_policy_version},
         "excluded_counts": dict(excluded),
         "groups": [{"top": k[0], "class": k[1], **v} for k, v in sorted(groups.items())],
         "pilot": pilot,

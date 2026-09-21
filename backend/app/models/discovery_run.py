@@ -13,6 +13,7 @@ class DiscoveryRunKind(str, Enum):
     D0_INVENTORY = "d0_inventory"
     D1_DUPLICATE_ANALYSIS = "d1_duplicate_analysis"
     D2_PROVENANCE_ANALYSIS = "d2_provenance_analysis"
+    D3_MASTER_MANIFEST = "d3_master_manifest"
 
 
 class DiscoveryRun(Base):
