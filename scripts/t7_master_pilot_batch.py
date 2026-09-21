@@ -54,6 +54,8 @@ def main() -> None:
     ap.add_argument("--report", required=True, type=Path, help="the checksum list the selection was built from")
     ap.add_argument("--max-embeddings", required=True, type=int)
     ap.add_argument("--max-runtime-seconds", required=True, type=int)
+    ap.add_argument("--scope", choices=["pilot", "all-normal"], default="pilot",
+                    help="pilot: the selection's pilot list; all-normal: every normal-class file in the selection")
     ap.add_argument("--database", default="aibrain_test")
     ap.add_argument("--allow-non-test", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="classify and select in memory; create nothing")
@@ -63,13 +65,14 @@ def main() -> None:
         raise SystemExit(f"refusing to use database {a.database!r} without --allow-non-test")
     selection = json.load(open(a.selection))
     by_path = {f["path"]: f for f in selection["files"]}
-    pilot = [by_path[p] for p in selection["pilot"]]
+    pilot = ([by_path[p] for p in selection["pilot"]] if a.scope == "pilot"
+             else [f for f in selection["files"] if f["class"] == "normal"])
     candidates = [CandidateObservation(root_t7_path=f["path"], member_path=None, declared_size_bytes=f["size"]) for f in pilot]
     policy = text_document_batch_policy()
     max_instances = len(pilot)
     max_bytes = sum(f["size"] for f in pilot)
     admitted = [c for c in (classify(o) for o in candidates) if policy.matches(c)]
-    print(f"pilot files: {len(pilot)} | admitted by policy {policy.selection_policy_version}: {len(admitted)} | bytes: {max_bytes:,}")
+    print(f"files in scope: {len(pilot)} | admitted by policy {policy.selection_policy_version}: {len(admitted)} | bytes: {max_bytes:,}")
     print(f"envelope: instances={max_instances} (derived) bytes={max_bytes:,} (derived) "
           f"embeddings={a.max_embeddings} (operator cap) runtime_s={a.max_runtime_seconds} (operator cap)")
     if a.dry_run:
@@ -88,7 +91,7 @@ def main() -> None:
             discovery_run=discovery, candidates=candidates, policy=policy,
             max_source_instances=max_instances, max_source_bytes=max_bytes, max_extracted_bytes=None,
             max_embeddings=a.max_embeddings, max_runtime_seconds=a.max_runtime_seconds,
-            classifier_version="master-copy-pilot-v1")
+            classifier_version=("master-copy-pilot-v1" if a.scope == "pilot" else "master-copy-priority-v1"))
         if batch is None:
             print("No batch created - nothing eligible.")
             return

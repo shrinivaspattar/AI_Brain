@@ -51,12 +51,14 @@ def main() -> None:
                     help="leave out files whose name contains this text, case-insensitive (repeatable)")
     ap.add_argument("--heavy-text-bytes", type=int, default=1_000_000,
                     help="provisional (measured on the first pilot): txt/md/json/csv above this go to a separate 'chunk_heavy' class")
+    ap.add_argument("--only-types", default="", help="comma-separated extensions to keep, e.g. .md,.pdf (default: all admitted types)")
     ap.add_argument("--no-policy-check", action="store_true",
                     help="keep files the batch policy would not admit (default: only admitted files are selected)")
     ap.add_argument("--pilot-per-type", type=int, default=20, help="provisional; files per type in the proposed pilot")
     a = ap.parse_args()
     root = a.root.rstrip("/") + "/"
     policy = text_document_batch_policy()
+    only_types = {t.strip().lower() for t in a.only_types.split(",") if t.strip()}
 
     db = sqlite3.connect(f"file:{a.hashes}?mode=ro", uri=True)
     sha_of = {p: s for p, s in db.execute("select path, sha256 from all_hashes where sha256 is not null")}
@@ -71,6 +73,9 @@ def main() -> None:
             workload = "structured_data"
         else:
             continue                                   # not a document type (media, programs, code: other steps)
+        if only_types and ext not in only_types:
+            excluded["type not in this tier (--only-types)"] += 1
+            continue
         if not path.startswith(root):
             excluded["outside the master root"] += 1
             continue
@@ -133,7 +138,7 @@ def main() -> None:
         "rules": {"document_types": sorted(TEXT_DOCUMENT | STRUCTURED), "excluded_folders_regex": VENDOR.pattern,
                   "large_bytes": a.large_bytes, "pilot_per_type": a.pilot_per_type,
                   "excluded_top_folders": a.exclude_folder, "excluded_name_contains": a.exclude_name_contains,
-                  "heavy_text_bytes": a.heavy_text_bytes,
+                  "heavy_text_bytes": a.heavy_text_bytes, "only_types": sorted(only_types),
                   "policy_version": None if a.no_policy_check else policy.selection_policy_version},
         "excluded_counts": dict(excluded),
         "groups": [{"top": k[0], "class": k[1], **v} for k, v in sorted(groups.items())],
