@@ -83,3 +83,9 @@ underlying fact that Chain 1 does not copy loose files is unchanged; the guard
 prevents the executor from acting on the original location, it does not make a
 working copy. Mounting the master backup read-only at the OS level remains the
 stronger protection.
+
+### Update (2026-09-22): the cleaned drive is the master copy
+
+See [[0003-clean-master-copy]]. The drive was deduplicated and its archives
+unpacked by hand; the read-only rule in this decision applies to the cleaned
+content unchanged.
