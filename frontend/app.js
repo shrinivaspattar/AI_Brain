@@ -1,3 +1,28 @@
+// A document ingested from an original file (Chain 2) is stored as a working
+// copy named "content.<ext>", which says nothing to the reader. When the
+// citation carries the original file path, show that file's name and folder.
+function citationFullPath(citation) {
+  const occurrence = citation.source_occurrences && citation.source_occurrences[0];
+  if (!occurrence) {
+    return citation.document_source;
+  }
+  return occurrence.member_path
+    ? `${occurrence.root_t7_path} :: ${occurrence.member_path}`
+    : occurrence.root_t7_path;
+}
+
+function citationLabel(citation) {
+  const occurrence = citation.source_occurrences && citation.source_occurrences[0];
+  if (!occurrence) {
+    return `${citation.document_title} (${citation.document_source})`;
+  }
+  const path = (occurrence.member_path || occurrence.root_t7_path).replace(/\\/g, "/");
+  const parts = path.split("/").filter(Boolean);
+  const name = parts[parts.length - 1] || path;
+  const folder = parts.length > 1 ? parts[parts.length - 2] : "";
+  return folder ? `${name} (in ${folder})` : name;
+}
+
 const CONVERSATION_ID_KEY = "ai_brain_conversation_id";
 const IMPORT_JOBS_POLL_INTERVAL_MS = 5000;
 const TERMINAL_IMPORT_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
@@ -91,7 +116,8 @@ function renderMessage({ role, content, citations }) {
     const list = document.createElement("ol");
     citations.forEach((citation) => {
       const item = document.createElement("li");
-      item.textContent = `${citation.document_title} (${citation.document_source})`;
+      item.textContent = citationLabel(citation);
+      item.title = citationFullPath(citation);
       list.appendChild(item);
     });
     citationsEl.appendChild(list);
@@ -470,7 +496,8 @@ function renderSourceSnippet(container, message) {
     const list = document.createElement("ol");
     message.citations.forEach((citation) => {
       const item = document.createElement("li");
-      item.textContent = `${citation.document_title} (${citation.document_source})`;
+      item.textContent = citationLabel(citation);
+      item.title = citationFullPath(citation);
       list.appendChild(item);
     });
     citationsEl.appendChild(list);
