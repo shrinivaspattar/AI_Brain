@@ -46,3 +46,22 @@ class ChatClient:
             raise ChatUnavailableError(str(exc)) from exc
 
         return response.message
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ):
+        """Like `chat`, but yields each partial response message as the model
+        produces it, so the caller can show text immediately."""
+        try:
+            for chunk in self._client.chat(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                think=self.thinking,
+                stream=True,
+            ):
+                yield chunk.message
+        except Exception as exc:
+            raise ChatUnavailableError(str(exc)) from exc

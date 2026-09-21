@@ -36,6 +36,10 @@ from app.classification.policy_evaluator import text_document_batch_policy  # no
 
 TEXT_DOCUMENT = {".md", ".txt", ".html", ".htm", ".pdf", ".docx", ".doc", ".rtf", ".pptx", ".xlsx", ".mbox", ".epub"}
 STRUCTURED = {".json", ".csv", ".xml", ".ipynb"}
+# Files whose NAME says they hold a secret are never selected for the search index.
+SENSITIVE_NAME_PARTS = ["recovery key", "recovery-key", "recovery_key", "recovery kit", "recovery-kit",
+                        "recovery_kit", "password", "passwd", "credential", "secret", "private key",
+                        "private_key", "seed phrase", "backup code"]
 VENDOR = re.compile(r"/(node_modules|site-packages|\.venv|venv|\.git|__pycache__|\.cache|Cache|Code Cache|\.stversions|\.stfolder|dist-info|egg-info)/", re.I)
 
 
@@ -49,6 +53,8 @@ def main() -> None:
     ap.add_argument("--exclude-folder", action="append", default=[], help="top-level folder name to leave out (repeatable)")
     ap.add_argument("--exclude-name-contains", action="append", default=[],
                     help="leave out files whose name contains this text, case-insensitive (repeatable)")
+    ap.add_argument("--no-sensitive-name-filter", action="store_true",
+                    help="do not skip files named like recovery keys / passwords / credentials (default: skip them)")
     ap.add_argument("--heavy-text-bytes", type=int, default=1_000_000,
                     help="provisional (measured on the first pilot): txt/md/json/csv above this go to a separate 'chunk_heavy' class")
     ap.add_argument("--only-types", default="", help="comma-separated extensions to keep, e.g. .md,.pdf (default: all admitted types)")
@@ -85,6 +91,9 @@ def main() -> None:
         name = os.path.basename(path)
         if name.startswith("~$"):
             excluded["Office lock file (~$...)"] += 1
+            continue
+        if not a.no_sensitive_name_filter and any(x in name.lower() for x in SENSITIVE_NAME_PARTS):
+            excluded["sensitive-looking name (recovery key, password, ...)"] += 1
             continue
         if any(x.lower() in name.lower() for x in a.exclude_name_contains):
             excluded["name excluded by the user"] += 1

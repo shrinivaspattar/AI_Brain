@@ -194,8 +194,48 @@ async function sendMessage(text) {
   const pendingBubble = renderPending();
   setComposerBusy(true);
 
+  let streamingBubble = null;
+  let answer = "";
+
+  // The reply is written piece by piece: show each piece at once instead of
+  // waiting minutes for the whole answer on a CPU-only machine.
+  function showAnswerSoFar() {
+    if (!streamingBubble) {
+      pendingBubble.remove();
+      streamingBubble = renderMessage({ role: "assistant", content: "" });
+    }
+    streamingBubble.textContent = answer;
+    scrollToBottom();
+  }
+
+  function handleEvent(event) {
+    if (event.type === "token") {
+      answer += event.text;
+      showAnswerSoFar();
+    } else if (event.type === "reset") {
+      answer = "";
+      if (streamingBubble) {
+        streamingBubble.textContent = "";
+      }
+    } else if (event.type === "error") {
+      throw new Error(event.detail);
+    } else if (event.type === "done") {
+      conversationId = event.conversation_id;
+      localStorage.setItem(CONVERSATION_ID_KEY, conversationId);
+      pendingBubble.remove();
+      if (streamingBubble) {
+        streamingBubble.remove();
+      }
+      renderMessage({
+        role: event.message.role,
+        content: event.message.content,
+        citations: event.message.citations,
+      });
+    }
+  }
+
   try {
-    const response = await fetch("/chat", {
+    const response = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -204,24 +244,40 @@ async function sendMessage(text) {
       }),
     });
 
-    const body = await response.json().catch(() => null);
-
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
+      const body = await response.json().catch(() => null);
       const detail = body && body.detail ? body.detail : `HTTP ${response.status}`;
       throw new Error(detail);
     }
 
-    conversationId = body.conversation_id;
-    localStorage.setItem(CONVERSATION_ID_KEY, conversationId);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-    pendingBubble.remove();
-    renderMessage({
-      role: body.message.role,
-      content: body.message.content,
-      citations: body.message.citations,
-    });
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const rawEvent = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+
+        const line = rawEvent.split("\n").find((l) => l.startsWith("data: "));
+        if (line) {
+          handleEvent(JSON.parse(line.slice(6)));
+        }
+      }
+    }
   } catch (err) {
     pendingBubble.remove();
+    if (streamingBubble) {
+      streamingBubble.remove();
+    }
     renderError(`Something went wrong: ${err.message}`);
   } finally {
     setComposerBusy(false);

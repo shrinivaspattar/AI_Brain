@@ -1,4 +1,7 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -56,6 +59,54 @@ def send_message(
         conversation_id=message.conversation_id,
         message=MessageResponse.model_validate(message),
     )
+
+
+@router.post(
+    "/stream",
+    responses={200: {"content": {"text/event-stream": {}}, "description": "Server-sent events"}},
+)
+def stream_message(
+    request: ChatRequest,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Same as POST /chat, but streamed as server-sent events so the reply
+    appears while it is being written. Events (one JSON object per `data:`
+    line): {"type": "token", "text"}, {"type": "reset"}, one final
+    {"type": "done", "conversation_id", "message"}, or {"type": "error",
+    "detail"} if the turn could not finish."""
+    service = ChatService(db)
+
+    def event_lines():
+        try:
+            for event in service.send_message_stream(
+                request.message,
+                conversation_id=request.conversation_id,
+                top_k=request.top_k,
+            ):
+                if event["type"] == "done":
+                    message = event["message"]
+                    event = {
+                        "type": "done",
+                        "conversation_id": message.conversation_id,
+                        "message": MessageResponse.model_validate(message).model_dump(mode="json"),
+                    }
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except ValueError as exc:
+            yield _error_event(str(exc))
+        except ChatUnavailableError as exc:
+            yield _error_event(f"Chat model unavailable: {exc}")
+        except EmbeddingUnavailableError as exc:
+            yield _error_event(f"Embedding model unavailable: {exc}")
+
+    return StreamingResponse(
+        event_lines(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _error_event(detail: str) -> str:
+    return f"data: {json.dumps({'type': 'error', 'detail': detail}, ensure_ascii=False)}\n\n"
 
 
 @router.get(

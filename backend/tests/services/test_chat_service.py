@@ -880,3 +880,130 @@ def test_send_message_succeeds_even_if_memory_proposal_fails() -> None:
     result = service.send_message("My name is Alex.")
 
     assert result.content == "Got it, I'll remember that."
+
+
+# ---- offline-chat evaluation follow-ups: search query, relevance cutoff, source names ----
+
+from app.rag.retrieval_service import SourceOccurrence  # noqa: E402
+
+
+def _message(role: MessageRole, content: str, message_id: int) -> Message:
+    return Message(id=message_id, conversation_id="conv-1", role=role, content=content)
+
+
+def test_short_follow_up_is_searched_together_with_the_previous_user_message() -> None:
+    history = [
+        _message(MessageRole.USER, "What does my Bangalore to Germany roadmap say?", 1),
+        _message(MessageRole.ASSISTANT, "It has phases.", 2),
+        _message(MessageRole.USER, "and the timeline?", 3),
+    ]
+
+    query = ChatService._search_query("and the timeline?", history, current_message_id=3)
+
+    assert query == "What does my Bangalore to Germany roadmap say? and the timeline?"
+
+
+def test_long_or_first_messages_are_searched_as_they_are() -> None:
+    long_message = "Please summarize everything I wrote about the education system comparison in detail"
+    history = [_message(MessageRole.USER, "earlier question", 1), _message(MessageRole.USER, long_message, 2)]
+
+    assert ChatService._search_query(long_message, history, current_message_id=2) == long_message
+    assert ChatService._search_query("hi", [_message(MessageRole.USER, "hi", 1)], current_message_id=1) == "hi"
+
+
+def test_relevance_cutoff_drops_far_chunks_only_when_configured(monkeypatch) -> None:
+    near = _retrieved_chunk(chunk_id=1, distance=0.2)
+    far = _retrieved_chunk(chunk_id=2, distance=0.6)
+
+    monkeypatch.setattr("app.services.chat_service.settings.CHAT_MAX_SOURCE_DISTANCE", None)
+    assert ChatService._relevant_only([near, far]) == [near, far]
+
+    monkeypatch.setattr("app.services.chat_service.settings.CHAT_MAX_SOURCE_DISTANCE", 0.4)
+    assert ChatService._relevant_only([near, far]) == [near]
+
+
+def test_send_message_shows_no_sources_when_nothing_is_relevant(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.CHAT_MAX_SOURCE_DISTANCE", 0.4)
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("Hello!")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = [_retrieved_chunk(distance=0.7)]
+
+    result = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service).send_message("hi")
+
+    assert result.citations is None
+    assert "No relevant documents were found" in chat_client.chat.call_args.args[0][0]["content"]
+
+
+def test_source_label_prefers_the_original_file_name_over_the_working_copy_title() -> None:
+    from dataclasses import replace
+
+    result = replace(
+        _retrieved_chunk(title="content.md", source="documents/workspace/group_9/content.md"),
+        source_occurrences=[
+            SourceOccurrence(root_t7_path="/master/claude browser offline/039_Bangalore_Germany_Roadmap.md",
+                             member_path=None, archive_ancestry=None)
+        ],
+    )
+
+    assert ChatService._source_label(result) == "039_Bangalore_Germany_Roadmap.md"
+    assert ChatService._source_label(_retrieved_chunk(title="notes.txt")) == "notes.txt"
+
+
+# ---- streaming ----
+
+def _stream_part(content: str = "", tool_calls=None) -> MagicMock:
+    part = MagicMock()
+    part.content = content
+    part.tool_calls = tool_calls
+    return part
+
+
+def _stream_service(parts_per_call, retrieved=None):
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat_stream.side_effect = [iter(parts) for parts in parts_per_call]
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = retrieved or []
+    return ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service), chat_client
+
+
+def test_send_message_stream_yields_pieces_then_the_saved_message() -> None:
+    service, _ = _stream_service([[_stream_part("Hel"), _stream_part("lo "), _stream_part("world")]],
+                                 retrieved=[_retrieved_chunk()])
+
+    events = list(service.send_message_stream("hi there"))
+
+    assert [e["type"] for e in events] == ["token", "token", "token", "done"]
+    assert "".join(e["text"] for e in events if e["type"] == "token") == "Hello world"
+    done = events[-1]["message"]
+    assert done.content == "Hello world"
+    assert done.citations[0]["document_title"] == "notes.txt"
+
+
+def test_send_message_stream_runs_a_tool_call_then_streams_the_final_reply() -> None:
+    call = _tool_call("get_current_time")
+    registry = MagicMock()
+    registry.to_ollama_schema.return_value = []
+    registry.call.return_value = ToolCallResult(content="12:00", is_error=False)
+    service, chat_client = _stream_service([
+        [_stream_part("", tool_calls=[call])],
+        [_stream_part("It is "), _stream_part("noon.")],
+    ])
+    service.tool_registry = registry
+    service._tool_registry_override = registry
+
+    events = list(service.send_message_stream("what time is it?"))
+
+    assert [e for e in events if e["type"] == "token"] == [
+        {"type": "token", "text": "It is "}, {"type": "token", "text": "noon."}]
+    assert events[-1]["message"].content == "It is noon."
+    assert chat_client.chat_stream.call_count == 2
+    registry.call.assert_called_once()

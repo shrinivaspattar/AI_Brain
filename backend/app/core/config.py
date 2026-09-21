@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # take 145 s instead of 6.5 s, so it is off by default. Set
     # CHAT_THINKING_ENABLED=true to trade speed for more deliberate answers.
     CHAT_THINKING_ENABLED: bool = False
+    # Sources farther than this cosine distance from the question are neither
+    # shown nor given to the model. None = keep all (the calibrated value is
+    # set in .env, see the offline-chat evaluation).
+    CHAT_MAX_SOURCE_DISTANCE: float | None = None
     EMBEDDING_MODEL: str = "nomic-embed-text"
     EMBEDDING_DIMENSIONS: int = 768
 

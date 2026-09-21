@@ -3,6 +3,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.memory.service import MemoryService
 from app.models.conversation import Conversation
 from app.models.memory import Memory, MemoryStatus
@@ -24,12 +25,25 @@ SYSTEM_PROMPT = (
     "facts about the user — state them plainly when relevant, with no "
     "[n] citation marker, since they aren't numbered. You also have "
     "tools available — use them when they'd give a better answer than "
-    "the context already provided."
+    "the context already provided. Keep answers short and direct (a few "
+    "sentences or a short list) unless the user asks for detail. If the "
+    "context contains the user's own notes on the topic, use them instead "
+    "of saying you have no access to them."
 )
 
 MAX_HISTORY_MESSAGES = 20
+
+# A message this short (in words) is treated as a follow-up such as "and the
+# timeline?": the search then also uses the previous user message, because
+# on its own it carries too little meaning. PROVISIONAL - chosen from the
+# offline-chat evaluation (one short follow-up), not calibrated.
+FOLLOW_UP_MAX_WORDS = 8
 MAX_MEMORIES = 50
 MAX_TOOL_ITERATIONS = 5
+TOOL_LOOP_EXHAUSTED_REPLY = (
+    "I wasn't able to finish that after several tool calls — "
+    "could you try rephrasing?"
+)
 
 # Cap on how much of a tool's result text gets persisted in the audit
 # record (ToolCallRecord.result). This bounds the tool_calls table, not
@@ -64,6 +78,36 @@ class ChatService:
         conversation_id: str | None = None,
         top_k: int = 5,
     ) -> Message:
+        conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
+            content, conversation_id, top_k
+        )
+
+        reply_text, tool_call_ids = self._run_tool_loop(prompt, conversation.id)
+
+        return self._finish_turn(conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids)
+
+    def send_message_stream(
+        self,
+        content: str,
+        conversation_id: str | None = None,
+        top_k: int = 5,
+    ):
+        """Same turn as `send_message`, but yields events while the reply is
+        being written so a reader sees text at once instead of waiting for
+        the whole answer: {"type": "token", "text": ...} for each piece,
+        {"type": "reset"} if text shown so far turns out to precede a tool
+        call (it is not the final answer), and finally
+        {"type": "done", "message": <the saved assistant Message>}."""
+        conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
+            content, conversation_id, top_k
+        )
+
+        reply_text, tool_call_ids = yield from self._run_tool_loop_stream(prompt, conversation.id)
+
+        message = self._finish_turn(conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids)
+        yield {"type": "done", "message": message}
+
+    def _prepare_turn(self, content: str, conversation_id: str | None, top_k: int):
         conversation = self._get_or_create_conversation(conversation_id)
 
         user_message = Message(
@@ -83,7 +127,12 @@ class ChatService:
                 on_memory_proposed=proposed_memory_ids.append,
             )
 
-        retrieved = self.retrieval_service.search(content, top_k=top_k)
+        history = self._load_history(conversation.id)
+        retrieved = self._relevant_only(
+            self.retrieval_service.search(
+                self._search_query(content, history, user_message.id), top_k=top_k
+            )
+        )
         # Only APPROVED memories ever reach the model - a PENDING proposal
         # (from `remember`, awaiting review) must not influence answers
         # before a human has confirmed it.
@@ -91,11 +140,18 @@ class ChatService:
             limit=MAX_MEMORIES,
             status=MemoryStatus.APPROVED,
         )
-        history = self._load_history(conversation.id)
         prompt = self._build_prompt(history, retrieved, memories)
 
-        reply_text, tool_call_ids = self._run_tool_loop(prompt, conversation.id)
+        return conversation, retrieved, prompt, proposed_memory_ids
 
+    def _finish_turn(
+        self,
+        conversation: Conversation,
+        reply_text: str,
+        retrieved: list[RetrievedChunk],
+        tool_call_ids: list[int],
+        proposed_memory_ids: list[int],
+    ) -> Message:
         citations = self._build_citations(retrieved)
 
         assistant_message = Message(
@@ -151,55 +207,103 @@ class ChatService:
             if not reply.tool_calls:
                 return reply.content or "", tool_call_record_ids
 
-            working_messages.append(
-                {
-                    "role": "assistant",
-                    "content": reply.content or "",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": dict(call.function.arguments),
-                            }
-                        }
-                        for call in reply.tool_calls
-                    ],
-                }
+            self._execute_tool_calls(
+                reply.tool_calls, reply.content or "", working_messages, conversation_id, iteration, tool_call_record_ids
             )
-
-            for call_index, call in enumerate(reply.tool_calls):
-                arguments = dict(call.function.arguments)
-                logger.info("Tool call: %s(%s)", call.function.name, arguments)
-
-                result = self.tool_registry.call(call.function.name, arguments)
-
-                record_id = self._record_tool_call(
-                    conversation_id=conversation_id,
-                    tool_name=call.function.name,
-                    iteration=iteration,
-                    call_index=call_index,
-                    arguments=arguments,
-                    result=result,
-                )
-                if record_id is not None:
-                    tool_call_record_ids.append(record_id)
-
-                working_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_name": call.function.name,
-                        "content": result.content,
-                    }
-                )
 
         logger.warning(
             "Tool loop hit MAX_TOOL_ITERATIONS (%d) without a final reply",
             MAX_TOOL_ITERATIONS,
         )
-        return (
-            "I wasn't able to finish that after several tool calls — "
-            "could you try rephrasing?"
-        ), tool_call_record_ids
+        return TOOL_LOOP_EXHAUSTED_REPLY, tool_call_record_ids
+
+    def _execute_tool_calls(
+        self,
+        tool_calls,
+        reply_content: str,
+        working_messages: list[dict],
+        conversation_id: str,
+        iteration: int,
+        tool_call_record_ids: list[int],
+    ) -> None:
+        """Run the model's requested tool calls: record the assistant turn,
+        execute each tool, persist its audit record, and append each result
+        to the running conversation for the next model call."""
+        working_messages.append(
+            {
+                "role": "assistant",
+                "content": reply_content,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": dict(call.function.arguments),
+                        }
+                    }
+                    for call in tool_calls
+                ],
+            }
+        )
+
+        for call_index, call in enumerate(tool_calls):
+            arguments = dict(call.function.arguments)
+            logger.info("Tool call: %s(%s)", call.function.name, arguments)
+
+            result = self.tool_registry.call(call.function.name, arguments)
+
+            record_id = self._record_tool_call(
+                conversation_id=conversation_id,
+                tool_name=call.function.name,
+                iteration=iteration,
+                call_index=call_index,
+                arguments=arguments,
+                result=result,
+            )
+            if record_id is not None:
+                tool_call_record_ids.append(record_id)
+
+            working_messages.append(
+                {
+                    "role": "tool",
+                    "tool_name": call.function.name,
+                    "content": result.content,
+                }
+            )
+
+    def _run_tool_loop_stream(self, messages: list[dict], conversation_id: str):
+        """`_run_tool_loop`, but the model's text is yielded piece by piece
+        as it is produced. Returns (final reply text, tool call record ids)
+        through the generator's return value."""
+        working_messages = list(messages)
+        tools_schema = self.tool_registry.to_ollama_schema()
+        tool_call_record_ids: list[int] = []
+
+        for iteration in range(1, MAX_TOOL_ITERATIONS + 1):
+            pieces: list[str] = []
+            tool_calls: list = []
+
+            for part in self.chat_client.chat_stream(working_messages, tools=tools_schema):
+                if part.content:
+                    pieces.append(part.content)
+                    yield {"type": "token", "text": part.content}
+                if part.tool_calls:
+                    tool_calls.extend(part.tool_calls)
+
+            if not tool_calls:
+                return "".join(pieces), tool_call_record_ids
+
+            if pieces:
+                yield {"type": "reset"}
+
+            self._execute_tool_calls(
+                tool_calls, "".join(pieces), working_messages, conversation_id, iteration, tool_call_record_ids
+            )
+
+        logger.warning(
+            "Tool loop hit MAX_TOOL_ITERATIONS (%d) without a final reply",
+            MAX_TOOL_ITERATIONS,
+        )
+        return TOOL_LOOP_EXHAUSTED_REPLY, tool_call_record_ids
 
     def _record_tool_call(
         self,
@@ -312,6 +416,41 @@ class ChatService:
 
         return conversation
 
+    @staticmethod
+    def _search_query(content: str, history: list[Message], current_message_id: int | None) -> str:
+        """The text to search with: the message itself, or - for a very short
+        follow-up - the previous user message followed by it."""
+        if len(content.split()) > FOLLOW_UP_MAX_WORDS:
+            return content
+
+        for message in reversed(history):
+            if message.role == MessageRole.USER and message.id != current_message_id:
+                return f"{message.content} {content}"
+
+        return content
+
+    @staticmethod
+    def _relevant_only(retrieved: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        """Drop chunks farther than CHAT_MAX_SOURCE_DISTANCE (when set), so a
+        greeting or a general-knowledge question does not carry five unrelated
+        'sources'. Unset means keep everything (the previous behaviour)."""
+        limit = settings.CHAT_MAX_SOURCE_DISTANCE
+        if limit is None:
+            return retrieved
+        return [result for result in retrieved if result.distance <= limit]
+
+    @staticmethod
+    def _source_label(result: RetrievedChunk) -> str:
+        """What the model (and the reader) should call this source: the
+        original file's name when known, else the stored document title
+        (a working copy is titled 'content.<ext>', which says nothing)."""
+        occurrences = result.source_occurrences
+        if occurrences:
+            first = occurrences[0]
+            path = (first.member_path or first.root_t7_path).replace("\\", "/")
+            return path.rsplit("/", 1)[-1]
+        return result.document.title
+
     def _load_history(self, conversation_id: str) -> list[Message]:
         statement = (
             select(Message)
@@ -351,7 +490,7 @@ class ChatService:
     @staticmethod
     def _format_context(retrieved: list[RetrievedChunk]) -> str:
         return "\n\n".join(
-            f"[{index}] {result.document.title}: {result.chunk.content}"
+            f"[{index}] {ChatService._source_label(result)}: {result.chunk.content}"
             for index, result in enumerate(retrieved, start=1)
         )
 
