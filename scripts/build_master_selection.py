@@ -14,7 +14,7 @@ calibrated on the pilot), and batch envelope limits are NOT chosen here.
 
 Usage:
     python scripts/build_master_selection.py --keep-csv keep_files.csv --hashes all_hashes.sqlite \\
-        --root /path/to/master/root --out selection.json [--large-bytes N] [--pilot-per-type K]
+        --root /path/to/master/root --out selection.json [--exclude-folder NAME ...] [--large-bytes N] [--pilot-per-type K]
 """
 
 import argparse
@@ -39,6 +39,7 @@ def main() -> None:
     ap.add_argument("--root", required=True)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--large-bytes", type=int, default=50_000_000, help="provisional; files above this go to a later, separate class")
+    ap.add_argument("--exclude-folder", action="append", default=[], help="top-level folder name to leave out (repeatable)")
     ap.add_argument("--pilot-per-type", type=int, default=20, help="provisional; files per type in the proposed pilot")
     a = ap.parse_args()
     root = a.root.rstrip("/") + "/"
@@ -58,6 +59,9 @@ def main() -> None:
             continue                                   # not a document type (media, programs, code: other steps)
         if not path.startswith(root):
             excluded["outside the master root"] += 1
+            continue
+        if path[len(root):].split("/")[0] in a.exclude_folder:
+            excluded["top-level folder excluded by the user"] += 1
             continue
         if VENDOR.search(path):
             excluded["vendor / cache folder"] += 1
@@ -98,7 +102,8 @@ def main() -> None:
         "root": a.root,
         "source": {"keep_csv_sha256": hashlib.sha256(a.keep_csv.read_bytes()).hexdigest(), "hashes_db": a.hashes.name},
         "rules": {"document_types": sorted(TEXT_DOCUMENT | STRUCTURED), "excluded_folders_regex": VENDOR.pattern,
-                  "large_bytes": a.large_bytes, "pilot_per_type": a.pilot_per_type},
+                  "large_bytes": a.large_bytes, "pilot_per_type": a.pilot_per_type,
+                  "excluded_top_folders": a.exclude_folder},
         "excluded_counts": dict(excluded),
         "groups": [{"top": k[0], "class": k[1], **v} for k, v in sorted(groups.items())],
         "pilot": pilot,
