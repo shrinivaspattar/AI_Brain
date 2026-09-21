@@ -837,3 +837,32 @@ def test_embedding_backend_failure_fails_durably_and_never_marks_chunks_embedded
     )
     assert attempt.failure_code == IngestionFailureCode.EMBEDDING_UNAVAILABLE
     assert attempt.retryable is True
+
+
+def test_chunk_insert_failure_fails_that_group_and_does_not_abort_the_run(
+    db: Session, tmp_path, monkeypatch
+) -> None:
+    """A chunk the database refuses (real case: NUL characters from a PDF)
+    must fail only its own group, durably and retryably, and leave the
+    session usable - not raise out of the stage."""
+    instance, workspace = _resolve_one_eligible_document(db, tmp_path)
+    group_id = instance.content_identity_group_id
+    NormalizationService(db).normalize_next(worker_id="worker-a", workspace_root=workspace)
+
+    import app.classification.chunking_service as chunking_module
+
+    monkeypatch.setattr(chunking_module, "chunk_text", lambda text: ["bad\x00chunk"])
+
+    ChunkingService(db).chunk_next(worker_id="worker-a", workspace_root=workspace)
+
+    group = db.get(ContentIdentityGroup, group_id)
+    assert group.pipeline_state == ContentPipelineState.FAILED
+    attempt = (
+        db.query(IngestionAttempt)
+        .filter(IngestionAttempt.content_identity_group_id == group_id)
+        .filter(IngestionAttempt.outcome == IngestionAttemptOutcome.FAILED)
+        .one()
+    )
+    assert attempt.failure_code == IngestionFailureCode.CHUNKING_ERROR
+    assert attempt.retryable is True
+    assert db.query(DocumentChunk).count() == 0

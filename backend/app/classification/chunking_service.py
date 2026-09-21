@@ -121,11 +121,21 @@ class ChunkingService:
                 return
 
             chunks = chunk_text(text)
-            self.db.add_all(
-                DocumentChunk(document_id=document.id, chunk_index=index, content=chunk, embedding=None)
-                for index, chunk in enumerate(chunks)
-            )
-            self.db.commit()
+            try:
+                self.db.add_all(
+                    DocumentChunk(document_id=document.id, chunk_index=index, content=chunk, embedding=None)
+                    for index, chunk in enumerate(chunks)
+                )
+                self.db.commit()
+            except Exception as exc:  # noqa: BLE001 - a bad chunk must fail this group, never abort the whole run
+                self.db.rollback()
+                self._fail(
+                    group,
+                    worker_id=worker_id,
+                    failure_code=IngestionFailureCode.CHUNKING_ERROR,
+                    failure_detail=f"chunk insert failed: {exc}"[:500],
+                )
+                return
 
         self.attempts.record_pipeline_attempt(
             content_identity_group_id=group.id,

@@ -183,3 +183,10 @@ def test_extract_text_handles_xlsx_renamed_with_conflict_suffix(
     workbook.save(str(file_path))
 
     assert "renamed\tstill works" in extract_text(file_path)
+
+
+def test_extract_text_removes_nul_characters(tmp_path: Path) -> None:
+    path = tmp_path / "with_nul.txt"
+    path.write_text("before\x00after\x00", encoding="utf-8")
+
+    assert extract_text(path) == "beforeafter"

@@ -81,6 +81,14 @@ def extract_text(path: Path) -> str:
 
     for extension, extractor in _EXTRACTORS.items():
         if suffix == extension or suffix.startswith(extension + "_"):
-            return extractor(path)
+            return _without_nul(extractor(path))
 
-    return path.read_text(encoding="utf-8")
+    return _without_nul(path.read_text(encoding="utf-8"))
+
+
+def _without_nul(text: str) -> str:
+    """PostgreSQL text columns cannot store the NUL character (0x00), and
+    it carries no meaning in extracted text. Real PDFs and slide decks
+    contain it (found on the first real-data pilot); leaving it in made the
+    chunk insert fail for the whole run."""
+    return text.replace("\x00", "")
