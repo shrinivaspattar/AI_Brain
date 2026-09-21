@@ -60,3 +60,6 @@ documents/
 # Committed batch scripts load their selection from one of these at
 # runtime instead of hardcoding real paths as source-code constants.
 scripts/*_selection.json
+
+# Real-data evaluation output (answers about personal notes)
+knowledge/eval/
