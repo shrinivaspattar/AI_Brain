@@ -198,3 +198,77 @@ def test_get_conversation_messages_returns_not_found() -> None:
 
     finally:
         app.dependency_overrides.clear()
+
+
+# ---- selectable chat model ----
+
+from app.api.chat import resolve_chat_model  # noqa: E402
+from app.core.config import settings  # noqa: E402
+
+
+def test_resolve_chat_model_passes_through_an_allowed_name() -> None:
+    assert resolve_chat_model("qwen3:4b") in settings.available_chat_models()
+    assert resolve_chat_model("qwen3:4b") == "qwen3:4b"
+
+
+def test_resolve_chat_model_falls_back_for_none_or_unknown_names() -> None:
+    assert resolve_chat_model(None) is None
+    assert resolve_chat_model("") is None
+    assert resolve_chat_model("some-model-nobody-configured") is None
+
+
+def test_list_available_models_returns_the_configured_allowlist_and_default() -> None:
+    response = TestClient(app).get("/chat/models")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["default"] == settings.CHAT_MODEL
+    assert settings.CHAT_MODEL in body["models"]
+    assert body["models"] == settings.available_chat_models()
+
+
+def test_send_message_uses_the_requested_model() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class, patch("app.api.chat.ChatClient") as client_class:
+            message = MagicMock()
+            message.id = 2
+            message.conversation_id = "conv-1"
+            message.role = "assistant"
+            message.content = "hi"
+            message.citations = None
+            message.created_at = datetime.now(UTC)
+            service_class.return_value.send_message.return_value = message
+
+            response = TestClient(app).post(
+                "/chat", json={"message": "hi", "model": "qwen3:4b"}
+            )
+
+        assert response.status_code == 200
+        client_class.assert_called_once_with(model="qwen3:4b")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_send_message_ignores_an_unknown_model_name() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class, patch("app.api.chat.ChatClient") as client_class:
+            message = MagicMock()
+            message.id = 2
+            message.conversation_id = "conv-1"
+            message.role = "assistant"
+            message.content = "hi"
+            message.citations = None
+            message.created_at = datetime.now(UTC)
+            service_class.return_value.send_message.return_value = message
+
+            TestClient(app).post("/chat", json={"message": "hi", "model": "not-a-real-model"})
+
+        client_class.assert_called_once_with(model=None)
+    finally:
+        app.dependency_overrides.clear()

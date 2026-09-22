@@ -21,6 +21,11 @@ class Settings(BaseSettings):
 
     OLLAMA_HOST: str = "http://localhost:11434"
     CHAT_MODEL: str = "qwen3:8b"
+    # Models a person can pick per-conversation in the chat UI, in addition
+    # to CHAT_MODEL (always included as the default/first choice even if not
+    # listed here). Comma-separated; each must already be pulled in Ollama -
+    # this list is just an allowlist of names, it does not pull anything.
+    AVAILABLE_CHAT_MODELS: str = "qwen3:8b,qwen3:4b,dolphin-mistral"
     # Qwen3 "thinking" adds hidden reasoning tokens before every reply. On
     # this project's CPU-only dev machine that made a simple tool-call turn
     # take 145 s instead of 6.5 s, so it is off by default. Set
@@ -52,6 +57,17 @@ class Settings(BaseSettings):
 
     def master_backup_paths(self) -> list[Path]:
         return [Path(p.strip()) for p in self.MASTER_BACKUP_PATHS.split(",") if p.strip()]
+
+    def available_chat_models(self) -> list[str]:
+        """CHAT_MODEL first (it is always offered, even if someone edits
+        AVAILABLE_CHAT_MODELS without it), then the rest in the order given,
+        with duplicates dropped."""
+        names = [self.CHAT_MODEL] + [m.strip() for m in self.AVAILABLE_CHAT_MODELS.split(",") if m.strip()]
+        seen: list[str] = []
+        for name in names:
+            if name not in seen:
+                seen.append(name)
+        return seen
 
 
 settings = Settings()

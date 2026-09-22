@@ -85,3 +85,91 @@ def test_thinking_follows_the_setting_when_not_given(monkeypatch) -> None:
     monkeypatch.setattr(settings, "CHAT_THINKING_ENABLED", True)
     with patch("app.services.chat_client.ollama.Client"):
         assert ChatClient().thinking is True
+
+
+# ---- graceful fallback for models that reject `tools` entirely ----
+
+def test_chat_retries_without_tools_when_the_model_does_not_support_them() -> None:
+    with patch("app.services.chat_client.ollama.Client") as client_class:
+        ok_response = MagicMock()
+        ok_response.message.content = "Hi! (no tools)"
+        ok_response.message.tool_calls = None
+        client_class.return_value.chat.side_effect = [
+            RuntimeError("dolphin-mistral does not support tools"),
+            ok_response,
+        ]
+
+        client = ChatClient()
+        tools = [{"type": "function", "function": {"name": "get_time"}}]
+        result = client.chat([{"role": "user", "content": "hi"}], tools=tools)
+
+        assert result is ok_response.message
+        assert client_class.return_value.chat.call_count == 2
+        first_call, second_call = client_class.return_value.chat.call_args_list
+        assert first_call.kwargs["tools"] == tools
+        assert second_call.kwargs["tools"] is None
+
+
+def test_chat_remembers_tools_are_unsupported_for_later_turns_on_the_same_client() -> None:
+    with patch("app.services.chat_client.ollama.Client") as client_class:
+        first_ok = MagicMock()
+        second_ok = MagicMock()
+        client_class.return_value.chat.side_effect = [
+            RuntimeError("model does not support tools"),
+            first_ok,
+            second_ok,
+        ]
+
+        client = ChatClient()
+        tools = [{"type": "function", "function": {"name": "get_time"}}]
+        client.chat([{"role": "user", "content": "hi"}], tools=tools)
+        client.chat([{"role": "user", "content": "again"}], tools=tools)
+
+        assert client_class.return_value.chat.call_count == 3
+        assert client._tools_unsupported is True
+        assert client_class.return_value.chat.call_args_list[-1].kwargs["tools"] is None
+
+
+def test_chat_does_not_swallow_an_unrelated_failure_as_tools_unsupported() -> None:
+    with patch("app.services.chat_client.ollama.Client") as client_class:
+        client_class.return_value.chat.side_effect = ConnectionError("connection refused")
+
+        client = ChatClient()
+
+        with pytest.raises(ChatUnavailableError, match="connection refused"):
+            client.chat([{"role": "user", "content": "hi"}], tools=[{"type": "function"}])
+
+        assert client_class.return_value.chat.call_count == 1
+        assert client._tools_unsupported is False
+
+
+def test_chat_stream_retries_without_tools_when_the_model_does_not_support_them() -> None:
+    with patch("app.services.chat_client.ollama.Client") as client_class:
+        good_chunk = MagicMock()
+        good_chunk.message.content = "Hi"
+
+        def side_effect(*_args, **kwargs):
+            if kwargs.get("tools"):
+                raise RuntimeError("does not support tools")
+            return iter([good_chunk])
+
+        client_class.return_value.chat.side_effect = side_effect
+
+        client = ChatClient()
+        tools = [{"type": "function", "function": {"name": "get_time"}}]
+        pieces = list(client.chat_stream([{"role": "user", "content": "hi"}], tools=tools))
+
+        assert pieces == [good_chunk.message]
+        assert client_class.return_value.chat.call_count == 2
+
+
+def test_chat_stream_does_not_swallow_an_unrelated_failure() -> None:
+    with patch("app.services.chat_client.ollama.Client") as client_class:
+        def side_effect(*_args, **_kwargs):
+            raise ConnectionError("connection refused")
+
+        client_class.return_value.chat.side_effect = side_effect
+        client = ChatClient()
+
+        with pytest.raises(ChatUnavailableError, match="connection refused"):
+            list(client.chat_stream([{"role": "user", "content": "hi"}], tools=[{"type": "function"}]))

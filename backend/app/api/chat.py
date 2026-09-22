@@ -5,18 +5,36 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.embeddings.client import EmbeddingUnavailableError
 from app.models.conversation import Conversation
 from app.models.message import Message
-from app.schemas.chat import ChatRequest, ChatResponse, MessageResponse
-from app.services.chat_client import ChatUnavailableError
+from app.schemas.chat import AvailableModelsResponse, ChatRequest, ChatResponse, MessageResponse
+from app.services.chat_client import ChatClient, ChatUnavailableError
 from app.services.chat_service import ChatService
 
 router = APIRouter(
     prefix="/chat",
     tags=["Chat"],
 )
+
+
+def resolve_chat_model(requested: str | None) -> str | None:
+    """None means "use ChatClient's own default" (settings.CHAT_MODEL) -
+    keeps behaviour unchanged for any caller that never sends `model`.
+    A name outside the configured allowlist is treated the same as not
+    sending one, rather than passing an arbitrary string to Ollama - the
+    allowlist exists so the picker only ever offers models a person chose
+    to expose, not an error path for a mistyped name."""
+    if requested and requested in settings.available_chat_models():
+        return requested
+    return None
+
+
+@router.get("/models", response_model=AvailableModelsResponse)
+def list_available_models() -> AvailableModelsResponse:
+    return AvailableModelsResponse(models=settings.available_chat_models(), default=settings.CHAT_MODEL)
 
 
 @router.post(
@@ -31,7 +49,7 @@ def send_message(
     request: ChatRequest,
     db: Session = Depends(get_db),
 ) -> ChatResponse:
-    service = ChatService(db)
+    service = ChatService(db, chat_client=ChatClient(model=resolve_chat_model(request.model)))
 
     try:
         message = service.send_message(
@@ -74,7 +92,7 @@ def stream_message(
     line): {"type": "token", "text"}, {"type": "reset"}, one final
     {"type": "done", "conversation_id", "message"}, or {"type": "error",
     "detail"} if the turn could not finish."""
-    service = ChatService(db)
+    service = ChatService(db, chat_client=ChatClient(model=resolve_chat_model(request.model)))
 
     def event_lines():
         try:

@@ -74,3 +74,24 @@ def test_stream_reports_an_unknown_conversation_as_an_error_event() -> None:
         app.dependency_overrides.clear()
 
     assert _events(response)[0]["type"] == "error"
+
+
+def test_stream_uses_the_requested_model() -> None:
+    from unittest.mock import patch
+
+    app.dependency_overrides[get_db] = lambda: MagicMock()
+
+    def fake_stream(*_args, **_kwargs):
+        yield {"type": "done", "message": Message(
+            id=2, conversation_id="conv-1", role=MessageRole.ASSISTANT, content="hi",
+            citations=None, created_at=datetime.now(UTC),
+        )}
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class, patch("app.api.chat.ChatClient") as client_class:
+            service_class.return_value.send_message_stream.side_effect = fake_stream
+            TestClient(app).post("/chat/stream", json={"message": "hi", "model": "dolphin-mistral"})
+    finally:
+        app.dependency_overrides.clear()
+
+    client_class.assert_called_once_with(model="dolphin-mistral")

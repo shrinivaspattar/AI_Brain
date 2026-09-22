@@ -24,6 +24,7 @@ function citationLabel(citation) {
 }
 
 const CONVERSATION_ID_KEY = "ai_brain_conversation_id";
+const SELECTED_MODEL_KEY = "ai_brain_selected_model";
 const IMPORT_JOBS_POLL_INTERVAL_MS = 5000;
 const TERMINAL_IMPORT_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
@@ -31,6 +32,7 @@ const messagesEl = document.getElementById("messages");
 const composerEl = document.getElementById("composer");
 const inputEl = document.getElementById("message-input");
 const sendBtn = document.getElementById("send-btn");
+const modelSelectEl = document.getElementById("model-select");
 const newConversationBtn = document.getElementById("new-conversation-btn");
 
 const chatViewEl = document.getElementById("chat-view");
@@ -189,6 +191,35 @@ async function loadConversation(id) {
   }
 }
 
+async function loadAvailableModels() {
+  // Best-effort: if this fails, the dropdown stays empty and every request
+  // just omits `model`, which the backend already treats as "use the
+  // server's default" - chat still works, it just can't be switched.
+  try {
+    const response = await fetch("/chat/models");
+    if (!response.ok) {
+      return;
+    }
+    const body = await response.json();
+    const saved = localStorage.getItem(SELECTED_MODEL_KEY);
+
+    modelSelectEl.innerHTML = "";
+    body.models.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      modelSelectEl.appendChild(option);
+    });
+    modelSelectEl.value = body.models.includes(saved) ? saved : body.default;
+  } catch (err) {
+    // offline/unreachable - leave the dropdown empty, chat still works
+  }
+}
+
+modelSelectEl.addEventListener("change", () => {
+  localStorage.setItem(SELECTED_MODEL_KEY, modelSelectEl.value);
+});
+
 async function sendMessage(text) {
   renderMessage({ role: "user", content: text });
   const pendingBubble = renderPending();
@@ -241,6 +272,7 @@ async function sendMessage(text) {
       body: JSON.stringify({
         message: text,
         conversation_id: conversationId,
+        model: modelSelectEl.value || null,
       }),
     });
 
@@ -1180,3 +1212,5 @@ if (conversationId) {
 } else {
   showEmptyState();
 }
+
+loadAvailableModels();

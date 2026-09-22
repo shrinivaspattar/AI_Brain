@@ -7,6 +7,15 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
     top_k: int = Field(default=5, ge=1, le=20)
+    # A name from GET /chat/models' "models" list. Anything else (unset,
+    # unknown, or not actually pulled in Ollama) falls back to the server's
+    # default model - see resolve_chat_model.
+    model: str | None = None
+
+
+class AvailableModelsResponse(BaseModel):
+    models: list[str]
+    default: str
 
 
 class AncestryStep(BaseModel):
