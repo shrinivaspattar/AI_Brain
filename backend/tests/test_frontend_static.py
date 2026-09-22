@@ -100,3 +100,18 @@ def test_dedup_reviews_route_not_shadowed_by_static_mount() -> None:
 
     finally:
         app.dependency_overrides.clear()
+
+
+def test_vendored_markdown_libraries_are_served_locally() -> None:
+    """No runtime CDN dependency for markdown rendering - both files are
+    committed under frontend/vendor/ and served by the same static mount."""
+    client = TestClient(app)
+
+    marked_response = client.get("/vendor/marked.min.js")
+    purify_response = client.get("/vendor/purify.min.js")
+
+    assert marked_response.status_code == 200
+    assert "javascript" in marked_response.headers["content-type"]
+
+    assert purify_response.status_code == 200
+    assert "javascript" in purify_response.headers["content-type"]

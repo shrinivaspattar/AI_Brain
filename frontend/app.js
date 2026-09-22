@@ -34,6 +34,7 @@ const inputEl = document.getElementById("message-input");
 const sendBtn = document.getElementById("send-btn");
 const modelSelectEl = document.getElementById("model-select");
 const newConversationBtn = document.getElementById("new-conversation-btn");
+const conversationsListEl = document.getElementById("conversations-list");
 
 const chatViewEl = document.getElementById("chat-view");
 const importJobsViewEl = document.getElementById("import-jobs-view");
@@ -100,12 +101,28 @@ function removeEmptyState() {
   if (empty) empty.remove();
 }
 
+function renderMarkdown(text) {
+  // marked/DOMPurify are optional (vendored locally, see index.html) - if
+  // either failed to load for some reason, fall back to plain text rather
+  // than throwing and breaking the whole chat.
+  if (typeof marked === "undefined" || typeof DOMPurify === "undefined") {
+    const escaped = document.createElement("div");
+    escaped.textContent = text;
+    return escaped.innerHTML;
+  }
+  return DOMPurify.sanitize(marked.parse(text));
+}
+
 function renderMessage({ role, content, citations }) {
   removeEmptyState();
 
   const bubble = document.createElement("div");
   bubble.className = `message ${role}`;
-  bubble.textContent = content;
+  if (role === "assistant") {
+    bubble.innerHTML = renderMarkdown(content);
+  } else {
+    bubble.textContent = content;
+  }
 
   if (citations && citations.length > 0) {
     const citationsEl = document.createElement("div");
@@ -154,6 +171,51 @@ function renderError(text) {
 function setComposerBusy(busy) {
   inputEl.disabled = busy;
   sendBtn.disabled = busy;
+}
+
+async function fetchConversations() {
+  // Best-effort, same as loadAvailableModels: the sidebar just stays empty
+  // on failure, chat itself is unaffected.
+  try {
+    const response = await fetch("/chat/conversations");
+    if (!response.ok) {
+      return;
+    }
+    renderConversationsList(await response.json());
+  } catch (err) {
+    // offline/unreachable - leave the sidebar as it is
+  }
+}
+
+function renderConversationsList(conversations) {
+  conversationsListEl.innerHTML = "";
+  if (conversations.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "conversations-empty";
+    empty.textContent = "No conversations yet.";
+    conversationsListEl.appendChild(empty);
+    return;
+  }
+  conversations.forEach((conversation) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "conversation-item";
+    item.classList.toggle("active", conversation.id === conversationId);
+    item.textContent = conversation.title || "Untitled conversation";
+    item.title = conversation.title || "Untitled conversation";
+    item.addEventListener("click", () => selectConversation(conversation.id));
+    conversationsListEl.appendChild(item);
+  });
+}
+
+async function selectConversation(id) {
+  if (id === conversationId) {
+    return;
+  }
+  conversationId = id;
+  localStorage.setItem(CONVERSATION_ID_KEY, conversationId);
+  await loadConversation(id);
+  fetchConversations(); // re-render just to update which item is highlighted
 }
 
 async function loadConversation(id) {
@@ -235,7 +297,7 @@ async function sendMessage(text) {
       pendingBubble.remove();
       streamingBubble = renderMessage({ role: "assistant", content: "" });
     }
-    streamingBubble.textContent = answer;
+    streamingBubble.innerHTML = renderMarkdown(answer);
     scrollToBottom();
   }
 
@@ -262,6 +324,7 @@ async function sendMessage(text) {
         content: event.message.content,
         citations: event.message.citations,
       });
+      fetchConversations();
     }
   }
 
@@ -339,6 +402,7 @@ newConversationBtn.addEventListener("click", () => {
   conversationId = null;
   showEmptyState();
   inputEl.focus();
+  fetchConversations();
 });
 
 // --- Import Jobs view ---------------------------------------------------
@@ -1214,3 +1278,4 @@ if (conversationId) {
 }
 
 loadAvailableModels();
+fetchConversations();

@@ -20,18 +20,23 @@
     </header>
 
     <section id="chat-view">
-      <main id="messages" aria-live="polite"></main>
+      <aside id="conversations-sidebar">
+        <div id="conversations-list" aria-live="polite"></div>
+      </aside>
+      <div id="chat-main">
+        <main id="messages" aria-live="polite"></main>
 
-      <form id="composer">
-        <select id="model-select" title="Chat model"></select>
-        <textarea
-          id="message-input"
-          placeholder="Ask AI_Brain something..."
-          rows="2"
-          autofocus
-        ></textarea>
-        <button id="send-btn" type="submit">Send</button>
-      </form>
+        <form id="composer">
+          <select id="model-select" title="Chat model"></select>
+          <textarea
+            id="message-input"
+            placeholder="Ask AI_Brain something..."
+            rows="2"
+            autofocus
+          ></textarea>
+          <button id="send-btn" type="submit">Send</button>
+        </form>
+      </div>
     </section>
 
     <section id="import-jobs-view" hidden>
@@ -74,6 +79,8 @@
     </section>
   </div>
 
+  <script src="vendor/marked.min.js"></script>
+  <script src="vendor/purify.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
