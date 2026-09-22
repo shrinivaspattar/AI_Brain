@@ -6,11 +6,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.memory.service import MemoryService
+from app.models.chat_attachment import ChatAttachment
 from app.models.conversation import Conversation
 from app.models.memory import Memory, MemoryStatus
 from app.models.message import Message, MessageRole
 from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
+from app.services.chat_attachment_service import ChatAttachmentService
 from app.services.chat_client import ChatClient
 from app.tools.builtin import build_default_registry
 from app.tools.registry import ToolCallResult, ToolRegistry
@@ -29,7 +31,10 @@ SYSTEM_PROMPT = (
     "the context already provided. Keep answers short and direct (a few "
     "sentences or a short list) unless the user asks for detail. If the "
     "context contains the user's own notes on the topic, use them instead "
-    "of saying you have no access to them."
+    "of saying you have no access to them. A 'Files the user attached to "
+    "this message' block, if provided, is a file they just uploaded for "
+    "this one message — treat it as the most direct source for anything "
+    "it's relevant to, separate from the indexed document context above."
 )
 
 MAX_HISTORY_MESSAGES = 20
@@ -61,11 +66,13 @@ class ChatService:
         retrieval_service: RetrievalService | None = None,
         memory_service: MemoryService | None = None,
         tool_registry: ToolRegistry | None = None,
+        attachment_service: ChatAttachmentService | None = None,
     ):
         self.db = db
         self.chat_client = chat_client or ChatClient()
         self.retrieval_service = retrieval_service or RetrievalService(db)
         self.memory_service = memory_service or MemoryService(db)
+        self.attachment_service = attachment_service or ChatAttachmentService(db)
         # None means "use the real, per-turn registry" - see send_message.
         # A caller-supplied registry (tests, mainly) is used as-is and
         # never rebuilt, since it has no conversation-specific behavior
@@ -78,9 +85,10 @@ class ChatService:
         content: str,
         conversation_id: str | None = None,
         top_k: int = 5,
+        attachment_ids: list[str] | None = None,
     ) -> Message:
         conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
-            content, conversation_id, top_k
+            content, conversation_id, top_k, attachment_ids
         )
 
         reply_text, tool_call_ids = self._run_tool_loop(prompt, conversation.id)
@@ -92,6 +100,7 @@ class ChatService:
         content: str,
         conversation_id: str | None = None,
         top_k: int = 5,
+        attachment_ids: list[str] | None = None,
     ):
         """Same turn as `send_message`, but yields events while the reply is
         being written so a reader sees text at once instead of waiting for
@@ -100,7 +109,7 @@ class ChatService:
         call (it is not the final answer), and finally
         {"type": "done", "message": <the saved assistant Message>}."""
         conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
-            content, conversation_id, top_k
+            content, conversation_id, top_k, attachment_ids
         )
 
         reply_text, tool_call_ids = yield from self._run_tool_loop_stream(prompt, conversation.id)
@@ -108,7 +117,13 @@ class ChatService:
         message = self._finish_turn(conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids)
         yield {"type": "done", "message": message}
 
-    def _prepare_turn(self, content: str, conversation_id: str | None, top_k: int):
+    def _prepare_turn(
+        self,
+        content: str,
+        conversation_id: str | None,
+        top_k: int,
+        attachment_ids: list[str] | None = None,
+    ):
         conversation = self._get_or_create_conversation(conversation_id)
 
         user_message = Message(
@@ -143,7 +158,8 @@ class ChatService:
             limit=MAX_MEMORIES,
             status=MemoryStatus.APPROVED,
         )
-        prompt = self._build_prompt(history, retrieved, memories)
+        attachments = self.attachment_service.get_many(attachment_ids or [])
+        prompt = self._build_prompt(history, retrieved, memories, attachments)
 
         return conversation, retrieved, prompt, proposed_memory_ids
 
@@ -483,9 +499,11 @@ class ChatService:
         history: list[Message],
         retrieved: list[RetrievedChunk],
         memories: list[Memory],
+        attachments: list[ChatAttachment] | None = None,
     ) -> list[dict[str, str]]:
         context_block = self._format_context(retrieved)
         memory_block = self._format_memories(memories)
+        attachments_block = self._format_attachments(attachments or [])
 
         system_content = SYSTEM_PROMPT
         if context_block:
@@ -495,6 +513,9 @@ class ChatService:
 
         if memory_block:
             system_content += "\n\nWhat you know about the user:\n" + memory_block
+
+        if attachments_block:
+            system_content += "\n\nFiles the user attached to this message:\n" + attachments_block
 
         messages = [{"role": "system", "content": system_content}]
         messages.extend(
@@ -514,6 +535,14 @@ class ChatService:
     @staticmethod
     def _format_memories(memories: list[Memory]) -> str:
         return "\n".join(f"- {memory.content}" for memory in memories)
+
+    @staticmethod
+    def _format_attachments(attachments: list[ChatAttachment]) -> str:
+        blocks = []
+        for a in attachments:
+            note = " (truncated - this is not the whole file)" if a.truncated else ""
+            blocks.append(f"--- {a.original_filename}{note} ---\n{a.extracted_text}")
+        return "\n\n".join(blocks)
 
     @staticmethod
     def _build_citations(

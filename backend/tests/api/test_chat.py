@@ -65,6 +65,7 @@ def test_send_message_returns_reply_with_citations() -> None:
                 "what is AI_Brain?",
                 conversation_id=None,
                 top_k=5,
+                attachment_ids=[],
             )
 
     finally:
@@ -306,3 +307,100 @@ def test_list_conversations_returns_most_recently_active_first() -> None:
     body = response.json()
     assert [c["id"] for c in body] == ["conv-new", "conv-old"]
     assert body[0]["title"] == "Newer chat"
+
+
+# ---- file/document attachments ----
+
+def test_upload_attachment_returns_extracted_text_summary(tmp_path, monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "CHAT_UPLOADS_DIR", tmp_path)
+    db = MagicMock()
+
+    with patch("app.api.chat.ChatAttachmentService") as service_class:
+        saved = MagicMock()
+        saved.id = "att-1"
+        saved.original_filename = "notes.txt"
+        saved.byte_size = 11
+        saved.extracted_text = "hello world"
+        saved.truncated = False
+        service_class.return_value.save.return_value = saved
+
+        app.dependency_overrides[get_db] = lambda: db
+        try:
+            response = TestClient(app).post(
+                "/chat/attachments",
+                files={"file": ("notes.txt", b"hello world", "text/plain")},
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "id": "att-1",
+        "filename": "notes.txt",
+        "byte_size": 11,
+        "extracted_chars": 11,
+        "truncated": False,
+    }
+
+
+def test_upload_attachment_reports_a_file_too_large_as_422() -> None:
+    from app.services.chat_attachment_service import AttachmentTooLargeError
+
+    app.dependency_overrides[get_db] = lambda: MagicMock()
+    try:
+        with patch("app.api.chat.ChatAttachmentService") as service_class:
+            service_class.return_value.save.side_effect = AttachmentTooLargeError("too big")
+            response = TestClient(app).post(
+                "/chat/attachments",
+                files={"file": ("big.txt", b"x", "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "too big"
+
+
+def test_upload_attachment_reports_unreadable_content_as_422() -> None:
+    from app.services.chat_attachment_service import AttachmentTextExtractionError
+
+    app.dependency_overrides[get_db] = lambda: MagicMock()
+    try:
+        with patch("app.api.chat.ChatAttachmentService") as service_class:
+            service_class.return_value.save.side_effect = AttachmentTextExtractionError("nope")
+            response = TestClient(app).post(
+                "/chat/attachments",
+                files={"file": ("photo.bin", b"\x00\x01", "application/octet-stream")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "nope"
+
+
+def test_send_message_passes_attachment_ids_through() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            message = MagicMock()
+            message.id = 2
+            message.conversation_id = "conv-1"
+            message.role = "assistant"
+            message.content = "hi"
+            message.citations = None
+            message.created_at = datetime.now(UTC)
+            service_class.return_value.send_message.return_value = message
+
+            TestClient(app).post("/chat", json={"message": "hi", "attachment_ids": ["att-1", "att-2"]})
+
+        service_class.return_value.send_message.assert_called_once_with(
+            "hi", conversation_id=None, top_k=5, attachment_ids=["att-1", "att-2"]
+        )
+    finally:
+        app.dependency_overrides.clear()

@@ -1082,3 +1082,81 @@ def test_send_message_touches_conversation_updated_at() -> None:
     service.send_message("hello", conversation_id="conv-1")
 
     assert conversation.updated_at > original_updated_at
+
+
+# ---- chat attachments (files uploaded directly into a turn) ----
+
+def test_send_message_includes_attachment_text_in_the_prompt() -> None:
+    from app.models.chat_attachment import ChatAttachment
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("Based on that file, ...")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+    attachment_service = MagicMock()
+    attachment_service.get_many.return_value = [
+        ChatAttachment(id="att-1", original_filename="report.txt", stored_path="/x", byte_size=3,
+                       extracted_text="quarterly numbers here", truncated=False)
+    ]
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        attachment_service=attachment_service,
+    )
+    service.send_message("what does this say?", attachment_ids=["att-1"])
+
+    attachment_service.get_many.assert_called_once_with(["att-1"])
+    system_content = chat_client.chat.call_args.args[0][0]["content"]
+    assert "Files the user attached to this message:" in system_content
+    assert "report.txt" in system_content
+    assert "quarterly numbers here" in system_content
+
+
+def test_send_message_notes_when_an_attachment_was_truncated() -> None:
+    from app.models.chat_attachment import ChatAttachment
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("ok")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+    attachment_service = MagicMock()
+    attachment_service.get_many.return_value = [
+        ChatAttachment(id="att-1", original_filename="big.txt", stored_path="/x", byte_size=999999,
+                       extracted_text="only the first part", truncated=True)
+    ]
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        attachment_service=attachment_service,
+    )
+    service.send_message("summarize", attachment_ids=["att-1"])
+
+    system_content = chat_client.chat.call_args.args[0][0]["content"]
+    assert "truncated" in system_content.lower()
+
+
+def test_send_message_omits_attachments_block_when_none_given() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    service.send_message("hello")
+
+    system_content = chat_client.chat.call_args.args[0][0]["content"]
+    # the base system prompt always explains what an attachments block would
+    # mean if present; only the block itself (with a real file) is optional
+    assert "Files the user attached to this message:" not in system_content

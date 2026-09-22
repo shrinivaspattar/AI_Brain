@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = ""
     INGESTION_DIR: Path = BASE_DIR / "documents" / "imports"
+    CHAT_UPLOADS_DIR: Path = BASE_DIR / "documents" / "chat_uploads"
     REDIS_URL: str = "redis://localhost:6379"
 
     # Comma-separated absolute paths of the read-only master backup(s) (see
@@ -26,6 +27,12 @@ class Settings(BaseSettings):
     # listed here). Comma-separated; each must already be pulled in Ollama -
     # this list is just an allowlist of names, it does not pull anything.
     AVAILABLE_CHAT_MODELS: str = "qwen3:8b,qwen3:4b,dolphin-mistral"
+
+    # Files dropped directly into a chat turn (not the T7 ingestion pipeline -
+    # see app/models/chat_attachment.py). Provisional caps, not calibrated
+    # against real prompt-budget testing on this hardware.
+    MAX_CHAT_ATTACHMENT_BYTES: int = 20_000_000
+    MAX_CHAT_ATTACHMENT_TEXT_CHARS: int = 20_000
     # Qwen3 "thinking" adds hidden reasoning tokens before every reply. On
     # this project's CPU-only dev machine that made a simple tool-call turn
     # take 145 s instead of 6.5 s, so it is off by default. Set

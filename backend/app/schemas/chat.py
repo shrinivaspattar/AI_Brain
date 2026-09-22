@@ -11,11 +11,24 @@ class ChatRequest(BaseModel):
     # unknown, or not actually pulled in Ollama) falls back to the server's
     # default model - see resolve_chat_model.
     model: str | None = None
+    # Ids from POST /chat/attachments - files uploaded directly into this
+    # chat, pasted into this one turn's prompt. Never persisted as part of
+    # the message itself; unknown/stale ids are silently dropped, see
+    # ChatAttachmentService.get_many.
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class AvailableModelsResponse(BaseModel):
     models: list[str]
     default: str
+
+
+class AttachmentResponse(BaseModel):
+    id: str
+    filename: str
+    byte_size: int
+    extracted_chars: int
+    truncated: bool
 
 
 class ConversationSummary(BaseModel):

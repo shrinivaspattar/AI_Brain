@@ -1,3 +1,4 @@
+from app.models.chat_attachment import ChatAttachment
 from app.models.classification_run import ClassificationRun
 from app.models.content_identity_group import (
     ContentIdentityAlgorithm,
@@ -34,6 +35,7 @@ from app.models.tool_call import ToolCallRecord
 
 __all__ = [
     "CanonicalStatus",
+    "ChatAttachment",
     "ClassificationRun",
     "ContentIdentityAlgorithm",
     "ContentIdentityGroup",

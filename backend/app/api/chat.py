@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,11 +11,17 @@ from app.embeddings.client import EmbeddingUnavailableError
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.schemas.chat import (
+    AttachmentResponse,
     AvailableModelsResponse,
     ChatRequest,
     ChatResponse,
     ConversationSummary,
     MessageResponse,
+)
+from app.services.chat_attachment_service import (
+    AttachmentTextExtractionError,
+    AttachmentTooLargeError,
+    ChatAttachmentService,
 )
 from app.services.chat_client import ChatClient, ChatUnavailableError
 from app.services.chat_service import ChatService
@@ -62,6 +68,7 @@ def send_message(
             request.message,
             conversation_id=request.conversation_id,
             top_k=request.top_k,
+            attachment_ids=request.attachment_ids,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -106,6 +113,7 @@ def stream_message(
                 request.message,
                 conversation_id=request.conversation_id,
                 top_k=request.top_k,
+                attachment_ids=request.attachment_ids,
             ):
                 if event["type"] == "done":
                     message = event["message"]
@@ -132,6 +140,36 @@ def stream_message(
 def _error_event(detail: str) -> str:
     return f"data: {json.dumps({'type': 'error', 'detail': detail}, ensure_ascii=False)}\n\n"
 
+
+@router.post(
+    "/attachments",
+    response_model=AttachmentResponse,
+    responses={422: {"description": "File too large or its text could not be extracted"}},
+)
+def upload_attachment(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> AttachmentResponse:
+    """Attach a file directly to a chat turn - separate from the T7 ingestion
+    pipeline, never embedded/searchable, used only by the message(s) that
+    reference its id via ChatRequest.attachment_ids. Documents/text only for
+    now (reuses the same extractor as ingestion: pdf, docx, pptx, xlsx, plain
+    text); images are not supported yet."""
+    content = file.file.read()
+    try:
+        attachment = ChatAttachmentService(db).save(file.filename or "upload", content)
+    except AttachmentTooLargeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except AttachmentTextExtractionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return AttachmentResponse(
+        id=attachment.id,
+        filename=attachment.original_filename,
+        byte_size=attachment.byte_size,
+        extracted_chars=len(attachment.extracted_text or ""),
+        truncated=attachment.truncated,
+    )
 
 @router.get("/conversations", response_model=list[ConversationSummary])
 def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummary]:
