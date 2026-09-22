@@ -342,6 +342,63 @@ body {
   cursor: default;
 }
 
+#attach-btn {
+  align-self: flex-end;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 1.1rem;
+  padding: 0.5rem 0.7rem;
+  cursor: pointer;
+}
+
+#attach-btn:hover {
+  background: var(--panel);
+}
+
+#attach-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#pending-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0 1.25rem;
+}
+
+#pending-attachments:empty {
+  display: none;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.attachment-chip.error {
+  border-color: var(--error-text);
+  color: var(--error-text);
+}
+
+.attachment-chip button {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0;
+}
+
 #import-jobs-view {
   padding: 1.25rem;
   overflow-y: auto;

@@ -35,6 +35,9 @@ const sendBtn = document.getElementById("send-btn");
 const modelSelectEl = document.getElementById("model-select");
 const newConversationBtn = document.getElementById("new-conversation-btn");
 const conversationsListEl = document.getElementById("conversations-list");
+const attachmentInputEl = document.getElementById("attachment-input");
+const attachBtn = document.getElementById("attach-btn");
+const pendingAttachmentsEl = document.getElementById("pending-attachments");
 
 const chatViewEl = document.getElementById("chat-view");
 const importJobsViewEl = document.getElementById("import-jobs-view");
@@ -172,6 +175,70 @@ function setComposerBusy(busy) {
   inputEl.disabled = busy;
   sendBtn.disabled = busy;
 }
+
+// Files attached directly to the NEXT message only (see docs: chat
+// attachments are one-shot, never implicitly reused by a later message).
+// Each entry: {id, filename} once uploaded, or {error, filename} if the
+// upload/extraction failed - an error entry is shown but never sent.
+let pendingAttachments = [];
+
+function renderPendingAttachments() {
+  pendingAttachmentsEl.innerHTML = "";
+  pendingAttachments.forEach((attachment, index) => {
+    const chip = document.createElement("span");
+    chip.className = attachment.error ? "attachment-chip error" : "attachment-chip";
+
+    const label = document.createElement("span");
+    label.textContent = attachment.error
+      ? `${attachment.filename}: ${attachment.error}`
+      : attachment.filename;
+    chip.appendChild(label);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.title = "Remove";
+    remove.addEventListener("click", () => {
+      pendingAttachments.splice(index, 1);
+      renderPendingAttachments();
+    });
+    chip.appendChild(remove);
+
+    pendingAttachmentsEl.appendChild(chip);
+  });
+}
+
+async function uploadAttachment(file) {
+  attachBtn.disabled = true;
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    const response = await fetch("/chat/attachments", { method: "POST", body: formData });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = body && body.detail ? body.detail : `HTTP ${response.status}`;
+      pendingAttachments.push({ filename: file.name, error: detail });
+    } else {
+      pendingAttachments.push({ id: body.id, filename: body.filename });
+    }
+  } catch (err) {
+    pendingAttachments.push({ filename: file.name, error: err.message });
+  } finally {
+    attachBtn.disabled = false;
+    renderPendingAttachments();
+  }
+}
+
+attachBtn.addEventListener("click", () => attachmentInputEl.click());
+
+attachmentInputEl.addEventListener("change", () => {
+  const file = attachmentInputEl.files[0];
+  attachmentInputEl.value = ""; // allow re-selecting the same file later
+  if (file) {
+    uploadAttachment(file);
+  }
+});
 
 async function fetchConversations() {
   // Best-effort, same as loadAvailableModels: the sidebar just stays empty
@@ -325,6 +392,8 @@ async function sendMessage(text) {
         citations: event.message.citations,
       });
       fetchConversations();
+      pendingAttachments = [];
+      renderPendingAttachments();
     }
   }
 
@@ -336,6 +405,7 @@ async function sendMessage(text) {
         message: text,
         conversation_id: conversationId,
         model: modelSelectEl.value || null,
+        attachment_ids: pendingAttachments.filter((a) => !a.error).map((a) => a.id),
       }),
     });
 

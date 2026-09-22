@@ -26,8 +26,12 @@
       <div id="chat-main">
         <main id="messages" aria-live="polite"></main>
 
+        <div id="pending-attachments" aria-live="polite"></div>
+
         <form id="composer">
           <select id="model-select" title="Chat model"></select>
+          <input id="attachment-input" type="file" hidden />
+          <button id="attach-btn" type="button" title="Attach a file to this message">📎</button>
           <textarea
             id="message-input"
             placeholder="Ask AI_Brain something..."
