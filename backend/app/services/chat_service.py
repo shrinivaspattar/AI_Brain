@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -127,6 +128,8 @@ class ChatService:
                 on_memory_proposed=proposed_memory_ids.append,
             )
 
+        self._ensure_title(conversation, content)
+
         history = self._load_history(conversation.id)
         retrieved = self._relevant_only(
             self.retrieval_service.search(
@@ -175,6 +178,10 @@ class ChatService:
 
         if proposed_memory_ids:
             self._link_memories_to_message(proposed_memory_ids, assistant_message.id)
+
+        conversation.updated_at = datetime.now(UTC)
+        self.db.add(conversation)
+        self.db.commit()
 
         return assistant_message
 
@@ -450,6 +457,16 @@ class ChatService:
             path = (first.member_path or first.root_t7_path).replace("\\", "/")
             return path.rsplit("/", 1)[-1]
         return result.document.title
+
+    @staticmethod
+    def _ensure_title(conversation: Conversation, first_message: str) -> None:
+        """A brand-new conversation has no title yet; derive one from the
+        message that started it; a conversation that already has one is
+        left alone (never overwritten by a later message)."""
+        if conversation.title is not None:
+            return
+        cleaned = " ".join(first_message.split())
+        conversation.title = cleaned[:60] + ("…" if len(cleaned) > 60 else "")
 
     def _load_history(self, conversation_id: str) -> list[Message]:
         statement = (

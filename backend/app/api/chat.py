@@ -10,7 +10,13 @@ from app.db.session import get_db
 from app.embeddings.client import EmbeddingUnavailableError
 from app.models.conversation import Conversation
 from app.models.message import Message
-from app.schemas.chat import AvailableModelsResponse, ChatRequest, ChatResponse, MessageResponse
+from app.schemas.chat import (
+    AvailableModelsResponse,
+    ChatRequest,
+    ChatResponse,
+    ConversationSummary,
+    MessageResponse,
+)
 from app.services.chat_client import ChatClient, ChatUnavailableError
 from app.services.chat_service import ChatService
 
@@ -125,6 +131,15 @@ def stream_message(
 
 def _error_event(detail: str) -> str:
     return f"data: {json.dumps({'type': 'error', 'detail': detail}, ensure_ascii=False)}\n\n"
+
+
+@router.get("/conversations", response_model=list[ConversationSummary])
+def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummary]:
+    """Most recently active first - `updated_at` is touched by ChatService on
+    every completed turn, not just at creation, so this reflects real activity."""
+    statement = select(Conversation).order_by(Conversation.updated_at.desc())
+    conversations = list(db.scalars(statement))
+    return [ConversationSummary.model_validate(c) for c in conversations]
 
 
 @router.get(

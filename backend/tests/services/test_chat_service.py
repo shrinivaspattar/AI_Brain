@@ -138,13 +138,15 @@ def test_send_message_uses_existing_conversation() -> None:
     result = service.send_message("hello", conversation_id="conv-1")
 
     assert result.conversation_id == "conv-1"
-    # get_or_create should not have created a *new* Conversation
+    # get_or_create should not have created a *new*, different Conversation -
+    # the existing one is legitimately re-added later, to persist the
+    # updated_at touch on activity (see test_send_message_touches_conversation_updated_at).
     added_conversations = [
         call.args[0]
         for call in db.add.call_args_list
         if isinstance(call.args[0], Conversation)
     ]
-    assert added_conversations == []
+    assert all(c is conversation for c in added_conversations)
 
 
 def test_send_message_includes_citations_and_context_in_prompt() -> None:
@@ -1007,3 +1009,76 @@ def test_send_message_stream_runs_a_tool_call_then_streams_the_final_reply() -> 
     assert events[-1]["message"].content == "It is noon."
     assert chat_client.chat_stream.call_count == 2
     registry.call.assert_called_once()
+
+
+# ---- conversation title derivation and activity timestamp ----
+
+def test_send_message_derives_a_title_from_the_first_message() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi there")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    service.send_message("  What does my Bangalore to Germany roadmap say?  ")
+
+    conversations = [c for c in db.add.call_args_list if isinstance(c.args[0], Conversation)]
+    assert conversations[0].args[0].title == "What does my Bangalore to Germany roadmap say?"
+
+
+def test_send_message_truncates_a_long_first_message_for_the_title() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("ok")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    long_message = "x" * 100
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    service.send_message(long_message)
+
+    conversations = [c for c in db.add.call_args_list if isinstance(c.args[0], Conversation)]
+    title = conversations[0].args[0].title
+    assert title == "x" * 60 + "…"
+
+
+def test_send_message_never_overwrites_an_existing_title() -> None:
+    db = MagicMock()
+    conversation = Conversation(id="conv-1", title="Existing title")
+    db.get.return_value = conversation
+    db.scalars.return_value = []
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("reply")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    service.send_message("a completely different message", conversation_id="conv-1")
+
+    assert conversation.title == "Existing title"
+
+
+def test_send_message_touches_conversation_updated_at() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db = MagicMock()
+    original_updated_at = datetime.now(UTC) - timedelta(hours=1)
+    conversation = Conversation(id="conv-1", title="t", updated_at=original_updated_at)
+    db.get.return_value = conversation
+    db.scalars.return_value = []
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("reply")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    service.send_message("hello", conversation_id="conv-1")
+
+    assert conversation.updated_at > original_updated_at

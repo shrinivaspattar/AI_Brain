@@ -272,3 +272,37 @@ def test_send_message_ignores_an_unknown_model_name() -> None:
         client_class.assert_called_once_with(model=None)
     finally:
         app.dependency_overrides.clear()
+
+
+# ---- conversation list (sidebar) ----
+
+def test_list_conversations_returns_most_recently_active_first() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.session import get_db as real_get_db  # noqa: F401  (imported for clarity only)
+    from app.models.conversation import Conversation
+
+    older = Conversation(
+        id="conv-old", title="Older chat",
+        created_at=datetime.now(UTC) - timedelta(hours=2),
+        updated_at=datetime.now(UTC) - timedelta(hours=2),
+    )
+    newer = Conversation(
+        id="conv-new", title="Newer chat",
+        created_at=datetime.now(UTC) - timedelta(hours=1),
+        updated_at=datetime.now(UTC),
+    )
+
+    db = MagicMock()
+    db.scalars.return_value = [newer, older]  # already the order a real ORDER BY desc would give
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        response = TestClient(app).get("/chat/conversations")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [c["id"] for c in body] == ["conv-new", "conv-old"]
+    assert body[0]["title"] == "Newer chat"
