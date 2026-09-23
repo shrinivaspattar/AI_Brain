@@ -1245,6 +1245,73 @@ def test_send_message_skips_web_search_when_not_requested(monkeypatch) -> None:
     web_search_service.search.assert_not_called()
 
 
+def test_send_message_persists_context_sources_for_documents_only() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("According to [1], ...")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = [_retrieved_chunk()]
+
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    message = service.send_message("what is AI_Brain?")
+
+    assert message.context_sources == ["documents"]
+
+
+def test_send_message_persists_context_sources_for_all_active_types(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.models.chat_attachment import ChatAttachment
+    from app.services.web_search_service import WebSearchResult
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", True)
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("ok")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = [_retrieved_chunk()]
+    memory_service = MagicMock()
+    memory_service.list_memories.return_value = [Memory(id=1, content="likes cats", status=MemoryStatus.APPROVED)]
+    attachment_service = MagicMock()
+    attachment_service.get_many.return_value = [
+        ChatAttachment(id="att-1", original_filename="a.txt", stored_path="/x", byte_size=1,
+                       extracted_text="x", truncated=False)
+    ]
+    web_search_service = MagicMock()
+    web_search_service.search.return_value = [WebSearchResult(title="t", url="u", snippet="s")]
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        memory_service=memory_service, attachment_service=attachment_service,
+        web_search_service=web_search_service,
+    )
+    message = service.send_message("hi", attachment_ids=["att-1"], web_search=True)
+
+    assert message.context_sources == ["documents", "memory", "attachment", "web"]
+
+
+def test_send_message_persists_empty_context_sources_for_plain_greeting() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("Hello!")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+
+    service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
+    message = service.send_message("hi")
+
+    assert message.context_sources == []
+
+
 def test_send_message_tells_model_when_web_search_fails(monkeypatch) -> None:
     from app.core.config import settings
     from app.services.web_search_service import WebSearchUnavailableError

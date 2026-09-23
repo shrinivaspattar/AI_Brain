@@ -95,6 +95,10 @@ class MessageResponse(BaseModel):
     role: str
     content: str
     citations: list[Citation] | None
+    # Which context sources fed this reply ("documents", "memory",
+    # "attachment", "web"), for the UI's privacy/context indicator. None
+    # for a USER message or a reply saved before this field existed.
+    context_sources: list[str] | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

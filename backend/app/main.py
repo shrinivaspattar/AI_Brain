@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from app.api.activity import router as activity_router
 from app.api.chat import router as chat_router
 from app.api.database import router as database_router
 from app.api.dedup import router as dedup_router
@@ -37,6 +38,7 @@ app.include_router(dedup_reviews_router)
 app.include_router(dedup_execution_plans_router)
 app.include_router(dedup_plan_authorizations_router)
 app.include_router(dedup_executions_router)
+app.include_router(activity_router)
 
 # Mounted last so it never shadows an API route above: Starlette checks
 # routes in registration order, and a Mount at "/" only gets a chance to

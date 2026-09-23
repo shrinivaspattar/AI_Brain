@@ -29,6 +29,7 @@ def test_send_message_returns_reply_with_citations() -> None:
                     "document_source": "/documents/notes.txt",
                 }
             ]
+            message.context_sources = ["documents"]
             message.created_at = datetime(2026, 8, 12, 10, 0, tzinfo=UTC)
 
             service_class.return_value.send_message.return_value = message
@@ -57,6 +58,7 @@ def test_send_message_returns_reply_with_citations() -> None:
                             "source_occurrences": None,
                         }
                     ],
+                    "context_sources": ["documents"],
                     "created_at": "2026-08-12T10:00:00Z",
                 },
             }
@@ -161,6 +163,7 @@ def test_get_conversation_messages_returns_history() -> None:
         message.role = "user"
         message.content = "hello"
         message.citations = None
+        message.context_sources = None
         message.created_at = datetime(2026, 8, 12, 10, 0, tzinfo=UTC)
 
         db.scalars.return_value = [message]
@@ -177,6 +180,7 @@ def test_get_conversation_messages_returns_history() -> None:
                 "role": "user",
                 "content": "hello",
                 "citations": None,
+                "context_sources": None,
                 "created_at": "2026-08-12T10:00:00Z",
             }
         ]

@@ -15,6 +15,7 @@
         <button id="nav-import-jobs-btn" class="nav-btn" type="button" aria-pressed="false">Import Jobs</button>
         <button id="nav-memory-btn" class="nav-btn" type="button" aria-pressed="false">Memory Review</button>
         <button id="nav-dedup-review-btn" class="nav-btn" type="button" aria-pressed="false">Dedup Review</button>
+        <button id="nav-activity-btn" class="nav-btn" type="button" aria-pressed="false">Recent Activity</button>
       </nav>
       <button id="new-conversation-btn" type="button" title="Start a new conversation">New conversation</button>
     </header>
@@ -82,6 +83,26 @@
         <span id="dedup-review-status-line"></span>
       </div>
       <div id="dedup-review-list" aria-live="polite"></div>
+    </section>
+
+    <section id="activity-view" hidden>
+      <div id="activity-toolbar">
+        <button id="refresh-activity-btn" type="button">Refresh</button>
+      </div>
+      <div id="activity-content">
+        <div class="activity-section">
+          <h2>Recent conversations</h2>
+          <ul id="activity-conversations" class="activity-list"></ul>
+        </div>
+        <div class="activity-section">
+          <h2>Recent uploads</h2>
+          <ul id="activity-attachments" class="activity-list"></ul>
+        </div>
+        <div class="activity-section">
+          <h2>Recent ingestion</h2>
+          <ul id="activity-batches" class="activity-list"></ul>
+        </div>
+      </div>
     </section>
   </div>
 

@@ -65,6 +65,13 @@ const dedupReviewFilterTabs = document.querySelectorAll(
   "#dedup-review-filter-tabs .filter-tab"
 );
 
+const activityViewEl = document.getElementById("activity-view");
+const navActivityBtn = document.getElementById("nav-activity-btn");
+const refreshActivityBtn = document.getElementById("refresh-activity-btn");
+const activityConversationsEl = document.getElementById("activity-conversations");
+const activityAttachmentsEl = document.getElementById("activity-attachments");
+const activityBatchesEl = document.getElementById("activity-batches");
+
 const MEMORY_EMPTY_MESSAGES = {
   pending: "No pending memories to review.",
   approved: "No approved memories yet.",
@@ -161,7 +168,21 @@ function renderSpeakButton(text) {
   return button;
 }
 
-function renderMessage({ role, content, citations }) {
+const CONTEXT_SOURCE_LABELS = {
+  documents: "Local docs",
+  memory: "Memory",
+  attachment: "Attachment",
+  web: "Web",
+};
+
+function renderContextIndicator(contextSources) {
+  const el = document.createElement("div");
+  el.className = "context-indicator";
+  el.textContent = contextSources.map((source) => CONTEXT_SOURCE_LABELS[source] || source).join(" · ");
+  return el;
+}
+
+function renderMessage({ role, content, citations, contextSources }) {
   removeEmptyState();
 
   const bubble = document.createElement("div");
@@ -170,6 +191,9 @@ function renderMessage({ role, content, citations }) {
     bubble.innerHTML = renderMarkdown(content);
     if (voiceEnabled && content) {
       bubble.appendChild(renderSpeakButton(content));
+    }
+    if (contextSources && contextSources.length > 0) {
+      bubble.appendChild(renderContextIndicator(contextSources));
     }
   } else {
     bubble.textContent = content;
@@ -361,6 +385,7 @@ async function loadConversation(id) {
         role: message.role,
         content: message.content,
         citations: message.citations,
+        contextSources: message.context_sources,
       });
     });
   } catch (err) {
@@ -523,6 +548,7 @@ async function sendMessage(text) {
         role: event.message.role,
         content: event.message.content,
         citations: event.message.citations,
+        contextSources: event.message.context_sources,
       });
       fetchConversations();
       pendingAttachments = [];
@@ -752,6 +778,7 @@ const VIEWS = {
   importJobs: { section: importJobsViewEl, navBtn: navImportJobsBtn },
   memory: { section: memoryViewEl, navBtn: navMemoryBtn },
   dedupReview: { section: dedupReviewViewEl, navBtn: navDedupReviewBtn },
+  activity: { section: activityViewEl, navBtn: navActivityBtn },
 };
 
 function showView(name) {
@@ -785,11 +812,18 @@ function showDedupReviewView() {
   fetchDedupReviews(currentDedupReviewFilter);
 }
 
+function showActivityView() {
+  showView("activity");
+  fetchRecentActivity();
+}
+
 navChatBtn.addEventListener("click", showChatView);
 navImportJobsBtn.addEventListener("click", showImportJobsView);
 navMemoryBtn.addEventListener("click", showMemoryView);
 navDedupReviewBtn.addEventListener("click", showDedupReviewView);
+navActivityBtn.addEventListener("click", showActivityView);
 refreshImportJobsBtn.addEventListener("click", fetchImportJobs);
+refreshActivityBtn.addEventListener("click", fetchRecentActivity);
 
 // --- Memory Review view --------------------------------------------------
 // Human review queue for candidate memories (Memory.status == "pending"),
@@ -1472,6 +1506,71 @@ dedupReviewFilterTabs.forEach((tab) => {
 refreshDedupReviewBtn.addEventListener("click", () =>
   fetchDedupReviews(currentDedupReviewFilter)
 );
+
+// --- Recent Activity view -------------------------------------------------
+// Plain recency lists over GET /activity/recent - no LLM summaries, no new
+// knowledge architecture, deliberately kept as maintenance/UI polish only.
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function renderActivityList(el, items, emptyMessage, formatItem) {
+  el.innerHTML = "";
+  if (items.length === 0) {
+    const li = document.createElement("li");
+    li.className = "activity-empty";
+    li.textContent = emptyMessage;
+    el.appendChild(li);
+    return;
+  }
+  items.forEach((item) => {
+    const li = document.createElement("li");
+    li.textContent = formatItem(item);
+    el.appendChild(li);
+  });
+}
+
+async function fetchRecentActivity() {
+  try {
+    const response = await fetch("/activity/recent");
+    if (!response.ok) {
+      throw new Error(`Unexpected status ${response.status}`);
+    }
+    const body = await response.json();
+
+    renderActivityList(
+      activityConversationsEl,
+      body.recent_conversations,
+      "No conversations yet.",
+      (c) => `${c.title || "Untitled conversation"} — ${formatTimestamp(c.updated_at)}`
+    );
+    renderActivityList(
+      activityAttachmentsEl,
+      body.recent_attachments,
+      "No uploads yet.",
+      (a) => `${a.filename} (${formatBytes(a.byte_size)}) — ${formatTimestamp(a.created_at)}`
+    );
+    renderActivityList(
+      activityBatchesEl,
+      body.recent_ingestion_batches,
+      "No ingestion activity yet.",
+      (b) => `Batch #${b.id} — ${b.status} (${b.source_instances_selected} files) — ${formatTimestamp(b.created_at)}`
+    );
+  } catch (err) {
+    renderActivityList(activityConversationsEl, [], `Could not load recent activity: ${err.message}`, () => "");
+    activityAttachmentsEl.innerHTML = "";
+    activityBatchesEl.innerHTML = "";
+  }
+}
 
 showChatView();
 

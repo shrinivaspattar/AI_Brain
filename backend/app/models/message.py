@@ -51,6 +51,17 @@ class Message(Base):
         nullable=True,
     )
 
+    # Which already-computed context sources fed this reply, for the UI's
+    # privacy/context indicator - a subset of "documents", "memory",
+    # "attachment", "web". Pure surfacing of what ChatService already
+    # decided to include, not a new retrieval/memory concept. Null for a
+    # USER message or any ASSISTANT message saved before this field
+    # existed - the UI just shows nothing for those, rather than guessing.
+    context_sources: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

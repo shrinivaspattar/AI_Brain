@@ -95,13 +95,15 @@ class ChatService:
         attachment_ids: list[str] | None = None,
         web_search: bool = False,
     ) -> Message:
-        conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
+        conversation, retrieved, prompt, proposed_memory_ids, context_sources = self._prepare_turn(
             content, conversation_id, top_k, attachment_ids, web_search
         )
 
         reply_text, tool_call_ids = self._run_tool_loop(prompt, conversation.id)
 
-        return self._finish_turn(conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids)
+        return self._finish_turn(
+            conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids, context_sources
+        )
 
     def send_message_stream(
         self,
@@ -117,13 +119,15 @@ class ChatService:
         {"type": "reset"} if text shown so far turns out to precede a tool
         call (it is not the final answer), and finally
         {"type": "done", "message": <the saved assistant Message>}."""
-        conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
+        conversation, retrieved, prompt, proposed_memory_ids, context_sources = self._prepare_turn(
             content, conversation_id, top_k, attachment_ids, web_search
         )
 
         reply_text, tool_call_ids = yield from self._run_tool_loop_stream(prompt, conversation.id)
 
-        message = self._finish_turn(conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids)
+        message = self._finish_turn(
+            conversation, reply_text, retrieved, tool_call_ids, proposed_memory_ids, context_sources
+        )
         yield {"type": "done", "message": message}
 
     def _prepare_turn(
@@ -172,7 +176,9 @@ class ChatService:
         web_results, web_search_error = self._maybe_web_search(content, web_search)
         prompt = self._build_prompt(history, retrieved, memories, attachments, web_results, web_search_error)
 
-        return conversation, retrieved, prompt, proposed_memory_ids
+        context_sources = self._context_sources(retrieved, memories, attachments, web_results)
+
+        return conversation, retrieved, prompt, proposed_memory_ids, context_sources
 
     def _finish_turn(
         self,
@@ -181,6 +187,7 @@ class ChatService:
         retrieved: list[RetrievedChunk],
         tool_call_ids: list[int],
         proposed_memory_ids: list[int],
+        context_sources: list[str] | None = None,
     ) -> Message:
         citations = self._build_citations(retrieved)
 
@@ -189,6 +196,7 @@ class ChatService:
             role=MessageRole.ASSISTANT,
             content=reply_text,
             citations=citations,
+            context_sources=context_sources,
         )
 
         try:
@@ -462,6 +470,28 @@ class ChatService:
                 return f"{message.content} {content}"
 
         return content
+
+    @staticmethod
+    def _context_sources(
+        retrieved: list[RetrievedChunk],
+        memories: list[Memory],
+        attachments: list[ChatAttachment],
+        web_results: list[WebSearchResult],
+    ) -> list[str]:
+        """Which already-computed context types fed this reply - pure
+        surfacing for the UI's privacy/context indicator, not a new
+        concept. Order is fixed (documents, memory, attachment, web) so
+        the UI doesn't need to sort it."""
+        sources = []
+        if retrieved:
+            sources.append("documents")
+        if memories:
+            sources.append("memory")
+        if attachments:
+            sources.append("attachment")
+        if web_results:
+            sources.append("web")
+        return sources
 
     def _maybe_web_search(
         self, content: str, web_search: bool
