@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import docx
 import openpyxl
 import pptx
 import pypdf
+import yaml
 
 
 def _extract_pdf(path: Path) -> str:
@@ -55,6 +57,90 @@ def _extract_xlsx(path: Path) -> str:
             workbook.close()
 
 
+# Obsidian's standard note header: a YAML mapping between two `---` lines
+# at the very start of the file. Common in web-clipper exports especially
+# (title/source/author/published/created/tags) - confirmed against this
+# project's own ingested corpus before building this (see the 2026-09-23
+# session note), not assumed.
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?\r?\n)---\r?\n?", re.DOTALL)
+
+# Obsidian's link syntax: [[Note]], [[Note|Display text]], and the embed
+# form ![[target]] (another note, an image, etc.). `[[` is otherwise rare
+# in real prose, but numeric/array-like content (e.g. "[[1, 2], [3, 4]]")
+# can coincidentally match double-bracket syntax - harmless here since the
+# regex just reformats whatever is inside without checking it is a real
+# note name.
+_WIKILINK_RE = re.compile(r"(!?)\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+
+def _split_frontmatter(text: str) -> tuple[dict | None, str]:
+    """Splits a leading YAML frontmatter block from the rest of the text.
+    Returns (fields, body); fields is None (and text returned unchanged)
+    when there is no frontmatter block, it isn't valid YAML, or it isn't a
+    mapping - a malformed or unusual header must never break ingestion of
+    the file's actual content."""
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return None, text
+    try:
+        fields = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None, text
+    if not isinstance(fields, dict):
+        return None, text
+    return fields, text[match.end():]
+
+
+def _format_frontmatter_value(value: object) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def _format_frontmatter_header(fields: dict) -> str:
+    """Every present, non-empty field as a plain 'Label: value' line, in
+    the order it appears in the note - whatever fields a person's own
+    frontmatter happens to have (title, date, status, tags, ...), not a
+    curated subset. Formatting only, no schema imposed."""
+    lines = [
+        f"{str(key).replace('_', ' ').strip().capitalize()}: {_format_frontmatter_value(value)}"
+        for key, value in fields.items()
+        if value not in (None, "", [], {})
+    ]
+    return "\n".join(lines)
+
+
+def _clean_wikilinks(text: str) -> str:
+    """Rewrites [[Note]]/[[Note|Display]] to the plain text a reader would
+    actually see rendered (the display text if given, else the note name),
+    and drops ![[embed]] entirely - an embedded image/note's target name
+    alone isn't meaningful content to chunk."""
+
+    def replace(match: re.Match) -> str:
+        is_embed, target, display = match.group(1), match.group(2), match.group(3)
+        if is_embed:
+            return ""
+        return (display or target).strip()
+
+    return _WIKILINK_RE.sub(replace, text)
+
+
+def _clean_obsidian_markdown(text: str) -> str:
+    """Obsidian-aware cleanup for a .md file's extracted text: frontmatter
+    reformatted as a short readable header (instead of chunked as raw
+    YAML), and [[wikilinks]]/![[embeds]] rewritten to plain text (instead
+    of chunked as literal bracket syntax). Everything else is left as-is -
+    this is text cleanup, not link resolution or a knowledge graph."""
+    fields, body = _split_frontmatter(text)
+    body = _clean_wikilinks(body)
+
+    if fields:
+        header = _format_frontmatter_header(fields)
+        if header:
+            return f"{header}\n\n{body.strip()}"
+
+    return body
+
+
 _EXTRACTORS = {
     ".pdf": _extract_pdf,
     ".docx": _extract_docx,
@@ -83,7 +169,12 @@ def extract_text(path: Path) -> str:
         if suffix == extension or suffix.startswith(extension + "_"):
             return _without_nul(extractor(path))
 
-    return _without_nul(_read_text_file(path))
+    text = _read_text_file(path)
+
+    if suffix == ".md" or suffix.startswith(".md_"):
+        text = _clean_obsidian_markdown(text)
+
+    return _without_nul(text)
 
 
 def _read_text_file(path: Path) -> str:
