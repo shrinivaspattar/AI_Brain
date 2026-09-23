@@ -28,6 +28,9 @@ class AvailableModelsResponse(BaseModel):
     # search toggle entirely when this is false, rather than showing a
     # control that would silently do nothing.
     web_search_enabled: bool = False
+    # Whether the server has VOICE_ENABLED=true - the UI hides its mic
+    # button entirely when this is false.
+    voice_enabled: bool = False
 
 
 class AttachmentResponse(BaseModel):
@@ -36,6 +39,14 @@ class AttachmentResponse(BaseModel):
     byte_size: int
     extracted_chars: int
     truncated: bool
+
+
+class TranscriptionResponse(BaseModel):
+    text: str
+
+
+class SpeakRequest(BaseModel):
+    text: str
 
 
 class ConversationSummary(BaseModel):

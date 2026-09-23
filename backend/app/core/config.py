@@ -67,6 +67,25 @@ class Settings(BaseSettings):
     SEARXNG_URL: str = "http://localhost:8080"
     WEB_SEARCH_MAX_RESULTS: int = 5
 
+    # Voice input (speech-to-text via faster-whisper). Fully local/offline -
+    # unlike web search, no external switch is needed for privacy, but it
+    # stays opt-in like every other optional capability here: a new
+    # dependency and a ~30-40s one-time model load per process shouldn't
+    # happen unless someone asks for it. "base" is a plain default, not
+    # benchmarked against "small"/"tiny" on this hardware.
+    VOICE_ENABLED: bool = False
+    STT_MODEL_SIZE: str = "base"
+
+    # Voice output (text-to-speech via Kokoro-onnx), gated by the same
+    # VOICE_ENABLED switch as speech-to-text - both are the one "voice
+    # input/output" roadmap item. Model files (~340MB) are not committed
+    # (see documents/ in .gitignore) - download kokoro-v1.0.onnx and
+    # voices-v1.0.bin from https://github.com/thewh1teagle/kokoro-onnx/releases
+    # into TTS_MODEL_PATH's/TTS_VOICES_PATH's directory before enabling.
+    TTS_MODEL_PATH: Path = BASE_DIR / "documents" / "tts_models" / "kokoro-v1.0.onnx"
+    TTS_VOICES_PATH: Path = BASE_DIR / "documents" / "tts_models" / "voices-v1.0.bin"
+    TTS_VOICE: str = "af_heart"
+
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         case_sensitive=True,

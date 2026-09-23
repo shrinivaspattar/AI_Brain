@@ -198,6 +198,27 @@ body {
   white-space: pre-wrap; /* plain text - preserve the line breaks the user typed */
 }
 
+.speak-btn {
+  display: block;
+  margin-top: 0.5rem;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.85rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+
+.speak-btn:hover {
+  background: var(--panel);
+}
+
+.speak-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* .message.assistant renders sanitized markdown as real HTML (see
    renderMarkdown in app.js) - these elements handle their own spacing,
    so no white-space override is needed here. */
@@ -382,6 +403,38 @@ body {
   background: var(--accent);
   color: var(--accent-text);
   border-color: var(--accent);
+}
+
+#mic-btn {
+  align-self: flex-end;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 1.1rem;
+  padding: 0.5rem 0.7rem;
+  cursor: pointer;
+}
+
+#mic-btn:hover {
+  background: var(--panel);
+}
+
+#mic-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#mic-btn.recording {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #ffffff;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
 }
 
 #pending-attachments {

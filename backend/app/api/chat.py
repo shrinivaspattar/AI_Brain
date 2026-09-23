@@ -1,7 +1,7 @@
 import json
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,8 @@ from app.schemas.chat import (
     ChatResponse,
     ConversationSummary,
     MessageResponse,
+    SpeakRequest,
+    TranscriptionResponse,
 )
 from app.services.chat_attachment_service import (
     AttachmentTextExtractionError,
@@ -25,6 +27,8 @@ from app.services.chat_attachment_service import (
 )
 from app.services.chat_client import ChatClient, ChatUnavailableError
 from app.services.chat_service import ChatService
+from app.services.speech_service import SpeechService, SpeechUnavailableError
+from app.services.transcription_service import TranscriptionService, TranscriptionUnavailableError
 
 router = APIRouter(
     prefix="/chat",
@@ -50,6 +54,7 @@ def list_available_models() -> AvailableModelsResponse:
         models=settings.available_chat_models(),
         default=settings.CHAT_MODEL,
         web_search_enabled=settings.WEB_SEARCH_ENABLED,
+        voice_enabled=settings.VOICE_ENABLED,
     )
 
 
@@ -176,6 +181,59 @@ def upload_attachment(
         extracted_chars=len(attachment.extracted_text or ""),
         truncated=attachment.truncated,
     )
+
+@router.post(
+    "/transcribe",
+    response_model=TranscriptionResponse,
+    responses={503: {"description": "Voice input is disabled or transcription failed"}},
+)
+def transcribe_audio(file: UploadFile = File(...)) -> TranscriptionResponse:
+    """Transcribes a recorded voice clip for the message composer to fill in
+    - never stored (the audio exists only in a temp file for the duration
+    of this request, see TranscriptionService), never part of the
+    searchable knowledge base. Disabled unless VOICE_ENABLED=true, same
+    pattern as WEB_SEARCH_ENABLED: an optional capability that must be
+    turned on before its endpoint does anything."""
+    if not settings.VOICE_ENABLED:
+        raise HTTPException(status_code=503, detail="Voice input is disabled on this server")
+
+    content = file.file.read()
+    try:
+        text = TranscriptionService().transcribe(content, suffix=_audio_suffix(file.filename))
+    except TranscriptionUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=f"Transcription failed: {exc}")
+
+    return TranscriptionResponse(text=text)
+
+
+def _audio_suffix(filename: str | None) -> str:
+    if filename and "." in filename:
+        return "." + filename.rsplit(".", 1)[-1]
+    return ".webm"
+
+
+@router.post(
+    "/speak",
+    responses={
+        200: {"content": {"audio/wav": {}}, "description": "Synthesized speech"},
+        503: {"description": "Voice output is disabled or synthesis failed"},
+    },
+)
+def speak_text(request: SpeakRequest) -> Response:
+    """Reads a message aloud - the reverse of /chat/transcribe, same
+    VOICE_ENABLED gate. Takes the message text directly (the frontend
+    already has it after rendering) rather than a message id, so this
+    stays a pure, stateless synthesis utility."""
+    if not settings.VOICE_ENABLED:
+        raise HTTPException(status_code=503, detail="Voice output is disabled on this server")
+
+    try:
+        audio = SpeechService().synthesize(request.text)
+    except SpeechUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=f"Speech synthesis failed: {exc}")
+
+    return Response(content=audio, media_type="audio/wav")
+
 
 @router.get("/conversations", response_model=list[ConversationSummary])
 def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummary]:

@@ -39,6 +39,7 @@ const attachmentInputEl = document.getElementById("attachment-input");
 const attachBtn = document.getElementById("attach-btn");
 const pendingAttachmentsEl = document.getElementById("pending-attachments");
 const webSearchBtn = document.getElementById("web-search-btn");
+const micBtn = document.getElementById("mic-btn");
 
 const chatViewEl = document.getElementById("chat-view");
 const importJobsViewEl = document.getElementById("import-jobs-view");
@@ -117,6 +118,49 @@ function renderMarkdown(text) {
   return DOMPurify.sanitize(marked.parse(text));
 }
 
+function renderSpeakButton(text) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "speak-btn";
+  button.title = "Read this reply aloud";
+  button.textContent = "🔊";
+
+  let audio = null;
+  button.addEventListener("click", async () => {
+    if (audio) {
+      audio.paused ? audio.play() : audio.pause();
+      return;
+    }
+    button.disabled = true;
+    button.textContent = "…";
+    try {
+      const response = await fetch("/chat/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error((body && body.detail) || `HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      audio = new Audio(URL.createObjectURL(blob));
+      audio.addEventListener("ended", () => {
+        button.textContent = "🔊";
+      });
+      button.textContent = "⏸";
+      audio.play();
+    } catch (err) {
+      alert(`Couldn't read this reply aloud: ${err.message}`);
+      button.textContent = "🔊";
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  return button;
+}
+
 function renderMessage({ role, content, citations }) {
   removeEmptyState();
 
@@ -124,6 +168,9 @@ function renderMessage({ role, content, citations }) {
   bubble.className = `message ${role}`;
   if (role === "assistant") {
     bubble.innerHTML = renderMarkdown(content);
+    if (voiceEnabled && content) {
+      bubble.appendChild(renderSpeakButton(content));
+    }
   } else {
     bubble.textContent = content;
   }
@@ -342,6 +389,8 @@ async function loadAvailableModels() {
     });
     modelSelectEl.value = body.models.includes(saved) ? saved : body.default;
     webSearchBtn.hidden = !body.web_search_enabled;
+    micBtn.hidden = !body.voice_enabled;
+    voiceEnabled = !!body.voice_enabled;
   } catch (err) {
     // offline/unreachable - leave the dropdown empty, chat still works
   }
@@ -354,10 +403,83 @@ modelSelectEl.addEventListener("change", () => {
 // Per-message opt-in, not persisted - each page load starts with web search
 // off, matching the "off by default" design (see docs/roadmap notes).
 let webSearchEnabled = false;
+// Whether the server has VOICE_ENABLED=true - set from /chat/models,
+// gates both the mic button and each assistant message's speak button.
+let voiceEnabled = false;
 webSearchBtn.addEventListener("click", () => {
   webSearchEnabled = !webSearchEnabled;
   webSearchBtn.classList.toggle("active", webSearchEnabled);
   webSearchBtn.setAttribute("aria-pressed", String(webSearchEnabled));
+});
+
+let mediaRecorder = null;
+let recordedChunks = [];
+
+function mimeTypeExtension(mimeType) {
+  if (mimeType.includes("webm")) return "webm";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("wav")) return "wav";
+  return "webm";
+}
+
+async function startRecording() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  recordedChunks = [];
+  mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.addEventListener("dataavailable", (event) => {
+    if (event.data.size > 0) {
+      recordedChunks.push(event.data);
+    }
+  });
+  mediaRecorder.addEventListener("stop", () => {
+    stream.getTracks().forEach((track) => track.stop());
+    transcribeRecording();
+  });
+  mediaRecorder.start();
+  micBtn.classList.add("recording");
+  micBtn.title = "Stop recording";
+}
+
+async function transcribeRecording() {
+  micBtn.disabled = true;
+  micBtn.title = "Transcribing...";
+  try {
+    const mimeType = mediaRecorder.mimeType || "audio/webm";
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    const formData = new FormData();
+    formData.append("file", blob, `recording.${mimeTypeExtension(mimeType)}`);
+
+    const response = await fetch("/chat/transcribe", { method: "POST", body: formData });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error((body && body.detail) || `HTTP ${response.status}`);
+    }
+
+    const text = (body.text || "").trim();
+    if (text) {
+      inputEl.value = inputEl.value ? `${inputEl.value} ${text}` : text;
+      inputEl.focus();
+    }
+  } catch (err) {
+    alert(`Voice transcription failed: ${err.message}`);
+  } finally {
+    micBtn.disabled = false;
+    micBtn.classList.remove("recording");
+    micBtn.title = "Record a voice message";
+  }
+}
+
+micBtn.addEventListener("click", async () => {
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    await startRecording();
+  } catch (err) {
+    alert(`Couldn't access the microphone: ${err.message}`);
+  }
 });
 
 async function sendMessage(text) {

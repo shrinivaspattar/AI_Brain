@@ -196,6 +196,34 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
+### Voice input/output
+
+Off by default (`VOICE_ENABLED=false`). Both directions are fully local -
+no internet involved, unlike web search below:
+
+- **Input** (speech-to-text): `faster-whisper`, model size set by
+  `STT_MODEL_SIZE` (default `base`). Downloads itself from Hugging Face on
+  first use - a one-time ~150MB fetch, then cached.
+- **Output** (text-to-speech): Kokoro-onnx. Its ~340MB model files are not
+  committed (see `documents/` in `.gitignore`) - download
+  [`kokoro-v1.0.onnx`](https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx)
+  and [`voices-v1.0.bin`](https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin)
+  into `documents/tts_models/` (or point `TTS_MODEL_PATH`/`TTS_VOICES_PATH`
+  elsewhere).
+
+Set `VOICE_ENABLED=true` once both are in place; the UI's mic button and
+each reply's speaker button appear automatically (`GET /chat/models`
+reports `voice_enabled`).
+
+### Web search
+
+Off by default (`WEB_SEARCH_ENABLED=false`) - the one feature that reaches
+the live internet, so it needs an explicit opt-in at two layers: this
+server-wide switch, and a per-message toggle in the UI. Runs against a
+self-hosted SearXNG (`docker compose up searxng`, see `docker-compose.yml`)
+rather than a third-party search API, so queries never leave machines this
+project controls. Point `SEARXNG_URL` at it if it's not on `localhost:8080`.
+
 ### Docker
 
 The image contains only the app (`backend/` and `frontend/`); Postgres and

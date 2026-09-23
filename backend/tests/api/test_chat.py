@@ -439,3 +439,101 @@ def test_list_available_models_reports_web_search_enabled(monkeypatch) -> None:
     response = TestClient(app).get("/chat/models")
 
     assert response.json()["web_search_enabled"] is True
+
+
+def test_list_available_models_reports_voice_enabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+
+    response = TestClient(app).get("/chat/models")
+
+    assert response.json()["voice_enabled"] is True
+
+
+def test_transcribe_audio_returns_503_when_voice_disabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", False)
+
+    response = TestClient(app).post(
+        "/chat/transcribe",
+        files={"file": ("recording.webm", b"fake-audio-bytes", "audio/webm")},
+    )
+
+    assert response.status_code == 503
+
+
+def test_transcribe_audio_returns_text_when_enabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+
+    with patch("app.api.chat.TranscriptionService") as service_class:
+        service_class.return_value.transcribe.return_value = "hello world"
+
+        response = TestClient(app).post(
+            "/chat/transcribe",
+            files={"file": ("recording.webm", b"fake-audio-bytes", "audio/webm")},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"text": "hello world"}
+        service_class.return_value.transcribe.assert_called_once_with(b"fake-audio-bytes", suffix=".webm")
+
+
+def test_transcribe_audio_returns_503_on_transcription_failure(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services.transcription_service import TranscriptionUnavailableError
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+
+    with patch("app.api.chat.TranscriptionService") as service_class:
+        service_class.return_value.transcribe.side_effect = TranscriptionUnavailableError("boom")
+
+        response = TestClient(app).post(
+            "/chat/transcribe",
+            files={"file": ("recording.webm", b"fake-audio-bytes", "audio/webm")},
+        )
+
+        assert response.status_code == 503
+
+
+def test_speak_text_returns_503_when_voice_disabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", False)
+
+    response = TestClient(app).post("/chat/speak", json={"text": "hello"})
+
+    assert response.status_code == 503
+
+
+def test_speak_text_returns_audio_when_enabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+
+    with patch("app.api.chat.SpeechService") as service_class:
+        service_class.return_value.synthesize.return_value = b"RIFF....WAVEfmt "
+
+        response = TestClient(app).post("/chat/speak", json={"text": "hello there"})
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        assert response.content == b"RIFF....WAVEfmt "
+        service_class.return_value.synthesize.assert_called_once_with("hello there")
+
+
+def test_speak_text_returns_503_on_synthesis_failure(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services.speech_service import SpeechUnavailableError
+
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+
+    with patch("app.api.chat.SpeechService") as service_class:
+        service_class.return_value.synthesize.side_effect = SpeechUnavailableError("boom")
+
+        response = TestClient(app).post("/chat/speak", json={"text": "hello"})
+
+        assert response.status_code == 503
