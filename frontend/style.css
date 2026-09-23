@@ -362,6 +362,28 @@ body {
   cursor: default;
 }
 
+#web-search-btn {
+  align-self: flex-end;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.9rem;
+  padding: 0.5rem 0.7rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#web-search-btn:hover {
+  background: var(--panel);
+}
+
+#web-search-btn.active {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
 #pending-attachments {
   display: flex;
   flex-wrap: wrap;

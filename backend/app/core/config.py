@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     EMBEDDING_CACHE_ENABLED: bool = False
     EMBEDDING_CACHE_TTL_SECONDS: int = 86400
 
+    # Web search: the one place this project reaches the live internet, so
+    # it is off by default at two layers - this global switch, and a
+    # per-message toggle in the UI (ChatRequest.web_search). Both must be
+    # true for a search to happen. Backed by a self-hosted SearXNG (see
+    # docker-compose.yml / docker/searxng), not a third-party search API,
+    # so a query never leaves machines this project controls.
+    WEB_SEARCH_ENABLED: bool = False
+    SEARXNG_URL: str = "http://localhost:8080"
+    WEB_SEARCH_MAX_RESULTS: int = 5
+
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         case_sensitive=True,

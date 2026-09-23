@@ -66,6 +66,7 @@ def test_send_message_returns_reply_with_citations() -> None:
                 conversation_id=None,
                 top_k=5,
                 attachment_ids=[],
+                web_search=False,
             )
 
     finally:
@@ -400,7 +401,41 @@ def test_send_message_passes_attachment_ids_through() -> None:
             TestClient(app).post("/chat", json={"message": "hi", "attachment_ids": ["att-1", "att-2"]})
 
         service_class.return_value.send_message.assert_called_once_with(
-            "hi", conversation_id=None, top_k=5, attachment_ids=["att-1", "att-2"]
+            "hi", conversation_id=None, top_k=5, attachment_ids=["att-1", "att-2"], web_search=False
         )
     finally:
         app.dependency_overrides.clear()
+
+
+def test_send_message_passes_web_search_through() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            message = MagicMock()
+            message.id = 2
+            message.conversation_id = "conv-1"
+            message.role = "assistant"
+            message.content = "hi"
+            message.citations = None
+            message.created_at = datetime.now(UTC)
+            service_class.return_value.send_message.return_value = message
+
+            TestClient(app).post("/chat", json={"message": "what's new?", "web_search": True})
+
+        service_class.return_value.send_message.assert_called_once_with(
+            "what's new?", conversation_id=None, top_k=5, attachment_ids=[], web_search=True
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_list_available_models_reports_web_search_enabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", True)
+
+    response = TestClient(app).get("/chat/models")
+
+    assert response.json()["web_search_enabled"] is True

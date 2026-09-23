@@ -46,7 +46,11 @@ def resolve_chat_model(requested: str | None) -> str | None:
 
 @router.get("/models", response_model=AvailableModelsResponse)
 def list_available_models() -> AvailableModelsResponse:
-    return AvailableModelsResponse(models=settings.available_chat_models(), default=settings.CHAT_MODEL)
+    return AvailableModelsResponse(
+        models=settings.available_chat_models(),
+        default=settings.CHAT_MODEL,
+        web_search_enabled=settings.WEB_SEARCH_ENABLED,
+    )
 
 
 @router.post(
@@ -69,6 +73,7 @@ def send_message(
             conversation_id=request.conversation_id,
             top_k=request.top_k,
             attachment_ids=request.attachment_ids,
+            web_search=request.web_search,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -114,6 +119,7 @@ def stream_message(
                 conversation_id=request.conversation_id,
                 top_k=request.top_k,
                 attachment_ids=request.attachment_ids,
+                web_search=request.web_search,
             ):
                 if event["type"] == "done":
                     message = event["message"]

@@ -40,6 +40,22 @@ services:
       timeout: 5s
       retries: 12
 
+  # Self-hosted meta-search, used only for the opt-in web-search feature
+  # (off by default - see WEB_SEARCH_ENABLED). Published to localhost so a
+  # backend running on the host (the usual dev setup) can also reach it,
+  # not just the containerized app.
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "${AIBRAIN_SEARXNG_PORT:-8080}:8080"
+    volumes:
+      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   # One-shot: applies the Alembic migrations, then exits.
   migrate:
     build: .
@@ -60,12 +76,15 @@ services:
       REDIS_URL: redis://redis:6379
       OLLAMA_HOST: http://host.docker.internal:11434
       EMBEDDING_CACHE_ENABLED: "true"
+      SEARXNG_URL: http://searxng:8080
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      searxng:
         condition: service_healthy
 
 volumes:

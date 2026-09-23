@@ -38,6 +38,7 @@ const conversationsListEl = document.getElementById("conversations-list");
 const attachmentInputEl = document.getElementById("attachment-input");
 const attachBtn = document.getElementById("attach-btn");
 const pendingAttachmentsEl = document.getElementById("pending-attachments");
+const webSearchBtn = document.getElementById("web-search-btn");
 
 const chatViewEl = document.getElementById("chat-view");
 const importJobsViewEl = document.getElementById("import-jobs-view");
@@ -340,6 +341,7 @@ async function loadAvailableModels() {
       modelSelectEl.appendChild(option);
     });
     modelSelectEl.value = body.models.includes(saved) ? saved : body.default;
+    webSearchBtn.hidden = !body.web_search_enabled;
   } catch (err) {
     // offline/unreachable - leave the dropdown empty, chat still works
   }
@@ -347,6 +349,15 @@ async function loadAvailableModels() {
 
 modelSelectEl.addEventListener("change", () => {
   localStorage.setItem(SELECTED_MODEL_KEY, modelSelectEl.value);
+});
+
+// Per-message opt-in, not persisted - each page load starts with web search
+// off, matching the "off by default" design (see docs/roadmap notes).
+let webSearchEnabled = false;
+webSearchBtn.addEventListener("click", () => {
+  webSearchEnabled = !webSearchEnabled;
+  webSearchBtn.classList.toggle("active", webSearchEnabled);
+  webSearchBtn.setAttribute("aria-pressed", String(webSearchEnabled));
 });
 
 async function sendMessage(text) {
@@ -406,6 +417,7 @@ async function sendMessage(text) {
         conversation_id: conversationId,
         model: modelSelectEl.value || null,
         attachment_ids: pendingAttachments.filter((a) => !a.error).map((a) => a.id),
+        web_search: webSearchEnabled,
       }),
     });
 

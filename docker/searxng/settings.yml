@@ -1,0 +1,26 @@
+# Minimal override on top of SearXNG's own defaults (use_default_settings
+# merges rather than replaces, so engines/categories/etc. are untouched).
+#
+# This instance is never published beyond localhost/the compose network -
+# it exists only so AI_Brain's backend can call its JSON API for the
+# opt-in web-search feature (see app/services/web_search_service.py). Two
+# defaults a *public* SearXNG instance would need are wrong for that:
+#   - limiter: the bot/rate-limit gate that blocks non-browser clients
+#     (including plain JSON requests) unless they pass a captcha-like
+#     check. There is exactly one client here (our own backend), so it
+#     is disabled rather than worked around.
+#   - json is not in the default enabled formats (public instances omit
+#     it to make scraping harder); it is added below since that's the
+#     only format this project reads.
+use_default_settings: true
+
+server:
+  secret_key: "aibrain-local-searxng-not-exposed-beyond-localhost"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json

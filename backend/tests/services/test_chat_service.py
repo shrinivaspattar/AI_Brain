@@ -1160,3 +1160,113 @@ def test_send_message_omits_attachments_block_when_none_given() -> None:
     # the base system prompt always explains what an attachments block would
     # mean if present; only the block itself (with a real file) is optional
     assert "Files the user attached to this message:" not in system_content
+
+
+def test_send_message_includes_web_results_when_enabled(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services.web_search_service import WebSearchResult
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", True)
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("Based on the web, ...")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+    web_search_service = MagicMock()
+    web_search_service.search.return_value = [
+        WebSearchResult(title="Some Result", url="https://example.com", snippet="a snippet")
+    ]
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        web_search_service=web_search_service,
+    )
+    service.send_message("what's new today?", web_search=True)
+
+    web_search_service.search.assert_called_once_with("what's new today?")
+    system_content = chat_client.chat.call_args.args[0][0]["content"]
+    assert "Web search results for this message:" in system_content
+    assert "[W1] Some Result (https://example.com)" in system_content
+    assert "a snippet" in system_content
+
+
+def test_send_message_skips_web_search_when_globally_disabled(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", False)
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+    web_search_service = MagicMock()
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        web_search_service=web_search_service,
+    )
+    # web_search=True on the request, but the server-wide switch is off
+    service.send_message("what's new today?", web_search=True)
+
+    web_search_service.search.assert_not_called()
+    system_content = chat_client.chat.call_args.args[0][0]["content"]
+    assert "Web search results for this message:" not in system_content
+
+
+def test_send_message_skips_web_search_when_not_requested(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", True)
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+    web_search_service = MagicMock()
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        web_search_service=web_search_service,
+    )
+    service.send_message("hello")  # web_search defaults to False
+
+    web_search_service.search.assert_not_called()
+
+
+def test_send_message_tells_model_when_web_search_fails(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services.web_search_service import WebSearchUnavailableError
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", True)
+
+    db = MagicMock()
+    db.get.return_value = None
+    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    chat_client = MagicMock()
+    chat_client.chat.return_value = _reply("hi")
+    retrieval_service = MagicMock()
+    retrieval_service.search.return_value = []
+    web_search_service = MagicMock()
+    web_search_service.search.side_effect = WebSearchUnavailableError("connection refused")
+
+    service = ChatService(
+        db, chat_client=chat_client, retrieval_service=retrieval_service,
+        web_search_service=web_search_service,
+    )
+    service.send_message("what's new today?", web_search=True)
+
+    system_content = chat_client.chat.call_args.args[0][0]["content"]
+    assert "failed and returned no results" in system_content

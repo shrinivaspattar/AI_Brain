@@ -14,6 +14,7 @@ from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
 from app.services.chat_attachment_service import ChatAttachmentService
 from app.services.chat_client import ChatClient
+from app.services.web_search_service import WebSearchResult, WebSearchService, WebSearchUnavailableError
 from app.tools.builtin import build_default_registry
 from app.tools.registry import ToolCallResult, ToolRegistry
 
@@ -34,7 +35,11 @@ SYSTEM_PROMPT = (
     "of saying you have no access to them. A 'Files the user attached to "
     "this message' block, if provided, is a file they just uploaded for "
     "this one message — treat it as the most direct source for anything "
-    "it's relevant to, separate from the indexed document context above."
+    "it's relevant to, separate from the indexed document context above. "
+    "A 'Web search results' block, if provided, is live internet content "
+    "fetched just now because the user turned web search on for this "
+    "message — cite it with the matching [Wn] marker, separate from the "
+    "[n] markers used for indexed documents."
 )
 
 MAX_HISTORY_MESSAGES = 20
@@ -67,12 +72,14 @@ class ChatService:
         memory_service: MemoryService | None = None,
         tool_registry: ToolRegistry | None = None,
         attachment_service: ChatAttachmentService | None = None,
+        web_search_service: WebSearchService | None = None,
     ):
         self.db = db
         self.chat_client = chat_client or ChatClient()
         self.retrieval_service = retrieval_service or RetrievalService(db)
         self.memory_service = memory_service or MemoryService(db)
         self.attachment_service = attachment_service or ChatAttachmentService(db)
+        self.web_search_service = web_search_service or WebSearchService()
         # None means "use the real, per-turn registry" - see send_message.
         # A caller-supplied registry (tests, mainly) is used as-is and
         # never rebuilt, since it has no conversation-specific behavior
@@ -86,9 +93,10 @@ class ChatService:
         conversation_id: str | None = None,
         top_k: int = 5,
         attachment_ids: list[str] | None = None,
+        web_search: bool = False,
     ) -> Message:
         conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
-            content, conversation_id, top_k, attachment_ids
+            content, conversation_id, top_k, attachment_ids, web_search
         )
 
         reply_text, tool_call_ids = self._run_tool_loop(prompt, conversation.id)
@@ -101,6 +109,7 @@ class ChatService:
         conversation_id: str | None = None,
         top_k: int = 5,
         attachment_ids: list[str] | None = None,
+        web_search: bool = False,
     ):
         """Same turn as `send_message`, but yields events while the reply is
         being written so a reader sees text at once instead of waiting for
@@ -109,7 +118,7 @@ class ChatService:
         call (it is not the final answer), and finally
         {"type": "done", "message": <the saved assistant Message>}."""
         conversation, retrieved, prompt, proposed_memory_ids = self._prepare_turn(
-            content, conversation_id, top_k, attachment_ids
+            content, conversation_id, top_k, attachment_ids, web_search
         )
 
         reply_text, tool_call_ids = yield from self._run_tool_loop_stream(prompt, conversation.id)
@@ -123,6 +132,7 @@ class ChatService:
         conversation_id: str | None,
         top_k: int,
         attachment_ids: list[str] | None = None,
+        web_search: bool = False,
     ):
         conversation = self._get_or_create_conversation(conversation_id)
 
@@ -159,7 +169,8 @@ class ChatService:
             status=MemoryStatus.APPROVED,
         )
         attachments = self.attachment_service.get_many(attachment_ids or [])
-        prompt = self._build_prompt(history, retrieved, memories, attachments)
+        web_results, web_search_error = self._maybe_web_search(content, web_search)
+        prompt = self._build_prompt(history, retrieved, memories, attachments, web_results, web_search_error)
 
         return conversation, retrieved, prompt, proposed_memory_ids
 
@@ -452,6 +463,24 @@ class ChatService:
 
         return content
 
+    def _maybe_web_search(
+        self, content: str, web_search: bool
+    ) -> tuple[list[WebSearchResult], str | None]:
+        """Runs a live web search only when both the global switch
+        (settings.WEB_SEARCH_ENABLED) and this message's own opt-in
+        (`web_search`) are true. A failed search never breaks the turn -
+        the model is told it didn't get results instead of the request
+        failing outright, same spirit as _link_tool_calls_to_message's
+        best-effort audit writes."""
+        if not (web_search and settings.WEB_SEARCH_ENABLED):
+            return [], None
+
+        try:
+            return self.web_search_service.search(content), None
+        except WebSearchUnavailableError as exc:
+            logger.warning("Web search failed: %s", exc)
+            return [], str(exc)
+
     @staticmethod
     def _relevant_only(retrieved: list[RetrievedChunk]) -> list[RetrievedChunk]:
         """Drop chunks farther than CHAT_MAX_SOURCE_DISTANCE (when set), so a
@@ -500,10 +529,13 @@ class ChatService:
         retrieved: list[RetrievedChunk],
         memories: list[Memory],
         attachments: list[ChatAttachment] | None = None,
+        web_results: list[WebSearchResult] | None = None,
+        web_search_error: str | None = None,
     ) -> list[dict[str, str]]:
         context_block = self._format_context(retrieved)
         memory_block = self._format_memories(memories)
         attachments_block = self._format_attachments(attachments or [])
+        web_results_block = self._format_web_results(web_results or [])
 
         system_content = SYSTEM_PROMPT
         if context_block:
@@ -516,6 +548,15 @@ class ChatService:
 
         if attachments_block:
             system_content += "\n\nFiles the user attached to this message:\n" + attachments_block
+
+        if web_results_block:
+            system_content += "\n\nWeb search results for this message:\n" + web_results_block
+        elif web_search_error:
+            system_content += (
+                "\n\nThe user turned on web search for this message, but it "
+                "failed and returned no results. Say so plainly if it's "
+                "relevant, instead of answering as if you searched."
+            )
 
         messages = [{"role": "system", "content": system_content}]
         messages.extend(
@@ -543,6 +584,13 @@ class ChatService:
             note = " (truncated - this is not the whole file)" if a.truncated else ""
             blocks.append(f"--- {a.original_filename}{note} ---\n{a.extracted_text}")
         return "\n\n".join(blocks)
+
+    @staticmethod
+    def _format_web_results(results: list[WebSearchResult]) -> str:
+        return "\n\n".join(
+            f"[W{index}] {result.title} ({result.url})\n{result.snippet}"
+            for index, result in enumerate(results, start=1)
+        )
 
     @staticmethod
     def _build_citations(

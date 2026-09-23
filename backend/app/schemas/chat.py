@@ -16,11 +16,18 @@ class ChatRequest(BaseModel):
     # the message itself; unknown/stale ids are silently dropped, see
     # ChatAttachmentService.get_many.
     attachment_ids: list[str] = Field(default_factory=list)
+    # Per-message opt-in for live web search. Only takes effect when the
+    # server also has WEB_SEARCH_ENABLED=true - see ChatService._maybe_web_search.
+    web_search: bool = False
 
 
 class AvailableModelsResponse(BaseModel):
     models: list[str]
     default: str
+    # Whether the server has WEB_SEARCH_ENABLED=true - the UI hides its
+    # search toggle entirely when this is false, rather than showing a
+    # control that would silently do nothing.
+    web_search_enabled: bool = False
 
 
 class AttachmentResponse(BaseModel):
