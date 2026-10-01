@@ -259,6 +259,12 @@ body {
 }
 
 .conversation-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  font-family: inherit;
   padding: 0.42rem 0.6rem;
   border-radius: var(--radius-sm);
   font-size: 0.82rem;
