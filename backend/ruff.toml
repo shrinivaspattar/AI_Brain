@@ -1,0 +1,9 @@
+# Minimal, curated lint config. CI runs this against app/ only (not tests/,
+# which routinely has intentionally-unused setup variables/imports).
+#
+# Scope is deliberately narrow: unused-code correctness rules, not style.
+# Ruff's full default ruleset flags 400+ findings here, nearly all cosmetic
+# (import order, typing-syntax preference) - that's not what this guards
+# against, so it's not enabled.
+[lint]
+select = ["F401", "F841", "F811"]

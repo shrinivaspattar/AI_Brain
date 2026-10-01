@@ -54,7 +54,15 @@ jobs:
           cache-dependency-path: backend/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r backend/requirements.txt
+        run: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      # Narrow, curated rule set (unused imports/variables/redefinitions) run
+      # against app/ only - not tests/, which routinely has intentionally
+      # unused setup variables. See backend/ruff.toml for why the ruleset is
+      # this small rather than ruff's full default set.
+      - name: Lint (ruff)
+        working-directory: backend
+        run: ruff check app/
 
       # The suite's integration tests target `aibrain_test` (never `aibrain`),
       # so both databases exist and are migrated to head, as on a dev machine.
