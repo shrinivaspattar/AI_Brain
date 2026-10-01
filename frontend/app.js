@@ -1582,3 +1582,37 @@ if (conversationId) {
 
 loadAvailableModels();
 fetchConversations();
+
+// Mobile sidebar toggle: the sidebar is fixed-width and holds all primary
+// navigation (not just chat history), so on narrow screens it's hidden
+// off-canvas by default and slid in via this toggle + backdrop, rather than
+// the old "just hide the conversation list" approach that left mobile users
+// with no way to reach Import Jobs/Memory Review/etc.
+const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
+const sidebarBackdropEl = document.getElementById("sidebar-backdrop");
+const appEl = document.getElementById("app");
+
+function closeSidebar() {
+  appEl.classList.remove("sidebar-open");
+  sidebarBackdropEl.hidden = true;
+  sidebarToggleBtn.setAttribute("aria-expanded", "false");
+}
+
+function openSidebar() {
+  appEl.classList.add("sidebar-open");
+  sidebarBackdropEl.hidden = false;
+  sidebarToggleBtn.setAttribute("aria-expanded", "true");
+}
+
+sidebarToggleBtn.addEventListener("click", () => {
+  if (appEl.classList.contains("sidebar-open")) {
+    closeSidebar();
+  } else {
+    openSidebar();
+  }
+});
+sidebarBackdropEl.addEventListener("click", closeSidebar);
+// Any nav/conversation selection closes the sidebar again on mobile - a
+// no-op on desktop, where the toggle button itself is hidden by CSS.
+document.getElementById("view-nav").addEventListener("click", closeSidebar);
+conversationsListEl.addEventListener("click", closeSidebar);

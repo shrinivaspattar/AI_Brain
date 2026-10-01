@@ -100,99 +100,108 @@ body {
 
 #app {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100vh;
 }
 
-/* ---------- Header ---------- */
+/* ---------- Persistent left sidebar (Claude-style: no top header bar,
+   everything - brand, new chat, navigation, chat history - lives here) ---------- */
 
-#header {
+#app-sidebar {
+  width: 272px;
+  flex-shrink: 0;
   display: flex;
-  align-items: center;
-  gap: 1.25rem;
-  padding: 0.85rem 1.5rem;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
+  flex-direction: column;
+  background: var(--sidebar);
+  border-right: 1px solid var(--border);
+  padding: 0.85rem 0.75rem;
+  overflow: hidden;
 }
 
-#header h1 {
+#sidebar-header {
+  padding: 0.4rem 0.5rem 0.75rem;
+}
+
+#sidebar-header h1 {
   margin: 0;
-  font-size: 1.05rem;
+  font-size: 1rem;
   font-weight: 600;
   color: var(--text-strong);
   letter-spacing: -0.01em;
-  white-space: nowrap;
+}
+
+#new-conversation-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  border: none;
+  background: var(--surface-soft);
+  color: var(--text-strong);
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.83rem;
+  font-weight: 500;
+  cursor: pointer;
+  margin-bottom: 0.9rem;
+  transition: background 0.15s ease;
+}
+
+#new-conversation-btn span {
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--muted-strong);
+}
+
+#new-conversation-btn:hover {
+  background: var(--surface-raised);
 }
 
 #view-nav {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  flex: 1;
-  background: var(--surface-soft);
-  padding: 0.25rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
+  flex-direction: column;
+  gap: 0.02rem;
+  margin-bottom: 1rem;
 }
 
 .nav-btn {
+  text-align: left;
   border: none;
   background: transparent;
   color: var(--muted-strong);
-  padding: 0.4rem 0.85rem;
-  border-radius: 999px;
-  font-size: 0.85rem;
-  font-weight: 500;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  font-weight: 400;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
-  white-space: nowrap;
 }
 
 .nav-btn:hover {
   color: var(--text-strong);
-  background: var(--surface-raised);
+  background: var(--surface-soft);
 }
 
 .nav-btn[aria-pressed="true"] {
-  background: var(--panel);
-  color: var(--accent);
-  box-shadow: var(--shadow-soft);
-  font-weight: 600;
-}
-
-#new-conversation-btn {
-  border: 1px solid var(--border-strong);
-  background: var(--panel);
+  background: var(--surface-soft);
   color: var(--text-strong);
-  padding: 0.45rem 1rem;
-  border-radius: 999px;
-  font-size: 0.85rem;
   font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color 0.15s ease, color 0.15s ease;
 }
 
-#new-conversation-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-/* ---------- Chat layout ---------- */
-
-#chat-view {
-  flex: 1;
-  display: flex;
-  min-height: 0;
+#sidebar-section-label {
+  padding: 0 0.6rem;
+  margin-bottom: 0.3rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
 }
 
 #conversations-sidebar {
-  width: 260px;
-  flex-shrink: 0;
-  background: var(--sidebar);
-  border-right: 1px solid var(--border);
+  flex: 1;
   overflow-y: auto;
-  padding: 0.75rem;
+  min-height: 0;
 }
 
 .conversations-empty {
@@ -202,12 +211,12 @@ body {
 }
 
 .conversation-item {
-  padding: 0.6rem 0.75rem;
+  padding: 0.42rem 0.6rem;
   border-radius: var(--radius-sm);
-  font-size: 0.85rem;
-  color: var(--text);
+  font-size: 0.82rem;
+  color: var(--muted-strong);
   cursor: pointer;
-  margin-bottom: 0.15rem;
+  margin-bottom: 0.02rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -215,14 +224,23 @@ body {
 }
 
 .conversation-item:hover {
-  background: var(--surface-raised);
+  color: var(--text-strong);
+  background: var(--surface-soft);
 }
 
 .conversation-item.active {
-  background: var(--panel);
-  color: var(--accent);
-  font-weight: 600;
-  box-shadow: var(--shadow-soft);
+  background: var(--surface-soft);
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+/* ---------- Chat layout ---------- */
+
+#chat-view {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
 }
 
 #chat-main {
@@ -279,6 +297,12 @@ body {
 .message.pending {
   color: var(--muted);
   font-style: italic;
+  animation: pending-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pending-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
 }
 
 .message.error {
@@ -512,6 +536,7 @@ body {
 #dedup-review-toolbar,
 #activity-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
   margin-bottom: 1.25rem;
@@ -562,6 +587,7 @@ body {
 #dedup-review-filter-tabs,
 #memory-filter-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.35rem;
 }
 
@@ -856,23 +882,74 @@ body {
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none !important;
+    animation: none !important;
   }
+}
+
+/* ---------- Mobile sidebar toggle (hidden entirely on desktop) ---------- */
+
+#sidebar-toggle-btn {
+  display: none;
+}
+
+#sidebar-backdrop {
+  display: none;
 }
 
 /* ---------- Mobile ---------- */
 
 @media (max-width: 720px) {
-  #header {
-    flex-wrap: wrap;
-    padding: 0.75rem 1rem;
+  #sidebar-toggle-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: 30;
+    width: 2.25rem;
+    height: 2.25rem;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--panel);
+    color: var(--text-strong);
+    font-size: 1rem;
+    cursor: pointer;
+    box-shadow: var(--shadow-soft);
   }
-  #view-nav {
-    order: 3;
-    flex-basis: 100%;
+
+  #sidebar-backdrop:not([hidden]) {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    z-index: 19;
   }
-  #conversations-sidebar {
-    display: none;
+
+  #app-sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 20;
+    width: 82vw;
+    max-width: 300px;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    box-shadow: var(--shadow-soft);
   }
+
+  #app.sidebar-open #app-sidebar {
+    transform: translateX(0);
+  }
+
+  /* Room for the fixed toggle button so it never overlaps the first message. */
+  #chat-view,
+  #import-jobs-view,
+  #memory-view,
+  #dedup-review-view,
+  #activity-view {
+    padding-top: 2.75rem;
+  }
+
   #messages {
     padding: 1rem 1rem 0.5rem;
   }
