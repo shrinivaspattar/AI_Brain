@@ -1616,3 +1616,25 @@ sidebarBackdropEl.addEventListener("click", closeSidebar);
 // no-op on desktop, where the toggle button itself is hidden by CSS.
 document.getElementById("view-nav").addEventListener("click", closeSidebar);
 conversationsListEl.addEventListener("click", closeSidebar);
+
+// Chat vs admin sidebar: two different nav rails sharing #app-sidebar's
+// slot, swapped by visibility rather than rebuilding the DOM. Deliberately
+// separate from VIEWS/showView() above - this only controls which SIDEBAR
+// is shown, not which content section is active.
+const chatSidebarEl = document.getElementById("app-sidebar");
+const adminSidebarEl = document.getElementById("admin-sidebar");
+const adminLinkBtn = document.getElementById("admin-link-btn");
+
+adminLinkBtn.addEventListener("click", () => {
+  chatSidebarEl.hidden = true;
+  adminSidebarEl.hidden = false;
+  showImportJobsView();
+});
+
+// The "Back to chat" button reuses the id "nav-chat-btn", so it already got
+// showChatView() wired up via the VIEWS-based listener above; this just
+// additionally restores the chat sidebar.
+document.getElementById("nav-chat-btn").addEventListener("click", () => {
+  adminSidebarEl.hidden = true;
+  chatSidebarEl.hidden = false;
+});

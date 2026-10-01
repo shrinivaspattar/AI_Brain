@@ -10,6 +10,8 @@
   <div id="app">
     <button id="sidebar-toggle-btn" type="button" aria-label="Toggle menu" aria-expanded="false">☰</button>
     <div id="sidebar-backdrop" hidden></div>
+    <!-- Chat sidebar: the everyday, human-facing surface. Just the brand,
+         starting a new conversation, and chat history - nothing operational. -->
     <aside id="app-sidebar">
       <div id="sidebar-header">
         <h1>AI_Brain</h1>
@@ -17,17 +19,32 @@
       <button id="new-conversation-btn" type="button" title="Start a new conversation">
         <span aria-hidden="true">+</span> New conversation
       </button>
+      <div id="sidebar-section-label">Recent chats</div>
+      <div id="conversations-sidebar">
+        <div id="conversations-list" aria-live="polite"></div>
+      </div>
+      <div id="sidebar-footer">
+        <button id="admin-link-btn" type="button">
+          <span aria-hidden="true">⚙</span> Admin
+        </button>
+      </div>
+    </aside>
+
+    <!-- Admin sidebar: operational/ingestion controls, kept out of the chat
+         surface entirely. Swapped in via #app.admin-mode (see app.js). -->
+    <aside id="admin-sidebar" hidden>
+      <div id="sidebar-header">
+        <h1>AI_Brain <span id="admin-badge">Admin</span></h1>
+      </div>
+      <button id="nav-chat-btn" type="button">
+        <span aria-hidden="true">←</span> Back to chat
+      </button>
       <nav id="view-nav">
-        <button id="nav-chat-btn" class="nav-btn" type="button" aria-pressed="true">Chat</button>
         <button id="nav-import-jobs-btn" class="nav-btn" type="button" aria-pressed="false">Import Jobs</button>
         <button id="nav-memory-btn" class="nav-btn" type="button" aria-pressed="false">Memory Review</button>
         <button id="nav-dedup-review-btn" class="nav-btn" type="button" aria-pressed="false">Dedup Review</button>
         <button id="nav-activity-btn" class="nav-btn" type="button" aria-pressed="false">Recent Activity</button>
       </nav>
-      <div id="sidebar-section-label">Recent chats</div>
-      <div id="conversations-sidebar">
-        <div id="conversations-list" aria-live="polite"></div>
-      </div>
     </aside>
 
     <section id="chat-view">

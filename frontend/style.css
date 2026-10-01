@@ -107,7 +107,8 @@ body {
 /* ---------- Persistent left sidebar (Claude-style: no top header bar,
    everything - brand, new chat, navigation, chat history - lives here) ---------- */
 
-#app-sidebar {
+#app-sidebar,
+#admin-sidebar {
   width: 272px;
   flex-shrink: 0;
   display: flex;
@@ -128,6 +129,53 @@ body {
   font-weight: 600;
   color: var(--text-strong);
   letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#admin-badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted-strong);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+}
+
+#sidebar-footer {
+  margin-top: auto;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+
+#admin-link-btn,
+#admin-sidebar #nav-chat-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--muted-strong);
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+#admin-link-btn:hover,
+#admin-sidebar #nav-chat-btn:hover {
+  color: var(--text-strong);
+  background: var(--surface-soft);
+}
+
+#admin-sidebar #nav-chat-btn {
+  margin-bottom: 0.75rem;
 }
 
 #new-conversation-btn {
@@ -926,7 +974,8 @@ body {
     z-index: 19;
   }
 
-  #app-sidebar {
+  #app-sidebar,
+  #admin-sidebar {
     position: fixed;
     inset: 0 auto 0 0;
     z-index: 20;
@@ -937,7 +986,8 @@ body {
     box-shadow: var(--shadow-soft);
   }
 
-  #app.sidebar-open #app-sidebar {
+  #app.sidebar-open #app-sidebar:not([hidden]),
+  #app.sidebar-open #admin-sidebar:not([hidden]) {
     transform: translateX(0);
   }
 
