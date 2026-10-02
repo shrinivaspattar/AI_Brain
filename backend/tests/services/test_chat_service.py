@@ -1011,15 +1011,19 @@ def test_send_message_stream_runs_a_tool_call_then_streams_the_final_reply() -> 
     registry.call.assert_called_once()
 
 
-# ---- conversation title derivation and activity timestamp ----
+# ---- conversation title generation and activity timestamp ----
 
-def test_send_message_derives_a_title_from_the_first_message() -> None:
+def test_send_message_generates_a_title_from_the_first_exchange() -> None:
     db = MagicMock()
     db.get.return_value = None
-    db.scalars.return_value = []
     db.refresh.side_effect = _make_fake_refresh()
+    history = [
+        Message(id=1, role=MessageRole.USER, content="What does my Bangalore to Germany roadmap say?"),
+        Message(id=2, role=MessageRole.ASSISTANT, content="hi there"),
+    ]
+    db.scalars.side_effect = [[], [], history]
     chat_client = MagicMock()
-    chat_client.chat.return_value = _reply("hi there")
+    chat_client.chat.side_effect = [_reply("hi there"), _reply("Germany relocation roadmap")]
     retrieval_service = MagicMock()
     retrieval_service.search.return_value = []
 
@@ -1027,33 +1031,43 @@ def test_send_message_derives_a_title_from_the_first_message() -> None:
     service.send_message("  What does my Bangalore to Germany roadmap say?  ")
 
     conversations = [c for c in db.add.call_args_list if isinstance(c.args[0], Conversation)]
-    assert conversations[0].args[0].title == "What does my Bangalore to Germany roadmap say?"
+    assert conversations[-1].args[0].title == "Germany relocation roadmap"
 
 
-def test_send_message_truncates_a_long_first_message_for_the_title() -> None:
+def test_send_message_title_generation_failure_does_not_break_the_turn() -> None:
+    from app.services.chat_client import ChatUnavailableError
+
     db = MagicMock()
     db.get.return_value = None
-    db.scalars.return_value = []
     db.refresh.side_effect = _make_fake_refresh()
+    history = [
+        Message(id=1, role=MessageRole.USER, content="hello"),
+        Message(id=2, role=MessageRole.ASSISTANT, content="ok"),
+    ]
+    db.scalars.side_effect = [[], [], history]
     chat_client = MagicMock()
-    chat_client.chat.return_value = _reply("ok")
+    chat_client.chat.side_effect = [_reply("ok"), ChatUnavailableError("ollama down")]
     retrieval_service = MagicMock()
     retrieval_service.search.return_value = []
 
-    long_message = "x" * 100
     service = ChatService(db, chat_client=chat_client, retrieval_service=retrieval_service)
-    service.send_message(long_message)
+    message = service.send_message("hello")
 
-    conversations = [c for c in db.add.call_args_list if isinstance(c.args[0], Conversation)]
-    title = conversations[0].args[0].title
-    assert title == "x" * 60 + "…"
+    assert message.content == "ok"
 
 
-def test_send_message_never_overwrites_an_existing_title() -> None:
+def test_send_message_does_not_regenerate_title_mid_conversation() -> None:
     db = MagicMock()
     conversation = Conversation(id="conv-1", title="Existing title")
     db.get.return_value = conversation
-    db.scalars.return_value = []
+    db.refresh.side_effect = _make_fake_refresh()
+    # Three prior exchanges (6 messages) plus this turn's two - not a
+    # multiple of TITLE_REFRESH_INTERVAL*2, so no title regeneration.
+    history = [
+        Message(id=i, role=MessageRole.USER if i % 2 else MessageRole.ASSISTANT, content="msg")
+        for i in range(1, 9)
+    ]
+    db.scalars.side_effect = [[], [], history]
     chat_client = MagicMock()
     chat_client.chat.return_value = _reply("reply")
     retrieval_service = MagicMock()
@@ -1063,6 +1077,7 @@ def test_send_message_never_overwrites_an_existing_title() -> None:
     service.send_message("a completely different message", conversation_id="conv-1")
 
     assert conversation.title == "Existing title"
+    chat_client.chat.assert_called_once()
 
 
 def test_send_message_touches_conversation_updated_at() -> None:

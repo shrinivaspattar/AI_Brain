@@ -23,6 +23,23 @@ function citationLabel(citation) {
   return folder ? `${name} (in ${folder})` : name;
 }
 
+// Turns a raw fetch/HTTP error into something a non-technical reader can act
+// on, while keeping the original message available via the title attribute
+// for anyone who does want the detail (devtools, screen share with support).
+function friendlyErrorMessage(action, err) {
+  const raw = err && err.message ? err.message : String(err);
+  if (err instanceof TypeError || /fetch/i.test(raw)) {
+    return `${action}: can't reach the server. Check your connection and try again.`;
+  }
+  if (/^HTTP 404/.test(raw) || /404/.test(raw)) {
+    return `${action}: not found. It may have been removed.`;
+  }
+  if (/^HTTP 5\d\d/.test(raw) || /Unexpected status 5\d\d/.test(raw)) {
+    return `${action}: the server ran into a problem. Please try again shortly.`;
+  }
+  return `${action}: something went wrong.`;
+}
+
 const CONVERSATION_ID_KEY = "ai_brain_conversation_id";
 const SELECTED_MODEL_KEY = "ai_brain_selected_model";
 const IMPORT_JOBS_POLL_INTERVAL_MS = 5000;
@@ -435,7 +452,7 @@ async function loadConversation(id) {
       });
     });
   } catch (err) {
-    renderError(`Could not load conversation history: ${err.message}`);
+    renderError(friendlyErrorMessage("Could not load conversation history", err));
   }
 }
 
@@ -668,7 +685,7 @@ async function sendMessage(text) {
       if (streamingBubble) {
         streamingBubble.remove();
       }
-      renderError(`Something went wrong: ${err.message}`);
+      renderError(friendlyErrorMessage("Message not sent", err));
     }
   } finally {
     activeStreamController = null;
@@ -841,7 +858,8 @@ async function fetchImportJobs() {
     importJobsListEl.innerHTML = "";
     const error = document.createElement("div");
     error.className = "message error";
-    error.textContent = `Could not load import jobs: ${err.message}`;
+    error.textContent = friendlyErrorMessage("Could not load import jobs", err);
+    error.title = err.message;
     importJobsListEl.appendChild(error);
     importJobsStatusLineEl.textContent = "";
   } finally {
@@ -1022,7 +1040,8 @@ function buildProvenanceBlock(memory) {
       snippetContainer.innerHTML = "";
       const errorEl = document.createElement("div");
       errorEl.className = "memory-review-error";
-      errorEl.textContent = `Could not load source message: ${err.message}`;
+      errorEl.textContent = friendlyErrorMessage("Could not load source message", err);
+      errorEl.title = err.message;
       snippetContainer.appendChild(errorEl);
       toggle.textContent = "Hide source message";
     } finally {
@@ -1069,7 +1088,8 @@ async function reviewMemory(memoryId, action, cardEl) {
       errorEl.className = "memory-review-error";
       cardEl.appendChild(errorEl);
     }
-    errorEl.textContent = `Could not ${action} memory: ${err.message}`;
+    errorEl.textContent = friendlyErrorMessage(`Could not ${action} memory`, err);
+    errorEl.title = err.message;
   }
 }
 
@@ -1193,7 +1213,8 @@ async function fetchMemories(filter) {
     memoryListEl.innerHTML = "";
     const error = document.createElement("div");
     error.className = "message error";
-    error.textContent = `Could not load memories: ${err.message}`;
+    error.textContent = friendlyErrorMessage("Could not load memories", err);
+    error.title = err.message;
     memoryListEl.appendChild(error);
     memoryStatusLineEl.textContent = "";
   } finally {
@@ -1508,7 +1529,7 @@ async function approveDedupReview(reviewId, canonicalDocumentId, reviewerDecisio
     }
   } catch (err) {
     buttons.forEach((btn) => (btn.disabled = false));
-    showDedupReviewError(cardEl, `Could not approve finding: ${err.message}`);
+    showDedupReviewError(cardEl, friendlyErrorMessage("Could not approve finding", err));
   }
 }
 
@@ -1535,7 +1556,7 @@ async function rejectDedupReview(reviewId, reviewerDecision, cardEl) {
     }
   } catch (err) {
     buttons.forEach((btn) => (btn.disabled = false));
-    showDedupReviewError(cardEl, `Could not reject finding: ${err.message}`);
+    showDedupReviewError(cardEl, friendlyErrorMessage("Could not reject finding", err));
   }
 }
 
@@ -1559,7 +1580,8 @@ async function fetchDedupReviews(filter) {
     dedupReviewListEl.innerHTML = "";
     const error = document.createElement("div");
     error.className = "message error";
-    error.textContent = `Could not load duplicate findings: ${err.message}`;
+    error.textContent = friendlyErrorMessage("Could not load duplicate findings", err);
+    error.title = err.message;
     dedupReviewListEl.appendChild(error);
     dedupReviewStatusLineEl.textContent = "";
   } finally {
@@ -1642,7 +1664,7 @@ async function fetchRecentActivity() {
       (b) => `Batch #${b.id} — ${b.status} (${b.source_instances_selected} files) — ${formatTimestamp(b.created_at)}`
     );
   } catch (err) {
-    renderActivityList(activityConversationsEl, [], `Could not load recent activity: ${err.message}`, () => "");
+    renderActivityList(activityConversationsEl, [], friendlyErrorMessage("Could not load recent activity", err), () => "");
     activityAttachmentsEl.innerHTML = "";
     activityBatchesEl.innerHTML = "";
   }

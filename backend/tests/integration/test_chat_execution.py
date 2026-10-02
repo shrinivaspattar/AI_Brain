@@ -44,7 +44,13 @@ def fake_tool_calling_chat_client(
     final_message.content = final_reply
     final_message.tool_calls = None
 
-    client.chat.side_effect = [tool_call_message, final_message]
+    title_message = MagicMock()
+    title_message.content = "generated title"
+    title_message.tool_calls = None
+
+    # The first exchange also triggers one title-generation call - see
+    # ChatService._update_title.
+    client.chat.side_effect = [tool_call_message, final_message, title_message]
     return client
 
 
@@ -321,8 +327,14 @@ def test_send_message_persists_multiple_audit_records_across_iterations() -> Non
         final_message.content = "Done checking both."
         final_message.tool_calls = None
 
+        title_message = MagicMock()
+        title_message.content = "generated title"
+        title_message.tool_calls = None
+
         chat_client = MagicMock()
-        chat_client.chat.side_effect = [first_message, second_message, final_message]
+        # The first exchange also triggers one title-generation call - see
+        # ChatService._update_title.
+        chat_client.chat.side_effect = [first_message, second_message, final_message, title_message]
 
         service = ChatService(
             db,

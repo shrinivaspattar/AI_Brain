@@ -88,7 +88,10 @@ def test_chat_prompt_includes_real_memories_from_database() -> None:
         try:
             reply = service.send_message("hello")
 
-            prompt = chat_client.chat.call_args.args[0]
+            # call_args_list[0]: the main reply, not the title-generation
+            # call that also happens on this first exchange (see
+            # ChatService._update_title).
+            prompt = chat_client.chat.call_args_list[0].args[0]
             assert "User's name is Shrinivas." in prompt[0]["content"]
 
         finally:
@@ -168,10 +171,18 @@ def test_send_message_proposes_and_links_memory_via_real_registry() -> None:
         second_turn_message.content = "I don't have that on file yet."
         second_turn_message.tool_calls = None
 
+        title_message = MagicMock()
+        title_message.content = "generated title"
+        title_message.tool_calls = None
+
         chat_client = MagicMock()
         chat_client.chat.side_effect = [
             tool_call_message,
             final_message,
+            # The first exchange also triggers one title-generation call -
+            # see ChatService._update_title. The second exchange doesn't
+            # (not a refresh point), so nothing extra before second_turn_message.
+            title_message,
             second_turn_message,
         ]
 

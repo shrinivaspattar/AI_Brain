@@ -13,7 +13,7 @@ from app.models.message import Message, MessageRole
 from app.models.tool_call import ToolCallRecord, ToolCallStatus
 from app.rag.retrieval_service import RetrievalService, RetrievedChunk
 from app.services.chat_attachment_service import ChatAttachmentService
-from app.services.chat_client import ChatClient
+from app.services.chat_client import ChatClient, ChatUnavailableError
 from app.services.web_search_service import WebSearchResult, WebSearchService, WebSearchUnavailableError
 from app.tools.builtin import build_default_registry
 from app.tools.registry import ToolCallResult, ToolRegistry
@@ -43,6 +43,17 @@ SYSTEM_PROMPT = (
 )
 
 MAX_HISTORY_MESSAGES = 20
+
+# How many exchanges (user+assistant pairs) between title regenerations
+# after the first one - frequent enough to catch a conversation that moves
+# on to a new topic, infrequent enough to keep the extra model calls rare.
+TITLE_REFRESH_INTERVAL = 3
+TITLE_CONTEXT_MESSAGES = 10
+TITLE_PROMPT = (
+    "Summarize what this conversation is about in 4-6 words, suitable as "
+    "a chat list title. No quotes, no punctuation at the end, no preamble "
+    "like 'Title:' - just the words themselves."
+)
 
 # A message this short (in words) is treated as a follow-up such as "and the
 # timeline?": the search then also uses the previous user message, because
@@ -157,8 +168,6 @@ class ChatService:
                 on_memory_proposed=proposed_memory_ids.append,
             )
 
-        self._ensure_title(conversation, content)
-
         history = self._load_history(conversation.id)
         retrieved = self._relevant_only(
             self.retrieval_service.search(
@@ -217,6 +226,8 @@ class ChatService:
         conversation.updated_at = datetime.now(UTC)
         self.db.add(conversation)
         self.db.commit()
+
+        self._update_title(conversation)
 
         return assistant_message
 
@@ -533,15 +544,46 @@ class ChatService:
             return path.rsplit("/", 1)[-1]
         return result.document.title
 
-    @staticmethod
-    def _ensure_title(conversation: Conversation, first_message: str) -> None:
-        """A brand-new conversation has no title yet; derive one from the
-        message that started it; a conversation that already has one is
-        left alone (never overwritten by a later message)."""
-        if conversation.title is not None:
+    def _update_title(self, conversation: Conversation) -> None:
+        """Keep the title a real reflection of what this conversation is
+        about right now, not just an echo of the opening message. Generated
+        after the first exchange (so a new chat is never left "Untitled"),
+        then regenerated every TITLE_REFRESH_INTERVAL exchanges after that
+        so a conversation that drifts to a different topic gets re-titled
+        instead of staying stuck on whatever started it."""
+        history = self._load_history(conversation.id)
+        message_count = len(history)
+        is_first_exchange = message_count == 2
+        is_refresh_point = (
+            message_count > 0 and message_count % (TITLE_REFRESH_INTERVAL * 2) == 0
+        )
+        if not is_first_exchange and not is_refresh_point:
             return
-        cleaned = " ".join(first_message.split())
-        conversation.title = cleaned[:60] + ("…" if len(cleaned) > 60 else "")
+
+        transcript = "\n".join(
+            f"{'User' if m.role == MessageRole.USER else 'Assistant'}: {m.content}"
+            for m in history[-TITLE_CONTEXT_MESSAGES:]
+        )
+        try:
+            response = self.chat_client.chat(
+                [
+                    {"role": "system", "content": TITLE_PROMPT},
+                    {"role": "user", "content": transcript},
+                ]
+            )
+            title = (response.content or "").strip().strip('"').strip("'").rstrip(".")
+        except ChatUnavailableError:
+            # Best-effort - a title refresh failing must never break the
+            # turn the user is actually waiting on.
+            logger.warning("Title generation failed for conversation %s", conversation.id)
+            return
+
+        if not title:
+            return
+
+        conversation.title = title[:60]
+        self.db.add(conversation)
+        self.db.commit()
 
     def _load_history(self, conversation_id: str) -> list[Message]:
         statement = (

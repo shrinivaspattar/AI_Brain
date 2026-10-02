@@ -261,7 +261,9 @@ def test_pipeline_output_is_consumed_by_chat_service_with_correct_citation(db: S
     # Stable, architecture-level behavior only - never fragile generated prose.
     assert assistant_message.role == MessageRole.ASSISTANT
     assert assistant_message.content == "Based on your documents, here is the deterministic answer."
-    assert len(fake_chat_client.calls) == 1
+    # 2, not 1: the first exchange also triggers one title-generation call
+    # (see ChatService._update_title) in addition to the main reply.
+    assert len(fake_chat_client.calls) == 2
 
     # Proves ChatService actually consumed the pipeline-created content,
     # not merely that some empty/unrelated retrieval happened: the
