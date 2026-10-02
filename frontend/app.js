@@ -89,6 +89,9 @@ const SOURCE_SNIPPET_MAX_LENGTH = 300;
 let currentDedupReviewFilter = "pending";
 
 let conversationId = localStorage.getItem(CONVERSATION_ID_KEY);
+// The in-flight stream's controller, so the Stop button can cancel it.
+// null whenever nothing is generating.
+let activeStreamController = null;
 let importJobsPollTimer = null;
 let currentMemoryFilter = "pending";
 
@@ -277,8 +280,19 @@ function renderError(text) {
 
 function setComposerBusy(busy) {
   inputEl.disabled = busy;
-  sendBtn.disabled = busy;
+  // The button stays enabled while busy - it becomes Stop instead of Send,
+  // rather than being disabled, so a running generation can be cancelled.
+  sendBtn.disabled = false;
+  sendBtn.textContent = busy ? "Stop" : "Send";
+  sendBtn.dataset.mode = busy ? "stop" : "send";
 }
+
+sendBtn.addEventListener("click", (event) => {
+  if (sendBtn.dataset.mode === "stop") {
+    event.preventDefault();
+    activeStreamController?.abort();
+  }
+});
 
 // Files attached directly to the NEXT message only (see docs: chat
 // attachments are one-shot, never implicitly reused by a later message).
@@ -588,6 +602,9 @@ async function sendMessage(text) {
     }
   }
 
+  const controller = new AbortController();
+  activeStreamController = controller;
+
   try {
     const response = await fetch("/chat/stream", {
       method: "POST",
@@ -599,6 +616,7 @@ async function sendMessage(text) {
         attachment_ids: pendingAttachments.filter((a) => !a.error).map((a) => a.id),
         web_search: webSearchEnabled,
       }),
+      signal: controller.signal,
     });
 
     if (!response.ok || !response.body) {
@@ -631,12 +649,29 @@ async function sendMessage(text) {
       }
     }
   } catch (err) {
-    pendingBubble.remove();
-    if (streamingBubble) {
-      streamingBubble.remove();
+    if (err.name === "AbortError") {
+      // User-initiated stop, not a failure: keep whatever text already
+      // streamed in rather than discarding it, same as ChatGPT/Claude do.
+      // Note this partial reply was never sent to the server's "done"
+      // handler, so it is NOT persisted to the conversation history -
+      // only this page's current view keeps it.
+      pendingBubble.remove();
+      if (streamingBubble) {
+        streamingBubble.classList.add("stopped");
+        const note = document.createElement("div");
+        note.className = "stopped-note";
+        note.textContent = "Stopped";
+        streamingBubble.appendChild(note);
+      }
+    } else {
+      pendingBubble.remove();
+      if (streamingBubble) {
+        streamingBubble.remove();
+      }
+      renderError(`Something went wrong: ${err.message}`);
     }
-    renderError(`Something went wrong: ${err.message}`);
   } finally {
+    activeStreamController = null;
     setComposerBusy(false);
     inputEl.focus();
   }
@@ -656,6 +691,15 @@ inputEl.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     composerEl.requestSubmit();
+  }
+});
+
+// On document, not inputEl: the input is disabled while generating (so it
+// can't receive its own keydown events), but Escape-to-stop should still
+// work regardless of what's focused.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeStreamController) {
+    activeStreamController.abort();
   }
 });
 

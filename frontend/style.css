@@ -395,6 +395,13 @@ body {
   50% { opacity: 1; }
 }
 
+.stopped-note {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  font-style: italic;
+  color: var(--muted);
+}
+
 .message.error {
   background: var(--error-bg);
   color: var(--error-text);
@@ -597,6 +604,13 @@ body {
   cursor: pointer;
   flex-shrink: 0;
   transition: background 0.15s ease;
+}
+
+/* Stop is a different, less-affirmative action than Send - a neutral fill
+   instead of the accent color keeps it from looking like "send again". */
+#send-btn[data-mode="stop"] {
+  background: var(--muted-strong);
+  color: var(--panel);
 }
 
 #send-btn:hover {
