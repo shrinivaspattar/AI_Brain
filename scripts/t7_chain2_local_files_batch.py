@@ -39,7 +39,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
@@ -70,15 +70,42 @@ def _sha256(path: Path) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--files", type=Path, nargs="+", required=True)
+    parser.add_argument("--files", type=Path, nargs="*", default=[])
+    parser.add_argument(
+        "--dir", type=Path, nargs="*", default=[],
+        help="folders to scan (recursively) for *.txt; raw OCR (*.screen.txt) and unfinished "
+        "*.partial/*.progress files are skipped - ingest the cleaned *.screen.clean.txt instead",
+    )
     parser.add_argument("--label", required=True, help="short name recorded in classifier_version, e.g. udemy-transcripts")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     files = [p.resolve() for p in args.files]
+    for folder in args.dir:
+        if not folder.is_dir():
+            raise SystemExit(f"Not a folder: {folder}")
+        files += [
+            p.resolve()
+            for p in sorted(folder.rglob("*.txt"))
+            if not p.name.endswith(".screen.txt")
+        ]
+    files = sorted(set(files))
     missing = [str(p) for p in files if not p.is_file()]
     if missing:
         raise SystemExit(f"Not found: {missing}")
+    if not files:
+        raise SystemExit("No files given (use --files and/or --dir).")
+
+    # Read-only: drop anything already discovered in the database, so re-pointing this
+    # at a whole folder after a partial ingest never re-registers finished files.
+    _engine = create_engine(make_url(settings.DATABASE_URL).set(database="aibrain"))
+    with _engine.connect() as _conn:
+        already = {r[0] for r in _conn.execute(text("SELECT DISTINCT root_t7_path FROM source_instances"))}
+    skipped = [p for p in files if str(p) in already]
+    files = [p for p in files if str(p) not in already]
+    print(f"Files found: {len(files) + len(skipped)}; already ingested (skipped): {len(skipped)}; to ingest: {len(files)}")
+    if not files:
+        raise SystemExit("Nothing new to ingest.")
 
     sizes = {p: p.stat().st_size for p in files}
     total_chunks = 0

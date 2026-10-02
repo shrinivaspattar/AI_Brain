@@ -86,7 +86,7 @@ def _read_window(video_path: Path, start: float, length: float) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def transcribe_to_file(model: WhisperModel, video_path: Path, out_path: Path) -> None:
+def transcribe_to_file(model: WhisperModel, video_path: Path, out_path: Path, language: str = "en") -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     partial_path = out_path.with_name(out_path.name + ".partial")
     progress_path = out_path.with_name(out_path.name + ".progress")
@@ -107,12 +107,15 @@ def transcribe_to_file(model: WhisperModel, video_path: Path, out_path: Path) ->
     while start < duration:
         audio = _read_window(video_path, start, WINDOW_SECONDS)
         if audio.size:
+            # "auto" = detect the language per 30 s chunk (for language-learning courses that
+            # mix English explanation with the target language); anything else forces that code.
+            language_kwargs = {"language": None, "multilingual": True} if language == "auto" else {"language": language}
             segments, _info = model.transcribe(
                 audio,
                 beam_size=5,
-                language="en",
                 vad_filter=True,
                 condition_on_previous_text=False,
+                **language_kwargs,
             )
             with partial_path.open("a", encoding="utf-8") as fh:
                 for segment in segments:
@@ -141,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("videos", nargs="+", type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--model-size", default=MODEL_SIZE)
+    parser.add_argument(
+        "--language", default="en",
+        help='language code to force (default "en"), or "auto" to detect per 30 s chunk',
+    )
     args = parser.parse_args(argv)
 
     print(f"Loading faster-whisper model '{args.model_size}' (cpu/int8)...", flush=True)
@@ -154,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         if out_path.exists():
             print(f"Skipping (already transcribed): {out_path}")
             continue
-        transcribe_to_file(model, video_path, out_path)
+        transcribe_to_file(model, video_path, out_path, args.language)
 
     return 0
 
