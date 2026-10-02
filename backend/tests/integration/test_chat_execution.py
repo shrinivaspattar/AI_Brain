@@ -367,3 +367,66 @@ def test_send_message_persists_multiple_audit_records_across_iterations() -> Non
         finally:
             if reply is not None:
                 _cleanup_conversation(db, reply.conversation_id)
+
+
+# ---- conversation delete: real DB, real FK constraints ----
+
+def test_delete_conversation_removes_messages_and_tool_calls_but_keeps_memories() -> None:
+    """Real-DB proof that the deletion order in ChatService.delete_conversation
+    actually satisfies the FK constraints (messages.conversation_id and
+    tool_calls.conversation_id are NOT NULL) - a mock-based test can't catch
+    a wrong order, a real Postgres FK violation would.
+    """
+    from app.memory.service import MemoryService
+    from app.models.memory import Memory, MemoryStatus
+    from app.schemas.memory import MemoryCreate
+
+    database_url = make_url(settings.DATABASE_URL).set(database="aibrain_test")
+    engine = create_engine(database_url)
+
+    with Session(engine) as db:
+        retrieval_service = MagicMock()
+        retrieval_service.search.return_value = []
+
+        service = ChatService(
+            db,
+            chat_client=fake_tool_calling_chat_client(
+                "get_current_datetime", {}, "It's currently 2026."
+            ),
+            retrieval_service=retrieval_service,
+        )
+
+        reply = service.send_message("what time is it?")
+        conversation_id = reply.conversation_id
+
+        memory_service = MemoryService(db)
+        memory = memory_service.create_memory(
+            MemoryCreate(
+                content="Created during this conversation",
+                conversation_id=conversation_id,
+                message_id=reply.id,
+            )
+        )
+        memory_id = memory.id
+
+        service.delete_conversation(conversation_id)
+
+        assert db.get(Conversation, conversation_id) is None
+        assert list(
+            db.scalars(select(Message).where(Message.conversation_id == conversation_id))
+        ) == []
+        assert list(
+            db.scalars(
+                select(ToolCallRecord).where(ToolCallRecord.conversation_id == conversation_id)
+            )
+        ) == []
+
+        # The memory itself survives - only its provenance link is dropped.
+        surviving_memory = db.get(Memory, memory_id)
+        assert surviving_memory is not None
+        assert surviving_memory.conversation_id is None
+        assert surviving_memory.message_id is None
+        assert surviving_memory.status == MemoryStatus.APPROVED
+
+        db.query(Memory).filter(Memory.id == memory_id).delete(synchronize_session=False)
+        db.commit()

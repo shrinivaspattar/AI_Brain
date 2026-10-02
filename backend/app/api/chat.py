@@ -15,6 +15,7 @@ from app.schemas.chat import (
     AvailableModelsResponse,
     ChatRequest,
     ChatResponse,
+    ConversationRenameRequest,
     ConversationSummary,
     MessageResponse,
     SpeakRequest,
@@ -26,7 +27,7 @@ from app.services.chat_attachment_service import (
     ChatAttachmentService,
 )
 from app.services.chat_client import ChatClient, ChatUnavailableError
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, EmptyTitleError
 from app.services.speech_service import SpeechService, SpeechUnavailableError
 from app.services.transcription_service import TranscriptionService, TranscriptionUnavailableError
 
@@ -242,6 +243,43 @@ def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummar
     statement = select(Conversation).order_by(Conversation.updated_at.desc())
     conversations = list(db.scalars(statement))
     return [ConversationSummary.model_validate(c) for c in conversations]
+
+
+@router.patch(
+    "/{conversation_id}",
+    response_model=ConversationSummary,
+    responses={404: {"description": "Conversation not found"}},
+)
+def rename_conversation(
+    conversation_id: str,
+    request: ConversationRenameRequest,
+    db: Session = Depends(get_db),
+) -> ConversationSummary:
+    service = ChatService(db)
+    try:
+        conversation = service.rename_conversation(conversation_id, request.title)
+    except EmptyTitleError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return ConversationSummary.model_validate(conversation)
+
+
+@router.delete(
+    "/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"description": "Conversation not found"}},
+)
+def delete_conversation(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+) -> None:
+    service = ChatService(db)
+    try:
+        service.delete_conversation(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
 @router.get(

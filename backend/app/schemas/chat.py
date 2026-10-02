@@ -21,6 +21,10 @@ class ChatRequest(BaseModel):
     web_search: bool = False
 
 
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+
+
 class AvailableModelsResponse(BaseModel):
     models: list[str]
     default: str

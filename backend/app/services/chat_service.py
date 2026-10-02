@@ -74,6 +74,11 @@ TOOL_LOOP_EXHAUSTED_REPLY = (
 MAX_TOOL_RESULT_LENGTH = 4000
 
 
+class EmptyTitleError(ValueError):
+    """A rename was requested with a title that's empty once whitespace is
+    stripped - a validation problem, not a missing-conversation one."""
+
+
 class ChatService:
     def __init__(
         self,
@@ -448,6 +453,48 @@ class ChatService:
         if len(text) <= MAX_TOOL_RESULT_LENGTH:
             return text, False
         return text[:MAX_TOOL_RESULT_LENGTH], True
+
+    def rename_conversation(self, conversation_id: str, title: str) -> Conversation:
+        # A separate exception from "not found" (ValueError) - a blank
+        # title is a validation problem (422), not a missing-resource one
+        # (404), even though Pydantic's min_length=1 alone doesn't catch a
+        # whitespace-only string like "   ".
+        cleaned = title.strip()
+        if not cleaned:
+            raise EmptyTitleError("Title cannot be empty")
+
+        conversation = self.db.get(Conversation, conversation_id)
+        if conversation is None:
+            raise ValueError(f"Conversation {conversation_id} not found")
+
+        conversation.title = cleaned[:255]
+        self.db.add(conversation)
+        self.db.commit()
+        self.db.refresh(conversation)
+        return conversation
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        conversation = self.db.get(Conversation, conversation_id)
+        if conversation is None:
+            raise ValueError(f"Conversation {conversation_id} not found")
+
+        # Memories survive their source conversation being deleted - they're
+        # the user's remembered facts, with value independent of the chat
+        # that produced them (same reasoning as keeping REJECTED memories:
+        # see MemoryStatus). Only the provenance link is dropped; the
+        # tool-call audit trail and the messages themselves are not kept,
+        # since they have no purpose once the conversation is gone.
+        self.db.query(Memory).filter(Memory.conversation_id == conversation_id).update(
+            {"conversation_id": None, "message_id": None}
+        )
+        self.db.query(ToolCallRecord).filter(
+            ToolCallRecord.conversation_id == conversation_id
+        ).delete(synchronize_session=False)
+        self.db.query(Message).filter(Message.conversation_id == conversation_id).delete(
+            synchronize_session=False
+        )
+        self.db.delete(conversation)
+        self.db.commit()
 
     def _get_or_create_conversation(
         self,

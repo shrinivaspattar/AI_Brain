@@ -1352,3 +1352,71 @@ def test_send_message_tells_model_when_web_search_fails(monkeypatch) -> None:
 
     system_content = chat_client.chat.call_args.args[0][0]["content"]
     assert "failed and returned no results" in system_content
+
+
+# ---- conversation rename / delete ----
+
+def test_rename_conversation_updates_and_returns_the_conversation() -> None:
+    from app.models.conversation import Conversation
+
+    db = MagicMock()
+    conversation = Conversation(id="conv-1", title="Old title")
+    db.get.return_value = conversation
+
+    service = ChatService(db, chat_client=MagicMock(), retrieval_service=MagicMock())
+    result = service.rename_conversation("conv-1", "  New title  ")
+
+    assert result.title == "New title"
+    db.commit.assert_called_once()
+
+
+def test_rename_conversation_raises_for_unknown_conversation() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+
+    service = ChatService(db, chat_client=MagicMock(), retrieval_service=MagicMock())
+
+    with pytest.raises(ValueError):
+        service.rename_conversation("conv-404", "New title")
+
+
+def test_rename_conversation_rejects_a_whitespace_only_title() -> None:
+    from app.models.conversation import Conversation
+
+    db = MagicMock()
+    db.get.return_value = Conversation(id="conv-1", title="Old title")
+
+    service = ChatService(db, chat_client=MagicMock(), retrieval_service=MagicMock())
+
+    with pytest.raises(ValueError):
+        service.rename_conversation("conv-1", "   ")
+
+
+def test_delete_conversation_raises_for_unknown_conversation() -> None:
+    db = MagicMock()
+    db.get.return_value = None
+
+    service = ChatService(db, chat_client=MagicMock(), retrieval_service=MagicMock())
+
+    with pytest.raises(ValueError):
+        service.delete_conversation("conv-404")
+
+
+def test_delete_conversation_deletes_dependent_rows_then_the_conversation() -> None:
+    from app.models.conversation import Conversation
+    from app.models.memory import Memory
+    from app.models.tool_call import ToolCallRecord
+
+    db = MagicMock()
+    conversation = Conversation(id="conv-1", title="Bye")
+    db.get.return_value = conversation
+
+    service = ChatService(db, chat_client=MagicMock(), retrieval_service=MagicMock())
+    service.delete_conversation("conv-1")
+
+    queried_models = [call.args[0] for call in db.query.call_args_list]
+    assert Memory in queried_models
+    assert ToolCallRecord in queried_models
+    assert Message in queried_models
+    db.delete.assert_called_once_with(conversation)
+    db.commit.assert_called_once()

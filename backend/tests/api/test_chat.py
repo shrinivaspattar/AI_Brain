@@ -529,6 +529,118 @@ def test_speak_text_returns_audio_when_enabled(monkeypatch) -> None:
         service_class.return_value.synthesize.assert_called_once_with("hello there")
 
 
+# ---- conversation rename / delete ----
+
+def test_rename_conversation_returns_the_updated_summary() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            from app.models.conversation import Conversation
+
+            renamed = Conversation(
+                id="conv-1",
+                title="New title",
+                created_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+                updated_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+            )
+            service_class.return_value.rename_conversation.return_value = renamed
+
+            response = TestClient(app).patch(
+                "/chat/conv-1", json={"title": "New title"}
+            )
+
+            assert response.status_code == 200
+            assert response.json()["title"] == "New title"
+            service_class.return_value.rename_conversation.assert_called_once_with(
+                "conv-1", "New title"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_rename_conversation_returns_not_found_for_unknown_conversation() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            service_class.return_value.rename_conversation.side_effect = ValueError(
+                "Conversation conv-404 not found"
+            )
+
+            response = TestClient(app).patch(
+                "/chat/conv-404", json={"title": "New title"}
+            )
+
+            assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_rename_conversation_rejects_a_whitespace_only_title_as_422_not_404() -> None:
+    # Pydantic's min_length=1 alone doesn't catch "   " (non-empty by
+    # length) - this must still come back as a validation error, not get
+    # misread as "conversation not found" just because both raise ValueError.
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            from app.services.chat_service import EmptyTitleError
+
+            service_class.return_value.rename_conversation.side_effect = EmptyTitleError(
+                "Title cannot be empty"
+            )
+
+            response = TestClient(app).patch("/chat/conv-1", json={"title": "   "})
+
+            assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_rename_conversation_rejects_an_empty_title() -> None:
+    app.dependency_overrides[get_db] = lambda: MagicMock()
+    try:
+        response = TestClient(app).patch("/chat/conv-1", json={"title": ""})
+        assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_delete_conversation_returns_204() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            response = TestClient(app).delete("/chat/conv-1")
+
+            assert response.status_code == 204
+            service_class.return_value.delete_conversation.assert_called_once_with("conv-1")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_delete_conversation_returns_not_found_for_unknown_conversation() -> None:
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        with patch("app.api.chat.ChatService") as service_class:
+            service_class.return_value.delete_conversation.side_effect = ValueError(
+                "Conversation conv-404 not found"
+            )
+
+            response = TestClient(app).delete("/chat/conv-404")
+
+            assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_speak_text_returns_503_on_synthesis_failure(monkeypatch) -> None:
     from app.core.config import settings
     from app.services.speech_service import SpeechUnavailableError
