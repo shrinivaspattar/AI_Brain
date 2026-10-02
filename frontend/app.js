@@ -100,11 +100,43 @@ function clearMessages() {
   messagesEl.innerHTML = "";
 }
 
+const SUGGESTED_PROMPTS = [
+  "Summarize what's in my recent documents",
+  "What do you remember about me?",
+  "Search my knowledge base for...",
+  "Help me think through a problem",
+];
+
 function showEmptyState() {
   clearMessages();
   const empty = document.createElement("div");
   empty.className = "empty-state";
-  empty.textContent = "Ask AI_Brain something to get started.";
+
+  const heading = document.createElement("div");
+  heading.className = "empty-state-heading";
+  heading.textContent = "AI_Brain";
+  empty.appendChild(heading);
+
+  const subtext = document.createElement("div");
+  subtext.className = "empty-state-subtext";
+  subtext.textContent = "Ask something, or pick up where you left off.";
+  empty.appendChild(subtext);
+
+  const prompts = document.createElement("div");
+  prompts.className = "empty-state-prompts";
+  SUGGESTED_PROMPTS.forEach((text) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "empty-state-prompt-chip";
+    chip.textContent = text;
+    chip.addEventListener("click", () => {
+      inputEl.value = text;
+      inputEl.focus();
+    });
+    prompts.appendChild(chip);
+  });
+  empty.appendChild(prompts);
+
   messagesEl.appendChild(empty);
 }
 
