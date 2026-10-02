@@ -3,23 +3,34 @@
 
 Arms (each produces a ranked list of chunks, collapsed to documents, and is
 scored at document level against the approved queries' labels):
-  dense              pgvector cosine (nomic-embed-text), exact scan
-  pg_fts             Postgres full-text, OR-joined terms, ts_rank_cd (NOT BM25)
-  bm25               in-memory Okapi BM25 (rank_bm25) over the same chunks
-  hybrid_dense_fts   RRF(dense, pg_fts)
-  hybrid_dense_bm25  RRF(dense, bm25)
+  dense                      pgvector cosine (nomic-embed-text), exact scan
+  pg_fts                     Postgres full-text, OR-joined terms, ts_rank_cd (NOT BM25)
+  bm25                       in-memory Okapi BM25 (rank_bm25) over the same chunks
+  hybrid_dense_fts           RRF(dense, pg_fts)
+  hybrid_dense_bm25          RRF(dense, bm25)
+  hybrid_dense_bm25_rerank   RRF(dense, bm25)'s own candidate pool, reordered by a
+                             cross-encoder (see RERANK_MODEL) scoring (query, chunk
+                             text) pairs directly - added to evaluate reranking
+                             (M33 follow-up) against the hybrid_dense_bm25 arm that
+                             Experiment 001's original confirmation round adopted.
 
 Reported: recall@10, mrr@10, ndcg@10 per arm, overall and per query type,
 with percentile-bootstrap 95% CIs over queries, plus p50/p95 retrieval
 latency. Latency = time to produce that arm's chunk ranking from a ready
 query embedding (embedding time is measured separately and excluded; a
-hybrid arm's latency is the sum of its two component retrievals + fusion).
+hybrid arm's latency is the sum of its two component retrievals + fusion;
+the rerank arm's latency additionally includes cross-encoder scoring time
+on top of hybrid_dense_bm25's own latency).
 
 PRE-REGISTERED DECISION RULE (see exp001_common.decision_verdict): on the
 primary metric (ndcg@10), a hybrid arm is adopted over dense only if the
 lower CI bound of its paired lexical-subset gain exceeds --min-margin AND
 its semantic-subset difference is not significantly negative. --min-margin
-has no default: choose it before you see any results.
+has no default: choose it before you see any results. The rerank arm is
+judged by the same rule, against the same dense baseline, not against
+hybrid_dense_bm25 - a separate, explicit comparison to hybrid_dense_bm25 is
+the deciding factor for whether reranking is worth its latency/dependency
+cost on top of what's already adopted (see report's extra section).
 
 Read-only against the scratch database. Requires setup_fts.py to have run,
 every chunk to have an embedding, `pip install -r scripts/exp001/requirements.txt`,
@@ -42,8 +53,13 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.embeddings.client import EmbeddingClient  # noqa: E402
 
-ARMS = ("dense", "pg_fts", "bm25", "hybrid_dense_fts", "hybrid_dense_bm25")
-HYBRIDS = ("hybrid_dense_fts", "hybrid_dense_bm25")
+ARMS = ("dense", "pg_fts", "bm25", "hybrid_dense_fts", "hybrid_dense_bm25", "hybrid_dense_bm25_rerank")
+HYBRIDS = ("hybrid_dense_fts", "hybrid_dense_bm25", "hybrid_dense_bm25_rerank")
+
+# A standard, small (~80MB) cross-encoder baseline for exactly this task
+# (query/passage relevance scoring) - not fine-tuned, not swapped per-run;
+# recorded in every results file like every other fixed hyperparameter here.
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
 def _ms(start: float) -> float:
@@ -69,9 +85,10 @@ def load_corpus(conn):
     return rows
 
 
-def run_queries(conn, rows, queries, pool, bm25_cls):
+def run_queries(conn, rows, queries, pool, bm25_cls, reranker):
     chunk_ids = [r[0] for r in rows]
     chunk_to_doc = {r[0]: r[1] for r in rows}
+    chunk_to_content = {r[0]: r[2] for r in rows}
     bm25 = bm25_cls([common.tokenize(r[2]) for r in rows])
     embedder = EmbeddingClient()
 
@@ -133,12 +150,24 @@ def run_queries(conn, rows, queries, pool, bm25_cls):
         hyb_bm25 = common.rrf_fuse([dense, bm25_ranked])
         hyb_bm25_ms = _ms(t0) + dense_ms + bm25_ms
 
+        # Reranks hybrid_dense_bm25's own fused pool (not a separately
+        # retrieved pool) - isolates "does reordering the same candidates
+        # help" from any difference a different candidate set would cause.
+        t0 = time.perf_counter()
+        rerank_pairs = [(q["query"], chunk_to_content[cid]) for cid in hyb_bm25]
+        rerank_scores = reranker.predict(rerank_pairs) if rerank_pairs else []
+        hyb_bm25_rerank = [
+            cid for cid, _score in sorted(zip(hyb_bm25, rerank_scores), key=lambda pair: -pair[1])
+        ]
+        rerank_ms = _ms(t0) + hyb_bm25_ms
+
         per_arm = {
             "dense": (dense, dense_ms),
             "pg_fts": (fts, fts_ms),
             "bm25": (bm25_ranked, bm25_ms),
             "hybrid_dense_fts": (hyb_fts, hyb_fts_ms),
             "hybrid_dense_bm25": (hyb_bm25, hyb_bm25_ms),
+            "hybrid_dense_bm25_rerank": (hyb_bm25_rerank, rerank_ms),
         }
         record = {"id": q["id"], "type": q["type"], "query": q["query"], "embed_ms": embed_ms, "arms": {}}
         for arm, (chunk_ranking, latency) in per_arm.items():
@@ -190,11 +219,29 @@ def paired_verdicts(records, min_margin, resamples, seed):
     return out
 
 
+def rerank_vs_adopted(records, resamples, seed):
+    """The comparison that actually decides whether reranking is worth
+    adding on top of what Experiment 001 already adopted: paired
+    ndcg@10 difference of hybrid_dense_bm25_rerank over hybrid_dense_bm25
+    itself (not over dense) - positive and clear of noise means reranking
+    earns its latency/dependency cost; anything else means it doesn't."""
+    diffs = {}
+    for scope in ("all", *common.QUERY_TYPES):
+        values = [
+            r["arms"]["hybrid_dense_bm25_rerank"][common.PRIMARY_METRIC]
+            - r["arms"]["hybrid_dense_bm25"][common.PRIMARY_METRIC]
+            for r in records
+            if scope == "all" or r["type"] == scope
+        ]
+        diffs[scope] = common.bootstrap_ci(values, resamples=resamples, seed=seed)
+    return diffs
+
+
 def fmt(ci):
     return f"{ci[0]:.3f} [{ci[1]:.3f}, {ci[2]:.3f}]"
 
 
-def render_report(meta, summary, verdicts):
+def render_report(meta, summary, verdicts, rerank_deltas):
     lines = ["# Experiment 001 results", "", "## Run parameters", ""]
     lines += [f"- {k}: {v}" for k, v in meta.items()]
     for scope in ("all", *common.QUERY_TYPES):
@@ -216,6 +263,18 @@ def render_report(meta, summary, verdicts):
             f"min_margin={v['min_margin']} -> lexical_gain={v['lexical_gain']}, "
             f"no_semantic_loss={v['no_semantic_loss']}, **adopt={v['adopt']}**"
         )
+    lines += [
+        "",
+        f"## Reranking vs the already-adopted hybrid_dense_bm25 ({common.PRIMARY_METRIC}, paired)",
+        "",
+        "Not part of the pre-registered vs-dense rule above - this is the actual",
+        "question for this follow-up: does reranking hybrid_dense_bm25's own",
+        "candidates improve on it, enough to justify the added latency and the",
+        "sentence-transformers/torch dependency.",
+        "",
+    ]
+    for scope in ("all", *common.QUERY_TYPES):
+        lines.append(f"- {scope}: {fmt(rerank_deltas[scope])}")
     return "\n".join(lines) + "\n"
 
 
@@ -236,6 +295,17 @@ def main() -> None:
     except ImportError as exc:
         raise SystemExit("rank_bm25 missing: pip install -r scripts/exp001/requirements.txt") from exc
 
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as exc:
+        raise SystemExit(
+            "sentence-transformers missing: pip install -r scripts/exp001/requirements.txt"
+        ) from exc
+    # Built once, outside the per-query loop - a CrossEncoder is a real
+    # model load (and the whole point of measuring latency per query is
+    # the per-query scoring cost, not model-load cost).
+    reranker = CrossEncoder(RERANK_MODEL)
+
     queries = common.load_approved_queries(args.queries)
     if not queries:
         raise SystemExit("no approved queries - review the drafted file and set approved=true")
@@ -248,10 +318,11 @@ def main() -> None:
         common.assert_connected_to_scratch(conn)
         rows = load_corpus(conn)
         pg_version = conn.execute(text("SHOW server_version")).scalar()
-        records = run_queries(conn, rows, queries, args.pool, BM25Okapi)
+        records = run_queries(conn, rows, queries, args.pool, BM25Okapi, reranker)
 
     summary = aggregate(records, args.resamples, args.seed)
     verdicts = paired_verdicts(records, args.min_margin, args.resamples, args.seed)
+    rerank_deltas = rerank_vs_adopted(records, args.resamples, args.seed)
     meta = {
         "database": args.database,
         "documents": len({r[1] for r in rows}),
@@ -267,13 +338,23 @@ def main() -> None:
         "seed": args.seed,
         "bm25_tokenizer": "lowercase [a-z0-9_]+, no stemming",
         "pg_fts": "to_tsquery('english', OR-joined terms), ts_rank_cd",
+        "rerank_model": RERANK_MODEL,
     }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "results.json").write_text(
-        json.dumps({"meta": meta, "summary": summary, "verdicts": verdicts, "per_query": records}, indent=2)
+        json.dumps(
+            {
+                "meta": meta,
+                "summary": summary,
+                "verdicts": verdicts,
+                "rerank_vs_adopted": rerank_deltas,
+                "per_query": records,
+            },
+            indent=2,
+        )
     )
-    (args.out_dir / "report.md").write_text(render_report(meta, summary, verdicts))
+    (args.out_dir / "report.md").write_text(render_report(meta, summary, verdicts, rerank_deltas))
     print(f"wrote {args.out_dir / 'report.md'} and results.json")
 
 

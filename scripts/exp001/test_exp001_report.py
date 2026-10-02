@@ -16,6 +16,9 @@ def _record(qid, qtype, dense_ndcg, hybrid_ndcg):
     arms = {name: arm(dense_ndcg) for name in run.ARMS}
     arms["hybrid_dense_fts"] = arm(hybrid_ndcg)
     arms["hybrid_dense_bm25"] = arm(hybrid_ndcg)
+    # Defaults to matching hybrid_dense_bm25 (not dense_ndcg) since that's
+    # the arm it's actually compared against - see rerank_vs_adopted().
+    arms["hybrid_dense_bm25_rerank"] = arm(hybrid_ndcg)
     return {"id": qid, "type": qtype, "query": "q", "embed_ms": 1.0, "arms": arms}
 
 
@@ -62,12 +65,26 @@ def test_report_renders_all_sections():
     records = _records(0.1, 0.0, n=5)
     summary = run.aggregate(records, resamples=100, seed=0)
     verdicts = run.paired_verdicts(records, min_margin=0.05, resamples=100, seed=0)
-    report = run.render_report({"database": "aibrain_exp001"}, summary, verdicts)
+    rerank_deltas = run.rerank_vs_adopted(records, resamples=100, seed=0)
+    report = run.render_report({"database": "aibrain_exp001"}, summary, verdicts, rerank_deltas)
     assert "# Experiment 001 results" in report
     assert "hybrid_dense_bm25" in report
     assert "adopt=" in report
+    assert "Reranking vs the already-adopted hybrid_dense_bm25" in report
     for scope in ("all", "lexical", "semantic"):
         assert f"Metrics - {scope} queries" in report
+
+
+def test_rerank_vs_adopted_is_zero_when_rerank_matches_hybrid():
+    # _record()'s default arm() gives every arm (including the new
+    # hybrid_dense_bm25_rerank, via `for name in run.ARMS`) the same
+    # dense_ndcg score unless overridden - so with no override the paired
+    # diff against hybrid_dense_bm25 must be exactly zero.
+    records = _records(0.1, 0.0, n=5)
+    deltas = run.rerank_vs_adopted(records, resamples=100, seed=0)
+    for scope in ("all", "lexical", "semantic"):
+        mean, lower, upper = deltas[scope]
+        assert mean == lower == upper == 0.0
 
 
 def test_primary_metric_is_ndcg():
