@@ -12,7 +12,9 @@
 </head>
 <body>
   <div id="app">
-    <button id="sidebar-toggle-btn" type="button" aria-label="Toggle menu" aria-expanded="false">☰</button>
+    <button id="sidebar-toggle-btn" type="button" aria-label="Toggle menu" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
     <div id="sidebar-backdrop" hidden></div>
     <!-- Chat sidebar: the everyday, human-facing surface. Just the brand,
          starting a new conversation, and chat history - nothing operational. -->
@@ -21,7 +23,8 @@
         <h1>AI_Brain</h1>
       </div>
       <button id="new-conversation-btn" type="button" title="Start a new conversation">
-        <span aria-hidden="true">+</span> New conversation
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        New conversation
       </button>
       <div id="sidebar-section-label">Recent chats</div>
       <div id="conversations-sidebar">
@@ -29,7 +32,8 @@
       </div>
       <div id="sidebar-footer">
         <button id="admin-link-btn" type="button">
-          <span aria-hidden="true">⚙</span> Admin
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.9" y1="4.9" x2="7.8" y2="7.8"/><line x1="16.2" y1="16.2" x2="19.1" y2="19.1"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.9" y1="19.1" x2="7.8" y2="16.2"/><line x1="16.2" y1="7.8" x2="19.1" y2="4.9"/></svg>
+          Admin
         </button>
       </div>
     </aside>
@@ -41,7 +45,8 @@
         <h1>AI_Brain <span id="admin-badge">Admin</span></h1>
       </div>
       <button id="nav-chat-btn" type="button">
-        <span aria-hidden="true">←</span> Back to chat
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+        Back to chat
       </button>
       <nav id="view-nav">
         <button id="nav-import-jobs-btn" class="nav-btn" type="button" aria-pressed="false">Import Jobs</button>
@@ -53,23 +58,42 @@
 
     <section id="chat-view">
       <div id="chat-main">
+        <header id="chat-header">
+          <span id="chat-header-title">New conversation</span>
+        </header>
         <main id="messages" aria-live="polite"></main>
 
         <div id="pending-attachments" aria-live="polite"></div>
 
         <form id="composer">
-          <select id="model-select" title="Chat model"></select>
-          <input id="attachment-input" type="file" hidden />
-          <button id="attach-btn" type="button" title="Attach a file to this message">📎</button>
-          <button id="web-search-btn" type="button" title="Search the web for this message" hidden aria-pressed="false">🌐 Search</button>
-          <button id="mic-btn" type="button" title="Record a voice message" hidden>🎤</button>
-          <textarea
-            id="message-input"
-            placeholder="Ask AI_Brain something..."
-            rows="2"
-            autofocus
-          ></textarea>
-          <button id="send-btn" type="submit">Send</button>
+          <div id="composer-card">
+            <div id="composer-input-row">
+              <textarea
+                id="message-input"
+                placeholder="Ask AI_Brain something..."
+                rows="2"
+                autofocus
+              ></textarea>
+              <button id="send-btn" type="submit">Send</button>
+            </div>
+          </div>
+          <div id="composer-footer">
+            <div id="composer-toolbar-left">
+              <input id="attachment-input" type="file" hidden />
+              <button id="attach-btn" type="button" title="Attach a file to this message">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05 12.25 20.24a5.5 5.5 0 0 1-7.78-7.78l9.19-9.19a3.67 3.67 0 0 1 5.19 5.19L9.47 17.84a1.83 1.83 0 0 1-2.6-2.6l8.49-8.49"/></svg>
+              </button>
+              <button id="web-search-btn" type="button" title="Search the web for this message" hidden aria-pressed="false">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                Search
+              </button>
+              <button id="mic-btn" type="button" title="Record a voice message" hidden>
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+              </button>
+            </div>
+            <p id="composer-disclaimer">AI_Brain can make mistakes. Check important info.</p>
+            <select id="model-select" title="Chat model"></select>
+          </div>
         </form>
       </div>
     </section>

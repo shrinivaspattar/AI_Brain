@@ -23,6 +23,23 @@ function citationLabel(citation) {
   return folder ? `${name} (in ${folder})` : name;
 }
 
+// A small, self-contained icon set (no external/CDN dependency, matching
+// the offline-first requirement) - real strokes instead of emoji, which
+// read as a prototype rather than a product. Each is a bare SVG body
+// (no outer <svg>, see icon()) in a 24x24 viewBox.
+const ICON_PATHS = {
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+  speaker: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>',
+  pause: '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>',
+  retry: '<path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 7 7 7"/>',
+  moreVertical: '<circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>',
+};
+
+function icon(name) {
+  return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name]}</svg>`;
+}
+
 // Turns a raw fetch/HTTP error into something a non-technical reader can act
 // on, while keeping the original message available via the title attribute
 // for anyone who does want the detail (devtools, screen share with support).
@@ -52,6 +69,7 @@ const sendBtn = document.getElementById("send-btn");
 const modelSelectEl = document.getElementById("model-select");
 const newConversationBtn = document.getElementById("new-conversation-btn");
 const conversationsListEl = document.getElementById("conversations-list");
+const chatHeaderTitleEl = document.getElementById("chat-header-title");
 const attachmentInputEl = document.getElementById("attachment-input");
 const attachBtn = document.getElementById("attach-btn");
 const pendingAttachmentsEl = document.getElementById("pending-attachments");
@@ -177,12 +195,56 @@ function renderMarkdown(text) {
   return DOMPurify.sanitize(marked.parse(text));
 }
 
+// Wraps every <pre><code> a markdown render produced with a header strip
+// (language label + copy button), matching real Claude's code blocks -
+// called fresh after every innerHTML assignment, since that replaces the
+// blocks entirely each time (including on every streamed token).
+function enhanceCodeBlocks(container) {
+  container.querySelectorAll("pre > code").forEach((codeEl) => {
+    const pre = codeEl.parentElement;
+    const lang = (codeEl.className.match(/language-(\S+)/) || [])[1] || "";
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "code-block";
+
+    const header = document.createElement("div");
+    header.className = "code-block-header";
+
+    const langLabel = document.createElement("span");
+    langLabel.className = "code-block-lang";
+    langLabel.textContent = lang;
+    header.appendChild(langLabel);
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "code-block-copy-btn";
+    copyBtn.title = "Copy code";
+    copyBtn.innerHTML = icon("copy");
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(codeEl.textContent);
+        copyBtn.innerHTML = icon("check");
+        setTimeout(() => {
+          copyBtn.innerHTML = icon("copy");
+        }, 1500);
+      } catch (err) {
+        copyBtn.title = friendlyErrorMessage("Couldn't copy", err);
+      }
+    });
+    header.appendChild(copyBtn);
+
+    pre.before(wrapper);
+    wrapper.appendChild(header);
+    wrapper.appendChild(pre);
+  });
+}
+
 function renderSpeakButton(text) {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "speak-btn";
+  button.className = "msg-action-btn speak-btn";
   button.title = "Read this reply aloud";
-  button.textContent = "🔊";
+  button.innerHTML = icon("speaker");
 
   let audio = null;
   button.addEventListener("click", async () => {
@@ -205,19 +267,89 @@ function renderSpeakButton(text) {
       const blob = await response.blob();
       audio = new Audio(URL.createObjectURL(blob));
       audio.addEventListener("ended", () => {
-        button.textContent = "🔊";
+        button.innerHTML = icon("speaker");
       });
-      button.textContent = "⏸";
+      button.innerHTML = icon("pause");
       audio.play();
     } catch (err) {
       alert(`Couldn't read this reply aloud: ${err.message}`);
-      button.textContent = "🔊";
+      button.innerHTML = icon("speaker");
     } finally {
       button.disabled = false;
     }
   });
 
   return button;
+}
+
+function renderCopyButton(text) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "msg-action-btn copy-btn";
+  button.title = "Copy";
+  button.innerHTML = icon("copy");
+
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.innerHTML = icon("check");
+      setTimeout(() => {
+        button.innerHTML = icon("copy");
+      }, 1500);
+    } catch (err) {
+      button.title = friendlyErrorMessage("Couldn't copy", err);
+    }
+  });
+
+  return button;
+}
+
+function renderRetryButton(onRetry) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "msg-action-btn retry-btn";
+  button.title = "Retry";
+  button.innerHTML = icon("retry");
+  button.addEventListener("click", onRetry);
+  return button;
+}
+
+function renderMessageActions(content, onRetry) {
+  const row = document.createElement("div");
+  row.className = "message-actions";
+  row.appendChild(renderCopyButton(content));
+  if (voiceEnabled) {
+    row.appendChild(renderSpeakButton(content));
+  }
+  if (onRetry) {
+    row.appendChild(renderRetryButton(onRetry));
+  }
+  return row;
+}
+
+function renderCollapsibleUserText(content) {
+  const wrapper = document.createElement("div");
+
+  const textEl = document.createElement("div");
+  textEl.className = "user-message-text";
+  const collapsedText = content.slice(0, USER_MESSAGE_COLLAPSE_THRESHOLD) + "…";
+  textEl.textContent = collapsedText;
+  wrapper.appendChild(textEl);
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "show-more-btn";
+  toggle.textContent = "Show more";
+
+  let expanded = false;
+  toggle.addEventListener("click", () => {
+    expanded = !expanded;
+    textEl.textContent = expanded ? content : collapsedText;
+    toggle.textContent = expanded ? "Show less" : "Show more";
+  });
+  wrapper.appendChild(toggle);
+
+  return wrapper;
 }
 
 const CONTEXT_SOURCE_LABELS = {
@@ -234,19 +366,27 @@ function renderContextIndicator(contextSources) {
   return el;
 }
 
-function renderMessage({ role, content, citations, contextSources }) {
+// A pasted user message this long gets collapsed behind "Show more", the
+// same as real Claude - otherwise a long paste pushes the actual reply
+// off-screen before the user can see it.
+const USER_MESSAGE_COLLAPSE_THRESHOLD = 600;
+
+function renderMessage({ role, content, citations, contextSources, onRetry }) {
   removeEmptyState();
 
   const bubble = document.createElement("div");
   bubble.className = `message ${role}`;
   if (role === "assistant") {
     bubble.innerHTML = renderMarkdown(content);
-    if (voiceEnabled && content) {
-      bubble.appendChild(renderSpeakButton(content));
-    }
+    enhanceCodeBlocks(bubble);
     if (contextSources && contextSources.length > 0) {
       bubble.appendChild(renderContextIndicator(contextSources));
     }
+    if (content) {
+      bubble.appendChild(renderMessageActions(content, onRetry));
+    }
+  } else if (content.length > USER_MESSAGE_COLLAPSE_THRESHOLD) {
+    bubble.appendChild(renderCollapsibleUserText(content));
   } else {
     bubble.textContent = content;
   }
@@ -398,16 +538,139 @@ function renderConversationsList(conversations) {
     conversationsListEl.appendChild(empty);
     return;
   }
+  let activeTitle = null;
   conversations.forEach((conversation) => {
+    const row = document.createElement("div");
+    row.className = "conversation-row";
+
     const item = document.createElement("button");
     item.type = "button";
     item.className = "conversation-item";
-    item.classList.toggle("active", conversation.id === conversationId);
+    const isActive = conversation.id === conversationId;
+    item.classList.toggle("active", isActive);
     item.textContent = conversation.title || "Untitled conversation";
     item.title = conversation.title || "Untitled conversation";
     item.addEventListener("click", () => selectConversation(conversation.id));
-    conversationsListEl.appendChild(item);
+    row.appendChild(item);
+    row.appendChild(renderConversationMenu(conversation));
+
+    conversationsListEl.appendChild(row);
+    if (isActive) {
+      activeTitle = conversation.title || "Untitled conversation";
+    }
   });
+  setChatHeaderTitle(activeTitle);
+}
+
+function closeAllConversationMenus() {
+  document.querySelectorAll(".conversation-menu").forEach((menu) => {
+    menu.hidden = true;
+  });
+}
+document.addEventListener("click", closeAllConversationMenus);
+
+function renderConversationMenu(conversation) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "conversation-menu-wrapper";
+
+  const menuBtn = document.createElement("button");
+  menuBtn.type = "button";
+  menuBtn.className = "conversation-menu-btn";
+  menuBtn.title = "Conversation options";
+  menuBtn.innerHTML = icon("moreVertical");
+
+  const menu = document.createElement("div");
+  menu.className = "conversation-menu";
+  menu.hidden = true;
+
+  const renameBtn = document.createElement("button");
+  renameBtn.type = "button";
+  renameBtn.textContent = "Rename";
+  renameBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    menu.hidden = true;
+    renameConversationPrompt(conversation);
+  });
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.className = "conversation-menu-delete";
+  deleteBtn.textContent = "Delete";
+  deleteBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    menu.hidden = true;
+    deleteConversationWithConfirm(conversation);
+  });
+
+  menu.appendChild(renameBtn);
+  menu.appendChild(deleteBtn);
+
+  menuBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const wasHidden = menu.hidden;
+    closeAllConversationMenus();
+    menu.hidden = !wasHidden;
+  });
+
+  wrapper.appendChild(menuBtn);
+  wrapper.appendChild(menu);
+  return wrapper;
+}
+
+async function renameConversationPrompt(conversation) {
+  const current = conversation.title || "";
+  const next = window.prompt("Rename conversation", current);
+  if (next === null) {
+    return;
+  }
+  const trimmed = next.trim();
+  if (!trimmed || trimmed === current) {
+    return;
+  }
+  try {
+    const response = await fetch(`/chat/${conversation.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: trimmed }),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error((body && body.detail) || `HTTP ${response.status}`);
+    }
+    if (conversation.id === conversationId) {
+      setChatHeaderTitle(trimmed);
+    }
+    fetchConversations();
+  } catch (err) {
+    alert(friendlyErrorMessage("Couldn't rename this conversation", err));
+  }
+}
+
+async function deleteConversationWithConfirm(conversation) {
+  const label = conversation.title || "Untitled conversation";
+  if (!window.confirm(`Delete "${label}"? This can't be undone.`)) {
+    return;
+  }
+  try {
+    const response = await fetch(`/chat/${conversation.id}`, { method: "DELETE" });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error((body && body.detail) || `HTTP ${response.status}`);
+    }
+    if (conversation.id === conversationId) {
+      localStorage.removeItem(CONVERSATION_ID_KEY);
+      conversationId = null;
+      showEmptyState();
+      setChatHeaderTitle(null);
+    }
+    fetchConversations();
+  } catch (err) {
+    alert(friendlyErrorMessage("Couldn't delete this conversation", err));
+  }
+}
+
+function setChatHeaderTitle(title) {
+  chatHeaderTitleEl.textContent = title || "New conversation";
 }
 
 async function selectConversation(id) {
@@ -443,12 +706,17 @@ async function loadConversation(id) {
     }
 
     clearMessages();
-    history.forEach((message) => {
+    history.forEach((message, index) => {
+      const precedingUser = history[index - 1];
       renderMessage({
         role: message.role,
         content: message.content,
         citations: message.citations,
         contextSources: message.context_sources,
+        onRetry:
+          message.role === "assistant" && precedingUser && precedingUser.role === "user"
+            ? () => sendMessage(precedingUser.content)
+            : null,
       });
     });
   } catch (err) {
@@ -586,6 +854,7 @@ async function sendMessage(text) {
       streamingBubble = renderMessage({ role: "assistant", content: "" });
     }
     streamingBubble.innerHTML = renderMarkdown(answer);
+    enhanceCodeBlocks(streamingBubble);
     scrollToBottom();
   }
 
@@ -612,6 +881,7 @@ async function sendMessage(text) {
         content: event.message.content,
         citations: event.message.citations,
         contextSources: event.message.context_sources,
+        onRetry: () => sendMessage(text),
       });
       fetchConversations();
       pendingAttachments = [];
@@ -724,6 +994,7 @@ newConversationBtn.addEventListener("click", () => {
   localStorage.removeItem(CONVERSATION_ID_KEY);
   conversationId = null;
   showEmptyState();
+  setChatHeaderTitle(null);
   inputEl.focus();
   fetchConversations();
 });
